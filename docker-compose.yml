@@ -1,0 +1,78 @@
+services:
+  coordinator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      SERVICE_ROLE: coordinator
+      PORT: "8080"
+      STATE_BACKEND: memory
+      ARTIFACT_BACKEND: local
+      ARTIFACT_ROOT: /data/artifacts
+      RESEARCH_A2A_URL: http://research:8080
+      EXECUTION_A2A_URL: http://execution:8080
+      TARGET_MODEL: ${TARGET_MODEL:-google/functiongemma-270m-it}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      MAX_CANDIDATES: ${MAX_CANDIDATES:-2}
+      ENVIRONMENT: local
+    ports:
+      - "8000:8080"
+    volumes:
+      - demo-artifacts:/data/artifacts
+    depends_on:
+      research:
+        condition: service_healthy
+      execution:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  research:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      SERVICE_ROLE: research
+      PORT: "8080"
+      STATE_BACKEND: memory
+      ARTIFACT_BACKEND: local
+      ARTIFACT_ROOT: /data/artifacts
+      TARGET_MODEL: ${TARGET_MODEL:-google/functiongemma-270m-it}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      ENVIRONMENT: local
+    ports:
+      - "8001:8080"
+    volumes:
+      - demo-artifacts:/data/artifacts
+    healthcheck: &agent-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/.well-known/agent-card.json', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  execution:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      SERVICE_ROLE: execution
+      PORT: "8080"
+      STATE_BACKEND: memory
+      ARTIFACT_BACKEND: local
+      ARTIFACT_ROOT: /data/artifacts
+      TARGET_MODEL: ${TARGET_MODEL:-google/functiongemma-270m-it}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      ENVIRONMENT: local
+    ports:
+      - "8002:8080"
+    volumes:
+      - demo-artifacts:/data/artifacts
+    healthcheck: *agent-healthcheck
+
+volumes:
+  demo-artifacts:

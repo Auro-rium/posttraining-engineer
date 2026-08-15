@@ -1,0 +1,59 @@
+name: Backend CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.x"
+          enable-cache: true
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --frozen --extra cloud --extra dev
+
+      - name: Run backend tests
+        env:
+          SERVICE_ROLE: coordinator
+          STATE_BACKEND: memory
+          ARTIFACT_BACKEND: memory
+        working-directory: backend
+        run: uv run pytest tests -q
+
+      - name: Validate living documentation
+        if: github.event_name != 'pull_request'
+        run: backend/.venv/bin/python backend/scripts/check_docs_sync.py
+
+      - name: Validate living documentation and changelog
+        if: github.event_name == 'pull_request'
+        run: backend/.venv/bin/python backend/scripts/check_docs_sync.py --base-ref "origin/${{ github.base_ref }}"
+
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Cloud Run container
+        run: docker build --tag autonomous-post-training-backend:ci backend
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Check Terraform formatting
+        run: terraform -chdir=infra/terraform fmt -check -recursive
+
+      - name: Validate Terraform configuration
+        run: terraform -chdir=infra/terraform init -backend=false && terraform -chdir=infra/terraform validate
