@@ -18,6 +18,14 @@ This file is append-only. Entries describe repository changes and the verificati
 - **Tests and verification:** `uv run pytest` passed 67 tests; `uv run ruff check app tests training scripts` passed; `uv run mypy app tests` passed for 29 source files; `backend/scripts/check_docs_sync.py` passed; `git diff --check` passed; the backend Docker image built; `docker compose config --quiet` passed; and all Terraform files parsed as HCL with `python-hcl2`.
 - **Known limitations and follow-up:** No Google Cloud deployment, live Gemini call, network A2A handoff, AgentGym execution, Vertex job, or checkpoint improvement was run or claimed. The required authenticated objective worker and GCS RAG corpus are external deployment prerequisites not provisioned here. Terraform provider validation was not run because the Terraform CLI is unavailable. A Vertex job handle is not persisted before polling, so `/auto` is best-effort and a coordinator restart during training requires operator inspection before retry.
 
+## 2026-08-15 11:40:00 IST (+05:30) — `MAINT-2026-08-15-001`
+
+- **Goal:** Keep generated live-document snapshots out of version control without excluding the canonical living documents.
+- **Summary of changes:** Added `live-docs/` and `live_docs/` ignore rules and documented the repository-hygiene decision.
+- **Affected files and components:** `.gitignore`, `Decisions.md`, and `ChangeLog.md`.
+- **Tests and verification:** Documentation and Git status checks are run after this entry; no application behavior changed.
+- **Known limitations and follow-up:** Generated snapshots must be deliberately copied into the root living documents when they contain information that should be retained.
+
 ## 2026-08-15 11:32:34 IST (+05:30) — `BUILD-2026-08-15-002`
 
 - **Goal:** Complete the deployment-only backend path with fail-closed cloud composition, real A2A/RAG boundaries, and honest operational constraints.

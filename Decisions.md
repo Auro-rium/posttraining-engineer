@@ -133,3 +133,15 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** Terraform contains separate team/coordinator resource blocks and an exact Agent Card URL may still need one optional reapply.
 - **Affected components:** Terraform Cloud Run resources, outputs, IAM bindings, and deployment instructions.
 - **Validation:** HCL/provider validation and a deployed check that coordinator environment URLs equal Terraform team outputs.
+
+## DEC-012 — Ignore generated live-document snapshots
+
+- **Date / run:** 2026-08-15 Asia/Kolkata / `MAINT-2026-08-15-001`
+- **Status:** Accepted
+- **Context:** Runtime or tooling integrations may create local live-document snapshots that should not be committed alongside the canonical append-only living documents.
+- **Decision:** Ignore `live-docs/` and `live_docs/` directories while keeping root `ChangeLog.md`, `Decisions.md`, and `Flow.md` tracked.
+- **Alternatives:** Ignore all Markdown files; commit every generated snapshot; use a machine-specific global ignore rule.
+- **Reason:** Generated snapshots are environment artifacts, while the root documents are the repository’s shared source of truth.
+- **Trade-offs:** A generated snapshot must be copied into the canonical documents deliberately if it contains information worth preserving.
+- **Affected components:** Repository hygiene and documentation maintenance.
+- **Validation:** Git status remains clean when either generated snapshot directory is present; canonical living documents remain trackable.

@@ -23,3 +23,7 @@ build/
 crash.log
 artifacts/
 backend/artifacts/
+
+# Generated/live documentation snapshots; canonical living docs stay tracked.
+live-docs/
+live_docs/
