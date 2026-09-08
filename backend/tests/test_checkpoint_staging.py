@@ -73,6 +73,25 @@ def test_gated_incomplete_and_cache_lock_inputs_are_rejected(tmp_path: Path) -> 
         validate_checkpoint_directory(checkpoint, revision=REVISION)
 
 
+@pytest.mark.parametrize(
+    ("filename", "flag", "value"),
+    [
+        ("config.json", "private", "true"),
+        ("tokenizer.json", "access_restricted", "1"),
+        ("tokenizer_config.json", "gated", "yes"),
+        ("metadata.json", "private", "on"),
+    ],
+)
+def test_truthy_restricted_json_flags_are_rejected(
+    tmp_path: Path, filename: str, flag: str, value: str
+) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / filename).write_text(json.dumps({flag: value}), encoding="utf-8")
+
+    with pytest.raises(CheckpointStagingError, match="gated/private/restricted"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
 def test_nested_cache_refs_locks_and_symlink_roots_are_rejected(tmp_path: Path) -> None:
     checkpoint = _checkpoint(tmp_path / "checkpoint")
     (checkpoint / "cache" / "refs").mkdir(parents=True)
@@ -120,6 +139,45 @@ def test_indexed_weights_require_supported_shard_map(
     with pytest.raises(
         CheckpointStagingError, match=r"(invalid shard name|non-string shard)"
     ):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+def _indexed_checkpoint(path: Path) -> Path:
+    checkpoint = _checkpoint(path)
+    (checkpoint / "model.safetensors").unlink()
+    (checkpoint / "model-00001-of-00002.safetensors").write_bytes(b"shard-1")
+    (checkpoint / "model-00002-of-00002.safetensors").write_bytes(b"shard-2")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "layer.0": "model-00001-of-00002.safetensors",
+                    "layer.1": "model-00002-of-00002.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return checkpoint
+
+
+def test_valid_indexed_shards_are_accepted(tmp_path: Path) -> None:
+    checkpoint = _indexed_checkpoint(tmp_path / "checkpoint")
+
+    files = validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+    assert {item.path for item in files} >= {
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        "model.safetensors.index.json",
+    }
+
+
+def test_indexed_shards_missing_from_disk_are_rejected(tmp_path: Path) -> None:
+    checkpoint = _indexed_checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "model-00002-of-00002.safetensors").unlink()
+
+    with pytest.raises(CheckpointStagingError, match="missing weight shard"):
         validate_checkpoint_directory(checkpoint, revision=REVISION)
 
 

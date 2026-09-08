@@ -31,6 +31,9 @@ _WEIGHT_NAMES = (
 _GATE_MARKERS = frozenset(
     {".gated", "gated", "gated.json", "access_request.json", "access_denied"}
 )
+_RESTRICTED_FLAGS = frozenset(
+    {"gated", "is_gated", "private", "is_private", "access_restricted", "access_denied"}
+)
 
 
 class CheckpointStagingError(ValueError):
@@ -169,23 +172,41 @@ def _relative_files(root: Path) -> list[Path]:
     return paths
 
 
+def _truthy_restricted_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value) if isinstance(value, (int, float)) else False
+
+
+def _contains_restricted_flag(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key).strip().lower().replace("-", "_")
+            if normalized_key in _RESTRICTED_FLAGS and _truthy_restricted_flag(item):
+                return True
+            if _contains_restricted_flag(item):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_restricted_flag(item) for item in value)
+    return False
+
+
 def _reject_gated_metadata(paths: list[Path], root: Path) -> None:
     for path in paths:
-        if path.name not in {"metadata.json", "checkpoint.json", "manifest.json"}:
+        if path.suffix.lower() != ".json":
             continue
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CheckpointStagingError(
-                f"invalid checkpoint metadata: {path.relative_to(root)}"
+                f"invalid checkpoint JSON metadata: {path.relative_to(root)}"
             ) from exc
-        if not isinstance(value, dict):
+        if _contains_restricted_flag(value):
             raise CheckpointStagingError(
-                f"checkpoint metadata must be an object: {path.relative_to(root)}"
+                f"checkpoint metadata is gated/private/restricted: {path.relative_to(root)}"
             )
-        for key in ("gated", "is_gated", "access_denied"):
-            if value.get(key) is True:
-                raise CheckpointStagingError(f"checkpoint is gated: {path.relative_to(root)}")
 
 
 def _validate_required_files(paths: list[Path], root: Path) -> None:
