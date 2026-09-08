@@ -4,7 +4,6 @@ Manages the optimization run state and agent handoffs.
 """
 from typing import Dict, Any, Optional
 import json
-import random
 from datetime import datetime
 from app.core.state import OptimizationRun
 from app.agents.benchmark_agent import create_benchmark_agent
@@ -20,15 +19,21 @@ from app.agents.champion_manager_agent import create_champion_manager_agent
 class OptimizationOrchestrator:
     """Orchestrates the autonomous post-training workflow."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        benchmark_adapter: Any = None,
+        training_adapter: Any = None,
+        evaluation_adapter: Any = None,
+    ):
         # Initialize all eight agents
-        self.benchmark_agent = create_benchmark_agent()
+        self.benchmark_agent = create_benchmark_agent(adapter=benchmark_adapter)
         self.failure_analyst_agent = create_failure_analyst_agent()
         self.research_agent = create_research_agent()
         self.data_curator_agent = create_data_curator_agent()
         self.training_designer_agent = create_training_designer_agent()
-        self.training_executor_agent = create_training_executor_agent()
-        self.eval_agent = create_eval_agent()
+        self.training_executor_agent = create_training_executor_agent(adapter=training_adapter)
+        self.eval_agent = create_eval_agent(adapter=evaluation_adapter)
         self.champion_manager_agent = create_champion_manager_agent()
 
         # Define the workflow phases
@@ -120,8 +125,17 @@ class OptimizationOrchestrator:
                 # Extract trajectory references for state
                 try:
                     benchmark_data = json.loads(benchmark_result)
+                    if not benchmark_data.get("benchmark_completed", False):
+                        raise ValueError(
+                            "objective benchmark adapter did not complete a real benchmark"
+                        )
                     run_state.trajectories = benchmark_data.get("trajectory_references", [])
-                    run_state.baselinePerformance = benchmark_data.get("aggregate_metrics", {}).get("success_rate", 0.0)
+                    aggregate_metrics = benchmark_data.get("aggregate_metrics", {})
+                    if not isinstance(aggregate_metrics, dict) or not isinstance(
+                        aggregate_metrics.get("success_rate"), (int, float)
+                    ):
+                        raise ValueError("objective benchmark returned no measured success_rate")
+                    run_state.baselinePerformance = float(aggregate_metrics["success_rate"])
                 except json.JSONDecodeError:
                     run_state.baselinePerformance = 0.0
 
@@ -267,18 +281,18 @@ class OptimizationOrchestrator:
                 if not run_state.experiments:
                     raise ValueError("No experiments available for execution")
 
-                # In a full implementation, would get the actual training configuration
-                # For now, use placeholder
+                training_configuration = run_state.budget.get("trainingConfiguration")
+                if not isinstance(training_configuration, dict):
+                    raise ValueError(
+                        "trainingConfiguration must be supplied by the training designer "
+                        "before submitting a real SageMaker job"
+                    )
+                if any("placeholder" in reference.lower() for reference in run_state.datasets):
+                    raise ValueError("placeholder dataset references cannot be submitted")
                 training_result = self.training_executor_agent.submit_training_job(
-                    configuration=json.dumps({
-                        "rank": 16,
-                        "learning_rate": 0.0002,
-                        "epochs": 2,
-                        "dropout": 0.1
-                    }),
+                    configuration=json.dumps(training_configuration),
                     dataset_references=json.dumps({
-                        "dataset_references": ["s3://placeholder/dataset.jsonl"] if run_state.datasets else [],
-                        "dataset_statistics": {"total_examples": 50}
+                        "dataset_references": run_state.datasets,
                     }),
                     base_model=run_state.baseCheckpoint,
                     job_name=f"optimization_run_{run_state.runId}_exp_{len([e for e in run_state.experiments if e.startswith('experiment_')])}"
@@ -291,17 +305,20 @@ class OptimizationOrchestrator:
                 })
 
             elif phase == "evaluate":
-                # Evaluate trained model
-                # In reality, would wait for training to complete first
-                # For demo purposes, simulate evaluation
+                # Evaluate only a provider-returned candidate artifact.  The
+                # current phase machine intentionally fails closed if the
+                # asynchronous training boundary was not connected.
+                if not run_state.candidates:
+                    raise ValueError(
+                        "no trained candidate artifact is recorded; wait for SageMaker "
+                        "training completion before evaluation"
+                    )
+                model_artifact = run_state.candidates[-1]
+                if not model_artifact.startswith("s3://"):
+                    raise ValueError("candidate artifact must be an S3 URI returned by the provider")
                 eval_result = self.eval_agent.evaluate_held_out_performance(
                     model_artifacts=json.dumps({
-                        "artifact_retrieval_id": f"artifact_{run_state.runId}",
-                        "artifacts": {
-                            "model_artifacts": {
-                                "adapter_model": f"s3://post-training-engineer-artifacts/models/{run_state.runId}/adapter_model.bin"
-                            }
-                        }
+                        "artifacts": {"model_artifacts": {"candidate": model_artifact}}
                     }),
                     evaluation_config={
                         "environment_id": run_state.environment,
@@ -313,7 +330,7 @@ class OptimizationOrchestrator:
                 # Also run regression benchmarks
                 regression_result = self.eval_agent.run_regression_benchmarks(
                     model_artifacts=json.dumps({
-                        "artifact_retrieval_id": f"artifact_{run_state.runId}"
+                        "artifacts": {"model_artifacts": {"candidate": model_artifact}}
                     }),
                     regression_suite={"environment": run_state.environment, "held_out": False},
                     baseline_performance=run_state.baselinePerformance
@@ -328,9 +345,17 @@ class OptimizationOrchestrator:
                 # Update champion performance if improved
                 try:
                     metrics_data = json.loads(metrics_result)
-                    candidate_performance = metrics_data.get("combined_performance_metrics", {}).get("combined_score", 0.0)
-                    run_state.candidates.append(f"candidate_{len(run_state.candidates)}")
-                    # Would update champion after promotion decision
+                    combined_metrics = metrics_data.get("combined_performance_metrics", {})
+                    candidate_performance = combined_metrics.get("combined_score")
+                    if (
+                        metrics_data.get("status") != "completed"
+                        or not isinstance(candidate_performance, (int, float))
+                        or metrics_data.get("evidence_class") not in {"LIVE", "PRIOR_VERIFIED_RUN"}
+                    ):
+                        raise ValueError(
+                            "evaluation did not return verified objective metrics"
+                        )
+                    run_state.candidatePerformance = float(candidate_performance)
                 except json.JSONDecodeError:
                     candidate_performance = 0.0
 
@@ -349,9 +374,9 @@ class OptimizationOrchestrator:
                 if not run_state.candidates:
                     raise ValueError("No candidates available for promotion decision")
 
-                # Get latest candidate performance (would come from evaluation)
-                # For demo, simulate a performance value
-                candidate_performance = run_state.baselinePerformance + random.uniform(-0.1, 0.3)  # Could be better or worse
+                candidate_performance = run_state.candidatePerformance
+                if candidate_performance is None:
+                    raise ValueError("promotion requires measured candidate evaluation metrics")
                 champion_performance = run_state.championPerformance if run_state.championCheckpoint else run_state.baselinePerformance
 
                 # Apply improvement gate

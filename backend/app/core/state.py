@@ -44,6 +44,9 @@ class OptimizationRun(BaseModel):
 
     # Metrics
     baselinePerformance: float = Field(0.0, description="Performance of base model")
+    candidatePerformance: Optional[float] = Field(
+        None, description="Measured performance of the latest evaluated candidate"
+    )
     championPerformance: float = Field(0.0, description="Performance of current champion")
     totalCostUSD: float = Field(0.0, description="Total cost in USD")
     totalTrainingTimeMin: int = Field(0, description="Total training time in minutes")
