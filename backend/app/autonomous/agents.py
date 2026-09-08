@@ -347,7 +347,7 @@ def _mapping_history(history: Sequence[Any] | None) -> list[dict[str, Any]]:
             selected = {
                 key: raw[key]
                 for key in _HISTORY_KEYS.difference({"created_at", "updated_at"})
-                if key in raw
+                if key in raw and not (key == "dataset_id" and raw[key] is None)
             }
             _validate_history_metadata(selected)
             result.append(selected)
@@ -723,7 +723,9 @@ def _history_refs(item: Mapping[str, Any]) -> set[str]:
         "evidence_ids",
     ):
         value = item.get(key)
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if isinstance(value, str):
+            references.add(value)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
             references.update(str(ref) for ref in value)
     return references
 

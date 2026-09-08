@@ -297,6 +297,15 @@ def test_real_experiment_record_history_allows_empty_refs_and_plain_dataset_id()
     assert "dataset-plain-id" in provider.prompts[0]
 
 
+def test_default_experiment_record_history_treats_missing_dataset_as_absent() -> None:
+    provider = RecordingProvider(
+        {"status": "SUCCEEDED", "evidence_class": "LIVE", "clusters": []}
+    )
+    AutonomousAgentAdapters(provider).analyze_failures(
+        ["traj://1"], [ExperimentRecord(experiment_number=1)]
+    )
+
+
 def test_failure_evidence_must_be_subset_of_coordinator_references() -> None:
     provider = RecordingProvider(
         {
@@ -526,6 +535,59 @@ def test_evidence_ids_are_consumed_when_legacy_refs_are_empty() -> None:
                     "falsifier": "premature completions do not decrease",
                     "evidence_refs": [],
                     "evidence_ids": ["artifact://old"],
+                    "status": "failed",
+                }
+            ],
+            verified_evidence_references=["artifact://old"],
+            verified_evidence_metadata={
+                "artifact://old": {
+                    "verified": True,
+                    "run_id": "run-1",
+                    "experiment_id": "exp-1",
+                    "measurement_id": "artifact://old",
+                    "evidence_class": "LIVE",
+                }
+            },
+        )
+
+
+def test_scalar_evidence_id_is_consumed_for_duplicate_history() -> None:
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "EXPLANATION",
+            "hypotheses": [
+                {
+                    "hypothesis_id": "h-new",
+                    "cluster_id": "cluster-1",
+                    "statement": "Verify after restart",
+                    "prediction": "fewer premature completions",
+                    "falsifier": "premature completions do not decrease",
+                    "evidence_refs": ["artifact://old"],
+                    "evidence_class": "EXPLANATION",
+                }
+            ],
+        }
+    )
+    cluster = FailureCluster(
+        cluster_id="cluster-1",
+        failure_type="premature_completion",
+        description="Observed failure",
+        count=1,
+        evidence_refs=["artifact://old"],
+    )
+    with pytest.raises(DuplicateHypothesisError):
+        AutonomousAgentAdapters(provider).research(
+            [cluster],
+            [
+                {
+                    "hypothesis_id": "h-old",
+                    "cluster_id": "cluster-1",
+                    "statement": "Verify after restart",
+                    "prediction": "fewer premature completions",
+                    "falsifier": "premature completions do not decrease",
+                    "evidence_refs": [],
+                    "evidence_ids": "artifact://old",
                     "status": "failed",
                 }
             ],
