@@ -32,6 +32,7 @@ __all__ = [
     "RunLimitExceeded",
     "RunRecord",
     "RunRepository",
+    "RunSequenceError",
 ]
 
 
@@ -49,6 +50,10 @@ class ConcurrentUpdateError(RepositoryError):
 
 class RunAlreadyExistsError(RepositoryError):
     """A run with the same id already exists."""
+
+
+class RunSequenceError(RepositoryError):
+    """The reserved run number is not the next number in the history."""
 
 
 def _now() -> str:
@@ -213,6 +218,18 @@ class DynamoDBRunRepository:
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _history_counter_last_number(item: Mapping[str, Any] | None) -> int:
+        if not isinstance(item, Mapping):
+            return 0
+        value = item.get("last_run_number", 0)
+        if isinstance(value, Mapping) and "N" in value:
+            value = value["N"]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     def _run_item(self, run: RunRecord) -> dict[str, Any]:
         return {
             "pk": self._pk(run.run_id),
@@ -301,7 +318,7 @@ class DynamoDBRunRepository:
             return None
         if reasons and isinstance(reasons[0], Mapping):
             if reasons[0].get("Code") == "ConditionalCheckFailed":
-                return "limit"
+                return "counter"
         if len(reasons) > 1 and isinstance(reasons[1], Mapping):
             if reasons[1].get("Code") == "ConditionalCheckFailed":
                 return "duplicate"
@@ -324,6 +341,11 @@ class DynamoDBRunRepository:
 
         table_name = self.table_name or getattr(self._table_or_create(), "name", "")
         counter_key = self._history_counter_key()
+        sequence_condition = (
+            "attribute_not_exists(#last_run_number) OR #last_run_number = :expected"
+            if record.run_number == 1
+            else "#last_run_number = :expected"
+        )
         operations: list[dict[str, Any]] = [
             {
                 "Update": {
@@ -334,17 +356,25 @@ class DynamoDBRunRepository:
                     },
                     "UpdateExpression": (
                         "SET #entity = :entity, #run_count = "
-                        "if_not_exists(#run_count, :zero) + :one"
+                        "if_not_exists(#run_count, :zero) + :one, "
+                        "#last_run_number = :next"
                     ),
                     "ConditionExpression": (
-                        "attribute_not_exists(#run_count) OR #run_count < :max_runs"
+                        f"({sequence_condition}) AND "
+                        "(attribute_not_exists(#run_count) OR #run_count < :max_runs)"
                     ),
-                    "ExpressionAttributeNames": {"#entity": "entity", "#run_count": "run_count"},
+                    "ExpressionAttributeNames": {
+                        "#entity": "entity",
+                        "#run_count": "run_count",
+                        "#last_run_number": "last_run_number",
+                    },
                     "ExpressionAttributeValues": {
                         ":entity": self._client_value("run_history_counter"),
                         ":zero": self._client_value(0),
                         ":one": self._client_value(1),
                         ":max_runs": self._client_value(max_runs),
+                        ":expected": self._client_value(record.run_number - 1),
+                        ":next": self._client_value(record.run_number),
                     },
                 }
             },
@@ -363,10 +393,23 @@ class DynamoDBRunRepository:
             self._transaction_client().transact_write_items(TransactItems=operations)
         except Exception as exc:
             reason = self._transaction_failure_reason(exc)
-            if reason == "limit":
-                raise RunLimitExceeded(f"maximum of {max_runs} runs reached") from exc
             if reason == "duplicate":
                 raise RunAlreadyExistsError(f"Run already exists: {record.run_id}") from exc
+            if reason == "counter":
+                # The transaction's first condition combines the cap and
+                # sequence checks. Classify the failed condition after the
+                # atomic rollback; these reads never make reservation safe.
+                if self._get_history_item(record.run_id) is not None:
+                    raise RunAlreadyExistsError(f"Run already exists: {record.run_id}") from exc
+                counter = self._get_history_counter()
+                if self._history_counter_count(counter) >= max_runs:
+                    raise RunLimitExceeded(f"maximum of {max_runs} runs reached") from exc
+                actual = self._history_counter_last_number(counter)
+                expected = record.run_number - 1
+                if actual != expected:
+                    raise RunSequenceError(
+                        f"expected run {actual + 1}, got {record.run_number}"
+                    ) from exc
 
             # Some test doubles and older botocore versions omit cancellation
             # reasons.  These reads only classify the failed transaction; they
@@ -375,6 +418,13 @@ class DynamoDBRunRepository:
                 raise RunAlreadyExistsError(f"Run already exists: {record.run_id}") from exc
             if self._history_counter_count(self._get_history_counter()) >= max_runs:
                 raise RunLimitExceeded(f"maximum of {max_runs} runs reached") from exc
+            counter = self._get_history_counter()
+            actual = self._history_counter_last_number(counter)
+            expected = record.run_number - 1
+            if actual != expected:
+                raise RunSequenceError(
+                    f"expected run {actual + 1}, got {record.run_number}"
+                ) from exc
             raise
         return record
 
@@ -393,11 +443,16 @@ class DynamoDBRunRepository:
             raise
         return run
 
-    def get_run(self, run_id: str) -> RunRecord | RunHistoryRecord | None:
-        history_item = self._get_history_item(run_id)
-        if history_item is not None:
-            return self._decode_history(history_item)
+    def get_run(self, run_id: str) -> RunRecord | None:
+        """Read operational coordinator state (the legacy repository contract)."""
+
         return self._get_state_run(run_id)
+
+    def get_history_run(self, run_id: str) -> RunHistoryRecord | None:
+        """Read one immutable comparison-history record by id."""
+
+        item = self._get_history_item(run_id)
+        return self._decode_history(item) if item is not None else None
 
     def update_run(
         self,
@@ -518,7 +573,7 @@ class DynamoDBRunRepository:
             if isinstance(item, Mapping) and item.get("entity") == "event"
         ]
 
-    def list_runs(self, *, limit: int = MAX_RUNS) -> list[RunHistoryRecord]:
+    def list_history_runs(self, *, limit: int = MAX_RUNS) -> list[RunHistoryRecord]:
         """Return the newest persisted history records in run-number order."""
 
         if not 1 <= limit <= MAX_RUNS:
@@ -551,6 +606,11 @@ class DynamoDBRunRepository:
         ]
         records.sort(key=lambda record: (record.run_number, record.created_at, record.run_id))
         return records[-limit:]
+
+    def list_runs(self, *, limit: int = MAX_RUNS) -> list[RunHistoryRecord]:
+        """Compatibility alias for the pre-split history contract."""
+
+        return self.list_history_runs(limit=limit)
 
 
 # Stable descriptive alias for the durable state boundary.

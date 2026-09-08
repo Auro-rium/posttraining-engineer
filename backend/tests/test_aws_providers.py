@@ -6,7 +6,7 @@ from typing import ClassVar
 
 import pytest
 
-from app.posttraining.models import Artifact, ArtifactKind
+from app.posttraining.models import Artifact, ArtifactKind, Evidence, EvidenceKind, EvidenceLabel
 from app.posttraining.run_history import RunDecision, RunHistoryRecord, RunStatus
 from app.providers.artifacts import ArtifactRef, S3ArtifactStore
 from app.providers.bedrock import BedrockStrandsModel
@@ -17,6 +17,7 @@ from app.providers.repository import (
     RunEvent,
     RunLimitExceeded,
     RunRecord,
+    RunSequenceError,
 )
 from app.providers.sagemaker import (
     EvaluationJobRequest,
@@ -142,9 +143,14 @@ class FakeTransactionClient:
         history_key = (str(history_item["pk"]), str(history_item["sk"]))
         counter = self.table.items.get(counter_key)
         count = int(counter.get("run_count", 0)) if counter else 0
+        last_number = int(counter.get("last_run_number", 0)) if counter else 0
         maximum = int(update["ExpressionAttributeValues"][":max_runs"]["N"])
         if count >= maximum:
             raise TransactionLimitError()
+        expected = int(update["ExpressionAttributeValues"][":expected"]["N"])
+        next_number = int(update["ExpressionAttributeValues"][":next"]["N"])
+        if last_number != expected:
+            raise TransactionSequenceError()
         if history_key in self.table.items:
             raise TransactionDuplicateError()
         self.table.items[counter_key] = {
@@ -152,6 +158,7 @@ class FakeTransactionClient:
             "sk": counter_key[1],
             "entity": "run_history_counter",
             "run_count": count + 1,
+            "last_run_number": next_number,
         }
         self.table.items[history_key] = dict(history_item)
         return {}
@@ -179,6 +186,13 @@ class TransactionLimitError(Exception):
     }
 
 
+class TransactionSequenceError(Exception):
+    response: ClassVar[dict[str, object]] = {
+        "Error": {"Code": "TransactionCanceledException"},
+        "CancellationReasons": [{"Code": "ConditionalCheckFailed"}, {}],
+    }
+
+
 class TransactionDuplicateError(Exception):
     response: ClassVar[dict[str, object]] = {
         "Error": {"Code": "TransactionCanceledException"},
@@ -187,6 +201,7 @@ class TransactionDuplicateError(Exception):
 
 
 def history_record(number: int, run_id: str | None = None) -> RunHistoryRecord:
+    candidate_id = f"candidate-{number:03d}"
     return RunHistoryRecord(
         run_id=run_id or f"run-{number:03d}",
         run_number=number,
@@ -194,19 +209,41 @@ def history_record(number: int, run_id: str | None = None) -> RunHistoryRecord:
         decision=RunDecision.PROMOTE,
         manifest_sha256="a" * 64,
         champion_run_id="champion" if number > 1 else None,
+        parent_run_id=f"run-{number - 1:03d}" if number > 1 else None,
         champion_artifact_id="champion-checkpoint",
-        candidate_artifact_id=f"candidate-{number:03d}",
+            candidate_artifact_id=candidate_id,
+            benchmark_id="agentgym-held-out",
+            suite="AgentGym",
+            suite_version="v1",
+            seed=7,
+            model_id="google/functiongemma-270m-it",
         baseline_metrics={"aggregate": 0.40, "per_environment": {"WebShop": 0.40}},
         candidate_metrics={"aggregate": 0.50, "per_environment": {"WebShop": 0.50}},
         artifact_refs=(
-            Artifact(
-                artifact_id=f"candidate-{number:03d}",
+                Artifact(
+                    artifact_id=candidate_id,
                 kind=ArtifactKind.CHECKPOINT,
                 uri=f"s3://artifacts/candidate-{number:03d}",
                 sha256="b" * 64,
+                ),
             ),
-        ),
-    )
+            evidence=(
+                Evidence(
+                    evidence_id=f"evaluation-{number:03d}",
+                    kind=EvidenceKind.EVALUATION,
+                    label=EvidenceLabel.LIVE,
+                    artifact_ids=(candidate_id,),
+                    metrics={"aggregate": 0.50, "WebShop": 0.50},
+                    verified=True,
+                    benchmark_id="agentgym-held-out",
+                    suite="AgentGym",
+                    suite_version="v1",
+                    manifest_sha256="a" * 64,
+                    seed=7,
+                    model_id="google/functiongemma-270m-it",
+                ),
+            ),
+        )
 
 
 def test_dynamodb_history_round_trips_links_metrics_manifest_and_artifacts() -> None:
@@ -215,8 +252,8 @@ def test_dynamodb_history_round_trips_links_metrics_manifest_and_artifacts() -> 
     expected = history_record(1)
 
     assert repository.reserve_run(expected) == expected
-    assert repository.get_run(expected.run_id) == expected
-    assert repository.list_runs() == [expected]
+    assert repository.get_history_run(expected.run_id) == expected
+    assert repository.list_history_runs() == [expected]
     item = table.items[("HISTORY", "RUN#run-001")]
     payload = json.loads(str(item["payload"]))
     assert payload["champion_run_id"] is None
@@ -245,12 +282,31 @@ def test_dynamodb_history_reservation_enforces_cap_and_duplicate_ids_atomically(
     assert "#run_count < :max_runs" in str(
         transaction["TransactItems"][0]["Update"]["ConditionExpression"]
     )
+    assert "#last_run_number" in str(transaction["TransactItems"][0]["Update"])
+
+
+def test_dynamodb_history_requires_the_next_sequence_number_atomically() -> None:
+    table = FakeTransactionalTable()
+    repository = DynamoDBRunRepository(table=table)
+
+    with pytest.raises(RunSequenceError, match="expected run 1"):
+        repository.reserve_run(history_record(2, "run-gap"))
+
+    repository.reserve_run(history_record(1))
+    with pytest.raises(RunSequenceError, match="expected run 2"):
+        repository.reserve_run(history_record(3, "run-gap-2"))
+
+    counter = table.items[("HISTORY", "COUNTER")]
+    assert counter["run_count"] == 1
+    assert counter["last_run_number"] == 1
 
 
 def test_dynamodb_updates_require_expected_state_version() -> None:
     table = FakeTable()
     repository = DynamoDBRunRepository(table=table)
-    repository.create_run(RunRecord(run_id="r1", data={"candidate": "a"}))
+    created = repository.create_run(RunRecord(run_id="r1", data={"candidate": "a"}))
+    assert repository.get_run("r1") == created
+    assert repository.get_history_run("r1") is None
 
     updated = repository.update_run("r1", expected_state_version=0, patch={"candidate": "b"})
     assert updated.state_version == 1
