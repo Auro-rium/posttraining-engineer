@@ -26,6 +26,7 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StrictStr,
+    field_validator,
     model_validator,
 )
 
@@ -89,6 +90,7 @@ _HISTORY_KEYS: Final[frozenset[str]] = frozenset(
         "testable_prediction",
         "falsifiable_criterion",
         "dataset_id",
+        "evidence_ids",
         "training_config",
         "evidence_refs",
         "artifact_ids",
@@ -163,6 +165,13 @@ class ResearchHypothesis(_HandoffModel):
     )
     confidence: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     evidence_class: StrictStr = "EXPLANATION"
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def require_json_float(cls, value: Any) -> Any:
+        if value is not None and type(value) is not float:
+            raise ValueError("confidence must be a JSON float")
+        return value
 
     @model_validator(mode="after")
     def validate_evidence(self) -> ResearchHypothesis:
@@ -242,6 +251,13 @@ class QLoRAConfig(_HandoffModel):
     batch_size: StrictInt
     gradient_accumulation_steps: StrictInt
     target_modules: tuple[StrictStr, ...]
+
+    @field_validator("dropout", "learning_rate", mode="before")
+    @classmethod
+    def require_json_float(cls, value: Any) -> Any:
+        if type(value) is not float:
+            raise ValueError("QLoRA float fields must be JSON floats")
+        return value
 
     @model_validator(mode="after")
     def validate_search_space(self) -> QLoRAConfig:
@@ -344,7 +360,13 @@ def _validate_history_metadata(item: Mapping[str, Any]) -> None:
     """Validate the small, metadata-only subset allowed into Nemotron context."""
 
     for key, value in item.items():
-        if key in {"evidence_refs", "artifact_ids", "provider_job_ids", "dataset_id"}:
+        if key in {
+            "evidence_refs",
+            "evidence_ids",
+            "artifact_ids",
+            "provider_job_ids",
+            "dataset_id",
+        }:
             if isinstance(value, str):
                 refs = [value]
             elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
@@ -496,10 +518,10 @@ class AutonomousAgentAdapters:
             for item in failure_clusters
         )
         cluster_refs = {ref for item in cluster_models for ref in item.evidence_refs}
-        verified_refs = (
-            set(_references(verified_evidence_references, "verified_evidence_references"))
-            if verified_evidence_references is not None
-            else cluster_refs
+        if verified_evidence_references is None:
+            raise ProviderHandoffError("research requires coordinator-verified evidence references")
+        verified_refs = set(
+            _references(verified_evidence_references, "verified_evidence_references")
         )
         if not cluster_refs.issubset(verified_refs):
             raise ProviderHandoffError("failure-cluster evidence is not coordinator-verified")
@@ -550,6 +572,7 @@ class AutonomousAgentAdapters:
         verified_trajectory_references: Sequence[str],
         hypotheses: Sequence[ResearchHypothesis | Mapping[str, Any]] = (),
         experiment_history: Sequence[Any] = (),
+        verified_dataset_artifact_references: Sequence[str] | None = None,
     ) -> CuratedDatasetPlan:
         refs = _references(verified_trajectory_references, "verified_trajectory_references")
         history = _mapping_history(experiment_history)
@@ -562,6 +585,16 @@ class AutonomousAgentAdapters:
         verified_refs = set(refs)
         if any(not set(item.evidence_refs).issubset(verified_refs) for item in hypothesis_models):
             raise ProviderHandoffError("hypothesis evidence_refs are not coordinator-verified")
+        if verified_dataset_artifact_references is None:
+            raise ProviderHandoffError(
+                "curation requires coordinator-owned dataset artifact provenance"
+            )
+        verified_dataset_refs = set(
+            _references(
+                verified_dataset_artifact_references,
+                "verified_dataset_artifact_references",
+            )
+        )
         hypothesis_values = [item.model_dump(mode="json") for item in hypothesis_models]
         response = self._call(
             "DataCuratorAgent",
@@ -585,6 +618,10 @@ class AutonomousAgentAdapters:
         if not set(plan.selected_trajectory_refs).issubset(set(refs)):
             raise ProviderHandoffError(
                 "curation selected a trajectory outside verified input references"
+            )
+        if plan.dataset_artifact_ref not in verified_dataset_refs:
+            raise ProviderHandoffError(
+                "curation returned a dataset artifact without coordinator provenance"
             )
         return plan
 

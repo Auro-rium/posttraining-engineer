@@ -65,6 +65,7 @@ _HANDOFF_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
         "status",
         "fingerprint",
         "artifact_ids",
+        "evidence_ids",
         "provider_job_ids",
         "metrics",
         "stop_reason",
@@ -91,6 +92,7 @@ _HANDOFF_REFERENCE_KEYS: Final[frozenset[str]] = frozenset(
         "verified_evidence_references",
         "evidence_refs",
         "artifact_ids",
+        "evidence_ids",
         "provider_job_ids",
         "dataset_artifact_ref",
         "dataset_id",
@@ -101,7 +103,11 @@ _HANDOFF_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$"
 )
 _HANDOFF_HAZARD_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?:ignore\s+(?:all|any|the)\s+previous|system\s+prompt|developer\s+message|"
+    r"(?:\b(?:ignore|disregard|forget|override|bypass)\b[^\n]{0,80}\b"
+    r"(?:instructions?|directions?|rules?)\b|"
+    r"\b(?:follow|use)\s+(?:my|these|the following|new)\s+(?:instructions?|directions?|rules?)\b|"
+    r"\b(?:you are now|act as|pretend to be|role[- ]?play as)\b|"
+    r"system\s+prompt|developer\s+message|"
     r"BEGIN\s+(?:PROMPT|COMPLETION|HIDDEN)|END\s+(?:PROMPT|COMPLETION|HIDDEN)|"
     r"(?:secret|password|api[_ -]?key|access[_ -]?token|held[ -]?out|raw[_ -]?prompt|"
     r"raw[_ -]?completion))",
@@ -282,9 +288,20 @@ def _validate_handoff_metadata(value: Any, *, field: str | None = None) -> None:
                 and isinstance(key, str)
                 and _HANDOFF_REFERENCE_PATTERN.fullmatch(key)
             )
-            if not dynamic_reference and (not isinstance(key, str) or key not in _HANDOFF_ALLOWED_KEYS):
+            dynamic_metric = (
+                field == "metrics"
+                and isinstance(key, str)
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", key) is not None
+                and _HANDOFF_HAZARD_PATTERN.search(key) is None
+            )
+            if not dynamic_reference and not dynamic_metric and (
+                not isinstance(key, str) or key not in _HANDOFF_ALLOWED_KEYS
+            ):
                 raise ValueError(f"handoff metadata key is not allowlisted: {key!r}")
-            _validate_handoff_metadata(child, field=key if not dynamic_reference else None)
+            _validate_handoff_metadata(
+                child,
+                field=key if not dynamic_reference and not dynamic_metric else None,
+            )
         return
     if isinstance(value, (list, tuple)):
         if len(value) > 128:
