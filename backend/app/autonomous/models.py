@@ -7,16 +7,75 @@ model output are deliberately represented by safe IDs or content hashes.
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
 from time import time_ns
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-fA-F]{40}$")
+_UNSAFE_CONTENT = re.compile(
+    r"(?:raw\s+prompt|raw\s+content|full\s+text|trajectory\b|hidden\b|secret\b|task\s+content)",
+    re.IGNORECASE,
+)
+
+
+class FrozenDict(dict[str, Any]):
+    """Dict-compatible mapping that rejects mutation after validation."""
+
+    def _immutable(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("mapping is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable  # type: ignore[assignment]
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable  # type: ignore[assignment]
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> FrozenDict:
+        clone = FrozenDict()
+        memo[id(self)] = clone
+        for key, value in self.items():
+            dict.__setitem__(clone, deepcopy(key, memo), deepcopy(value, memo))
+        return clone
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return FrozenDict({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
+_EVENT_METADATA_KEYS = frozenset(
+    {
+        "approval_digest", "artifact_id", "cost_usd", "evidence_label", "event_id",
+        "experiment_id", "latency_ms", "operation_key", "phase", "provider_id",
+        "reason_code", "run_id", "status",
+    }
+)
+
+
+def _validate_event_metadata(value: dict[str, str]) -> FrozenDict:
+    for key, item in value.items():
+        if key not in _EVENT_METADATA_KEYS:
+            raise ValueError(f"event metadata key {key!r} is not allow-listed")
+        if not item.strip() or len(item) > 512 or _UNSAFE_CONTENT.search(item):
+            raise ValueError("event metadata must contain only safe opaque references")
+    return FrozenDict(value)
 
 
 def utc_now() -> datetime:
@@ -112,6 +171,17 @@ class ExperimentRecord(ContractModel):
                 raise ValueError("metrics require non-empty names and finite numeric values")
         return value
 
+    @field_validator("training_config", "metrics", mode="after")
+    @classmethod
+    def freeze_mappings(cls, value: dict[str, Any]) -> FrozenDict:
+        return cast(FrozenDict, _deep_freeze(value))
+
+    @model_validator(mode="after")
+    def freeze_nested_values(self) -> ExperimentRecord:
+        object.__setattr__(self, "training_config", _deep_freeze(self.training_config))
+        object.__setattr__(self, "metrics", _deep_freeze(self.metrics))
+        return self
+
 
 class RunOperation(ContractModel):
     """Persisted intent/result used to reconcile an at-least-once provider call."""
@@ -128,6 +198,8 @@ class RunOperation(ContractModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
+    version: int = Field(default=0, ge=0)
+
     @field_validator("request_digest")
     @classmethod
     def validate_request_digest(cls, value: str | None) -> str | None:
@@ -141,6 +213,16 @@ class RunOperation(ContractModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("timestamps must include a timezone")
         return value
+
+    @field_validator("result", mode="after")
+    @classmethod
+    def freeze_result(cls, value: dict[str, Any]) -> FrozenDict:
+        return cast(FrozenDict, _deep_freeze(value))
+
+    @model_validator(mode="after")
+    def freeze_nested_values(self) -> RunOperation:
+        object.__setattr__(self, "result", _deep_freeze(self.result))
+        return self
 
 
 class RunEventRecord(ContractModel):
@@ -164,6 +246,18 @@ class RunEventRecord(ContractModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("occurred_at must include a timezone")
         return value
+
+    @field_validator("reason")
+    @classmethod
+    def reject_unsafe_reason(cls, value: str) -> str:
+        if _UNSAFE_CONTENT.search(value):
+            raise ValueError("event reason may not contain raw or sealed content")
+        return value
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def validate_metadata(cls, value: dict[str, str]) -> FrozenDict:
+        return _validate_event_metadata(value)
 
 
 class AutonomousRunState(ContractModel):
@@ -236,6 +330,16 @@ class AutonomousRunState(ContractModel):
             raise ValueError("artifact references cannot be blank")
         return value
 
+    @field_validator("experiments", mode="after")
+    @classmethod
+    def freeze_experiments(cls, value: list[ExperimentRecord]) -> tuple[ExperimentRecord, ...]:
+        return tuple(value)
+
+    @field_validator("metadata", "baseline_metrics", "champion_metrics", mode="after")
+    @classmethod
+    def freeze_state_mappings(cls, value: dict[str, Any]) -> FrozenDict:
+        return cast(FrozenDict, _deep_freeze(value))
+
     @model_validator(mode="after")
     def validate_budget_and_scope(self) -> AutonomousRunState:
         if self.spent_budget_usd > self.approved_budget_usd:
@@ -244,6 +348,10 @@ class AutonomousRunState(ContractModel):
             raise ValueError("experiment history exceeds approved maximum")
         if self.approval_consumed and not self.approval_digest:
             raise ValueError("consumed approval requires approval_digest")
+        object.__setattr__(self, "experiments", tuple(self.experiments))
+        object.__setattr__(self, "metadata", _deep_freeze(self.metadata))
+        object.__setattr__(self, "baseline_metrics", _deep_freeze(self.baseline_metrics))
+        object.__setattr__(self, "champion_metrics", _deep_freeze(self.champion_metrics))
         return self
 
     @property

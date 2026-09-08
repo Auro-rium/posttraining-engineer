@@ -69,11 +69,16 @@ class Page[T]:
     """Small immutable-ish page value with list-compatible convenience methods."""
 
     def __init__(
-        self, items: Sequence[T], next_after: int | None = None, next_offset: int | None = None
+        self,
+        items: Sequence[T],
+        next_after: int | None = None,
+        next_offset: int | None = None,
+        next_cursor: Mapping[str, Any] | None = None,
     ):
         self.items = list(items)
         self.next_after = next_after
         self.next_offset = next_offset
+        self.next_cursor = dict(next_cursor) if next_cursor is not None else None
 
     def __iter__(self):  # type: ignore[no-untyped-def]
         return iter(self.items)
@@ -84,9 +89,17 @@ class Page[T]:
     def __getitem__(self, index: int) -> T:
         return self.items[index]
 
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Page):
+            return self.items == other.items
+        if isinstance(other, list):
+            return self.items == other
+        return NotImplemented
+
 
 EventPage = Page[RunEventRecord]
 ExperimentPage = Page[ExperimentRecord]
+StatePage = Page[AutonomousRunState]
 
 
 @runtime_checkable
@@ -129,8 +142,12 @@ class AutonomousRunRepository(Protocol):
     def release_lease(self, run_id: str, owner: str) -> AutonomousRunState: ...
 
     def scan_recoverable(
-        self, *, now: datetime | None = None, limit: int = 100
-    ) -> list[AutonomousRunState]: ...
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
+    ) -> StatePage: ...
 
     def put_operation_intent(self, operation: RunOperation) -> RunOperation: ...
 
@@ -149,13 +166,23 @@ class AutonomousRunRepository(Protocol):
     ) -> RunOperation: ...
 
     def list_events(
-        self, run_id: str, *, after_sequence: int = 0, limit: int = 100
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
     ) -> EventPage: ...
 
     def add_experiment(self, run_id: str, experiment: ExperimentRecord) -> ExperimentRecord: ...
 
     def list_experiments(
-        self, run_id: str, *, offset: int = 0, limit: int = 100
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
     ) -> ExperimentPage: ...
 
 
@@ -391,8 +418,16 @@ class InMemoryAutonomousRunRepository:
             )
 
     def scan_recoverable(
-        self, *, now: datetime | None = None, limit: int = 100
-    ) -> list[AutonomousRunState]:
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
+    ) -> StatePage:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if cursor is not None:
+            raise ValueError("in-memory recovery does not accept a cursor")
         when = _ensure_now(now)
         terminal = {
             AutonomousRunStatus.SUCCEEDED,
@@ -409,7 +444,7 @@ class InMemoryAutonomousRunRepository:
                 if state.lease_owner and state.lease_expires_at and state.lease_expires_at > when:
                     continue
                 values.append(copy_for_storage(state))
-            return values[: max(0, limit)]
+            return StatePage(values[:limit])
 
     def put_operation_intent(self, operation: RunOperation) -> RunOperation:
         with self._lock:
@@ -450,11 +485,26 @@ class InMemoryAutonomousRunRepository:
             current = self._operations.get((run_id, operation_key))
             if current is None:
                 raise OperationNotFoundError("operation intent does not exist")
+            normalized_status = RunOperationStatus(status)
+            normalized_result = dict(result or {})
+            if current.status in {
+                RunOperationStatus.SUCCEEDED,
+                RunOperationStatus.FAILED,
+                RunOperationStatus.CANCELLED,
+            }:
+                if (
+                    current.status is normalized_status
+                    and current.provider_id == provider_id
+                    and dict(current.result) == normalized_result
+                ):
+                    return copy_for_storage(current)
+                raise OperationAlreadyExistsError("terminal operation result cannot be changed")
             updated = current.model_copy(
                 update={
                     "provider_id": provider_id if provider_id is not None else current.provider_id,
-                    "status": status,
-                    "result": dict(result or {}),
+                    "status": normalized_status,
+                    "result": normalized_result,
+                    "version": current.version + 1,
                     "updated_at": utc_now(),
                 }
             )
@@ -462,7 +512,18 @@ class InMemoryAutonomousRunRepository:
             self._operations[(run_id, operation_key)] = copy_for_storage(updated)
             return copy_for_storage(updated)
 
-    def list_events(self, run_id: str, *, after_sequence: int = 0, limit: int = 100) -> EventPage:
+    def list_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
+    ) -> EventPage:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if cursor is not None:
+            raise ValueError("in-memory event reads do not accept a cursor")
         with self._lock:
             self._require(run_id)
             values = [event for event in self._events[run_id] if event.sequence > after_sequence]
@@ -496,7 +557,18 @@ class InMemoryAutonomousRunRepository:
             )
             return copy_for_storage(stored)
 
-    def list_experiments(self, run_id: str, *, offset: int = 0, limit: int = 100) -> ExperimentPage:
+    def list_experiments(
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
+    ) -> ExperimentPage:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if cursor is not None:
+            raise ValueError("in-memory experiment reads do not accept a cursor")
         with self._lock:
             self._require(run_id)
             values = self._experiments[run_id]
@@ -536,7 +608,10 @@ class DynamoDBAutonomousRunRepository:
     ) -> None:
         if table is None and not table_name:
             raise ValueError("table_name is required when table is not supplied")
-        self.table_name = table_name
+        derived_name = getattr(table, "name", None) if table is not None else None
+        self.table_name = table_name or derived_name
+        if not self.table_name:
+            raise ValueError("injected table must expose a name or table_name is required")
         self._table = table
         self._client = client
         self._resource = resource
@@ -564,8 +639,16 @@ class DynamoDBAutonomousRunRepository:
         return self._client
 
     @staticmethod
+    def _operation_sk(operation_key: str) -> str:
+        return f"OP#{operation_key}"
+
+    @staticmethod
     def _key(run_id: str, sort_key: str = "STATE") -> dict[str, str]:
         return {"pk": f"RUN#{run_id}", "sk": sort_key}
+
+    @classmethod
+    def _ddb_key(cls, run_id: str, sort_key: str = "STATE") -> dict[str, dict[str, str]]:
+        return {key: cls._encode(value) for key, value in cls._key(run_id, sort_key).items()}
 
     @staticmethod
     def _encode(value: Any) -> dict[str, Any]:
@@ -584,12 +667,15 @@ class DynamoDBAutonomousRunRepository:
         return {"S": str(value)}
 
     @classmethod
-    def _item(cls, sort_key: str, payload: Any) -> dict[str, Any]:
+    def _item(cls, sort_key: str, payload: Any, *, run_id: str | None = None) -> dict[str, Any]:
         data = payload.model_dump(mode="json")
+        payload_run_id = getattr(payload, "run_id", None) or run_id
+        if not isinstance(payload_run_id, str) or not payload_run_id:
+            raise ValueError("run_id is required for persisted records")
         item: dict[str, Any] = {
             "entity": type(payload).__name__,
-            "run_id": payload.run_id,
-            "pk": f"RUN#{payload.run_id}",
+            "run_id": payload_run_id,
+            "pk": f"RUN#{payload_run_id}",
             "sk": sort_key,
             "payload": _json(data),
         }
@@ -609,6 +695,7 @@ class DynamoDBAutonomousRunRepository:
                     "operation_key": payload.operation_key,
                     "experiment_number": payload.experiment_number,
                     "status": payload.status.value,
+                    "version": payload.version,
                 }
             )
         elif isinstance(payload, ExperimentRecord):
@@ -616,10 +703,15 @@ class DynamoDBAutonomousRunRepository:
         return item
 
     @classmethod
-    def _ddb_item(cls, sort_key: str, payload: Any) -> dict[str, Any]:
+    def _ddb_item(
+        cls, sort_key: str, payload: Any, *, run_id: str | None = None
+    ) -> dict[str, Any]:
         """Encode a native resource item for the low-level DynamoDB client."""
 
-        return {key: cls._encode(value) for key, value in cls._item(sort_key, payload).items()}
+        return {
+            key: cls._encode(value)
+            for key, value in cls._item(sort_key, payload, run_id=run_id).items()
+        }
 
     @staticmethod
     def _decode(item: Mapping[str, Any], model: type[ModelT]) -> ModelT:
@@ -840,7 +932,7 @@ class DynamoDBAutonomousRunRepository:
             self._table_or_create().put_item(
                 Item=self._item(self.STATE_SK, next_state),
                 ConditionExpression="version = :version",
-                ExpressionAttributeValues={":version": {"N": str(current.version)}},
+                ExpressionAttributeValues={":version": current.version},
             )
         except Exception as exc:
             if self._conditional(exc):
@@ -883,15 +975,20 @@ class DynamoDBAutonomousRunRepository:
         self._table_or_create().put_item(
             Item=self._item(self.STATE_SK, next_state),
             ConditionExpression="version = :version",
-            ExpressionAttributeValues={":version": {"N": str(current.version)}},
+            ExpressionAttributeValues={":version": current.version},
         )
         return next_state
 
     def scan_recoverable(
-        self, *, now: datetime | None = None, limit: int = 100
-    ) -> list[AutonomousRunState]:
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
+    ) -> StatePage:
+        if limit < 1:
+            raise ValueError("limit must be positive")
         # Scan is intentionally metadata-only and bounded; production callers should add a GSI.
-        response = self._table_or_create().scan(Limit=max(0, limit))
         when = _ensure_now(now)
         terminal = {
             AutonomousRunStatus.SUCCEEDED,
@@ -900,22 +997,59 @@ class DynamoDBAutonomousRunRepository:
             AutonomousRunStatus.BLOCKED,
             AutonomousRunStatus.STOPPED,
         }
-        output = []
-        for item in response.get("Items", []):
-            if item.get("sk") != self.STATE_SK:
-                continue
-            state = self._decode(item, AutonomousRunState)
-            if state.status not in terminal and not (
-                state.lease_owner and state.lease_expires_at and state.lease_expires_at > when
-            ):
-                output.append(state)
-        return output[: max(0, limit)]
+        output: list[AutonomousRunState] = []
+        next_cursor = dict(cursor) if cursor is not None else None
+        while len(output) < limit:
+            kwargs: dict[str, Any] = {"Limit": limit}
+            if next_cursor is not None:
+                kwargs["ExclusiveStartKey"] = next_cursor
+            response = self._table_or_create().scan(**kwargs)
+            page_cursor: dict[str, Any] | None = None
+            for item in response.get("Items", []):
+                if item.get("sk") != self.STATE_SK:
+                    page_cursor = {"pk": item.get("pk"), "sk": item.get("sk")}
+                    continue
+                state = self._decode(item, AutonomousRunState)
+                if state.status not in terminal and not (
+                    state.lease_owner
+                    and state.lease_expires_at
+                    and state.lease_expires_at > when
+                ):
+                    output.append(state)
+                    page_cursor = {"pk": item.get("pk"), "sk": item.get("sk")}
+                    if len(output) >= limit:
+                        break
+            raw_cursor = response.get("LastEvaluatedKey")
+            if len(output) >= limit and page_cursor is not None:
+                next_cursor = page_cursor
+            else:
+                next_cursor = dict(raw_cursor) if isinstance(raw_cursor, Mapping) else None
+            if next_cursor is None:
+                break
+        return StatePage(output[:limit], next_cursor=next_cursor)
 
     def put_operation_intent(self, operation: RunOperation) -> RunOperation:
-        item = self._item(f"OP#{operation.experiment_number}#{operation.phase.value}", operation)
+        if self.get(operation.run_id) is None:
+            raise RunNotFoundError(f"run {operation.run_id!r} was not found")
+        item = self._ddb_item(self._operation_sk(operation.operation_key), operation)
         try:
-            self._table_or_create().put_item(
-                Item=item, ConditionExpression="attribute_not_exists(pk)"
+            self._client_or_create().transact_write_items(
+                TransactItems=[
+                    {
+                        "ConditionCheck": {
+                            "TableName": self.table_name,
+                            "Key": self._ddb_key(operation.run_id, self.STATE_SK),
+                            "ConditionExpression": "attribute_exists(pk)",
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table_name,
+                            "Item": item,
+                            "ConditionExpression": "attribute_not_exists(pk)",
+                        }
+                    },
+                ]
             )
         except Exception as exc:
             if self._conditional(exc):
@@ -929,16 +1063,13 @@ class DynamoDBAutonomousRunRepository:
         return operation
 
     def get_operation(self, run_id: str, operation_key: str | None = None) -> RunOperation | None:
-        response = self._table_or_create().query(
-            KeyConditionExpression="pk = :pk",
-            ExpressionAttributeValues={":pk": f"RUN#{run_id}", ":prefix": "OP#"},
-            FilterExpression="begins_with(sk, :prefix)",
+        if operation_key is None:
+            raise ValueError("operation_key is required for an operation lookup")
+        response = self._table_or_create().get_item(
+            Key=self._key(run_id, self._operation_sk(operation_key)), ConsistentRead=True
         )
-        for item in response.get("Items", []):
-            operation = self._decode(item, RunOperation)
-            if operation_key is None or operation.operation_key == operation_key:
-                return operation
-        return None
+        item = response.get("Item")
+        return self._decode(item, RunOperation) if isinstance(item, Mapping) else None
 
     def record_operation_result(
         self,
@@ -952,35 +1083,76 @@ class DynamoDBAutonomousRunRepository:
         current = self.get_operation(run_id, operation_key)
         if current is None:
             raise OperationNotFoundError("operation intent does not exist")
+        normalized_status = RunOperationStatus(status)
+        normalized_result = dict(result or {})
+        if current.status in {
+            RunOperationStatus.SUCCEEDED,
+            RunOperationStatus.FAILED,
+            RunOperationStatus.CANCELLED,
+        }:
+            if (
+                current.status is normalized_status
+                and current.provider_id == provider_id
+                and dict(current.result) == normalized_result
+            ):
+                return current
+            raise OperationAlreadyExistsError("terminal operation result cannot be changed")
         updated = RunOperation.model_validate(
             current.model_copy(
                 update={
                     "provider_id": provider_id if provider_id is not None else current.provider_id,
-                    "status": status,
-                    "result": dict(result or {}),
+                    "status": normalized_status,
+                    "result": normalized_result,
+                    "version": current.version + 1,
                     "updated_at": utc_now(),
                 }
             ).model_dump(mode="python")
         )
-        self._table_or_create().put_item(
-            Item=self._item(f"OP#{updated.experiment_number}#{updated.phase.value}", updated)
-        )
+        try:
+            self._table_or_create().put_item(
+                Item=self._item(self._operation_sk(updated.operation_key), updated),
+                ConditionExpression="version = :version",
+                ExpressionAttributeValues={":version": current.version},
+            )
+        except Exception as exc:
+            if self._conditional(exc):
+                raise OperationAlreadyExistsError(
+                    "operation result changed concurrently"
+                ) from exc
+            raise
         return updated
 
-    def list_events(self, run_id: str, *, after_sequence: int = 0, limit: int = 100) -> EventPage:
+    def list_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
+    ) -> EventPage:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        expression_values: dict[str, Any] = {
+            ":pk": f"RUN#{run_id}",
+            ":start": f"EVENT#{after_sequence:020d}",
+            ":end": "EVENT#\uffff",
+        }
+        kwargs: dict[str, Any] = {
+            "KeyConditionExpression": "pk = :pk AND sk BETWEEN :start AND :end",
+            "ExpressionAttributeValues": expression_values,
+            "Limit": limit,
+            "ScanIndexForward": True,
+        }
+        if cursor is not None:
+            kwargs["ExclusiveStartKey"] = dict(cursor)
         response = self._table_or_create().query(
-            KeyConditionExpression="pk = :pk AND sk > :after",
-            ExpressionAttributeValues={
-                ":pk": f"RUN#{run_id}",
-                ":after": f"EVENT#{after_sequence:020d}",
-            },
-            Limit=max(0, limit),
-            ScanIndexForward=True,
+            **kwargs
         )
         values = [self._decode(item, RunEventRecord) for item in response.get("Items", [])]
         return EventPage(
             values[:limit],
-            next_after=values[-1].sequence if len(values) == limit and values else None,
+            next_after=values[-1].sequence if values and response.get("LastEvaluatedKey") else None,
+            next_cursor=response.get("LastEvaluatedKey"),
         )
 
     def add_experiment(self, run_id: str, experiment: ExperimentRecord) -> ExperimentRecord:
@@ -1013,7 +1185,9 @@ class DynamoDBAutonomousRunRepository:
                         "Put": {
                             "TableName": table_name,
                             "Item": self._ddb_item(
-                                f"EXP#{experiment.experiment_number:04d}", experiment
+                                f"EXP#{experiment.experiment_number:04d}",
+                                experiment,
+                                run_id=run_id,
                             ),
                             "ConditionExpression": "attribute_not_exists(pk)",
                         }
@@ -1034,19 +1208,41 @@ class DynamoDBAutonomousRunRepository:
             raise
         return experiment
 
-    def list_experiments(self, run_id: str, *, offset: int = 0, limit: int = 100) -> ExperimentPage:
-        response = self._table_or_create().query(
-            KeyConditionExpression="pk = :pk",
-            ExpressionAttributeValues={":pk": f"RUN#{run_id}", ":prefix": "EXP#"},
-            FilterExpression="begins_with(sk, :prefix)",
-            ScanIndexForward=True,
-            Limit=max(0, offset + limit),
-        )
+    def list_experiments(
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        cursor: Mapping[str, Any] | None = None,
+    ) -> ExperimentPage:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if offset < 0:
+            raise ValueError("offset must not be negative")
+        kwargs: dict[str, Any] = {
+            "KeyConditionExpression": "pk = :pk AND sk BETWEEN :start AND :end",
+            "ExpressionAttributeValues": {
+                ":pk": f"RUN#{run_id}",
+                ":start": "EXP#0000",
+                ":end": "EXP#\uffff",
+            },
+            "ScanIndexForward": True,
+            "Limit": offset + limit if cursor is None else limit,
+        }
+        if cursor is not None:
+            kwargs["ExclusiveStartKey"] = dict(cursor)
+        response = self._table_or_create().query(**kwargs)
         values = [self._decode(item, ExperimentRecord) for item in response.get("Items", [])]
-        selected = values[offset : offset + limit]
+        selected = values[offset : offset + limit] if cursor is None and offset else values[:limit]
         return ExperimentPage(
             selected,
-            next_offset=offset + len(selected) if offset + len(selected) < len(values) else None,
+            next_offset=(
+                offset + len(selected)
+                if cursor is None and offset + len(selected) < len(values)
+                else None
+            ),
+            next_cursor=response.get("LastEvaluatedKey"),
         )
 
     create_run = create
