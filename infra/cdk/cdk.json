@@ -1,0 +1,30 @@
+{
+  "app": "../../backend/.venv/bin/python app.py",
+  "context": {
+    "region": "us-east-1",
+    "backend_image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "trainer_image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "evaluator_image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "objective_worker_url": "https://objective.internal",
+    "artifact_prefix": "post-training",
+    "target_model": "google/functiongemma-270m-it",
+    "strands_model": "nvidia.nemotron-super-3-120b",
+    "objective_suite": "AgentGym/AgentEval",
+    "objective_suite_version": "agent-eval-v1",
+    "max_experiments": "5",
+    "max_cost_usd": "25",
+    "max_training_time_min": "120",
+    "sagemaker_instance_type": "ml.g5.xlarge",
+    "gpu_instance_allowlist": "ml.g5.xlarge",
+    "minimum_gpu_quota": "1",
+    "sagemaker_instance_count": "1",
+    "sagemaker_volume_size_gb": "30",
+    "approval_secret_env": "LIVE_APPROVAL_SECRET",
+    "approval_ttl_seconds": "900",
+    "posttraining_seed": "7",
+    "telemetry_enabled": "true",
+    "telemetry_exporter": "logging",
+    "desired_count": "1",
+    "objective_desired_count": "1"
+  }
+}

@@ -1,7 +1,6 @@
 """AWS deployment entry point for the backend-only hackathon service."""
 
 import aws_cdk as cdk
-
 from stacks.post_training_stack import PostTrainingStack
 
 app = cdk.App()
