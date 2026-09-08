@@ -71,7 +71,16 @@ def _graph_payload(comparison: ComparisonDTO) -> dict[str, object]:
                 per_environment=row.candidate_per_environment,
             )
         )
-    chart_data = build_comparison(points)
+    try:
+        chart_data = build_comparison(points)
+    except ValueError as exc:
+        # An empty or malformed history is a client-visible readiness issue,
+        # not an unhandled server exception.  Keep the API fail-closed so the
+        # dashboard can render the error state and retry after a run exists.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     return {
         "comparison": comparison.model_dump(mode="json"),
         "chart_data": chart_data,

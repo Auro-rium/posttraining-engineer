@@ -22,19 +22,28 @@ class OptimizationOrchestrator:
     def __init__(
         self,
         *,
+        model: str | None = None,
         benchmark_adapter: Any = None,
         training_adapter: Any = None,
         evaluation_adapter: Any = None,
     ):
         # Initialize all eight agents
-        self.benchmark_agent = create_benchmark_agent(adapter=benchmark_adapter)
-        self.failure_analyst_agent = create_failure_analyst_agent()
-        self.research_agent = create_research_agent()
-        self.data_curator_agent = create_data_curator_agent()
-        self.training_designer_agent = create_training_designer_agent()
-        self.training_executor_agent = create_training_executor_agent(adapter=training_adapter)
-        self.eval_agent = create_eval_agent(adapter=evaluation_adapter)
-        self.champion_manager_agent = create_champion_manager_agent()
+        resolved_model = model or "nvidia.nemotron-super-3-120b"
+        self.model_id = resolved_model
+        self.benchmark_agent = create_benchmark_agent(
+            model=resolved_model, adapter=benchmark_adapter
+        )
+        self.failure_analyst_agent = create_failure_analyst_agent(model=resolved_model)
+        self.research_agent = create_research_agent(model=resolved_model)
+        self.data_curator_agent = create_data_curator_agent(model=resolved_model)
+        self.training_designer_agent = create_training_designer_agent(model=resolved_model)
+        self.training_executor_agent = create_training_executor_agent(
+            model=resolved_model, adapter=training_adapter
+        )
+        self.eval_agent = create_eval_agent(
+            model=resolved_model, adapter=evaluation_adapter
+        )
+        self.champion_manager_agent = create_champion_manager_agent(model=resolved_model)
 
         # Define the workflow phases
         self.phases = [
@@ -519,6 +528,23 @@ class OptimizationOrchestrator:
 
 
 # Factory function
-def create_orchestrator() -> OptimizationOrchestrator:
-    """Create an optimization orchestrator instance."""
-    return OptimizationOrchestrator()
+def create_orchestrator(
+    *,
+    model: str | None = None,
+    benchmark_adapter: Any = None,
+    training_adapter: Any = None,
+    evaluation_adapter: Any = None,
+) -> OptimizationOrchestrator:
+    """Create an orchestrator with explicit model and provider dependencies.
+
+    The coordinator is intentionally dependency-injected: a missing live
+    adapter remains visible to the relevant agent and fails closed instead of
+    silently selecting a simulated implementation.
+    """
+
+    return OptimizationOrchestrator(
+        model=model,
+        benchmark_adapter=benchmark_adapter,
+        training_adapter=training_adapter,
+        evaluation_adapter=evaluation_adapter,
+    )

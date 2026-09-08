@@ -3,6 +3,7 @@ Main application entry point for the autonomous post-training engineer.
 Updated for AWS Agents for Humans Hackathon with Strands Agents.
 """
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from threading import Lock
@@ -27,6 +28,7 @@ from app.posttraining.run_history import (
     RunRegistry,
 )
 from app.providers.repository import DynamoDBRunRepository
+from app.providers.sagemaker import SageMakerProvider
 from app.runtime_config import get_runtime_config
 
 # Configure logging
@@ -99,8 +101,30 @@ def _create_run_registry(config: Any) -> RunRegistry:
 # fails closed rather than silently running the local simulation.
 settings = get_runtime_config()
 
-# Initialize the orchestrator
-orchestrator = create_orchestrator()
+def _create_application_orchestrator(config: Any) -> Any:
+    """Wire configured model/provider dependencies into the coordinator.
+
+    SageMaker's client is lazy, so constructing this adapter does not create a
+    job or another AWS resource.  The objective-worker adapter is intentionally
+    left absent until one is explicitly configured; benchmark execution then
+    fails closed rather than falling back to explanatory metrics.
+    """
+
+    provider = (
+        SageMakerProvider(region_name=config.aws_region)
+        if config.app_mode == "aws"
+        else None
+    )
+    return create_orchestrator(
+        model=config.strands_model,
+        training_adapter=provider,
+        evaluation_adapter=provider,
+    )
+
+
+# Initialize the orchestrator with the same model and provider configuration
+# advertised by the process health contract.
+orchestrator = _create_application_orchestrator(settings)
 
 # In-memory store for active runs (would use database in production)
 active_runs: dict[str, OptimizationRun] = {}
@@ -203,10 +227,16 @@ async def health_check():
             "mode": settings.app_mode,
             "role": settings.service_role,
             "aws_region": settings.aws_region,
+            "reasoning_model": settings.strands_model,
+            "target_model": settings.target_model,
             "timestamp": datetime.utcnow().isoformat(),
             "components": {
                 "orchestrator": "ready",
                 "strands_agents": "initialized",
+                "sagemaker_provider": (
+                    "configured" if settings.app_mode == "aws" else "not_configured"
+                ),
+                "objective_worker": "not_configured",
                 "environment": "available",
                 "run_history": "ready",
                 "telemetry": "ready",
@@ -246,13 +276,54 @@ async def create_optimization_run(
         budget: Resource constraints
     """
     try:
-        # Set default budget if not provided
+        # Apply the deployment's hard budget defaults and reject request-level
+        # values that would widen them.  This keeps the HTTP boundary aligned
+        # with RuntimeConfig rather than allowing a caller to bypass it.
         if budget is None:
             budget = {
-                "maxExperiments": 3,
-                "maxCostUSD": 50.0,
-                "maxTrainingTimeMin": 120
+                "maxExperiments": settings.max_experiments,
+                "maxCostUSD": settings.max_cost_usd,
+                "maxTrainingTimeMin": settings.max_training_time_min,
             }
+        else:
+            budget = dict(budget)
+        max_experiments = budget.get("maxExperiments", settings.max_experiments)
+        max_cost_usd = budget.get("maxCostUSD", settings.max_cost_usd)
+        max_training_time = budget.get(
+            "maxTrainingTimeMin", settings.max_training_time_min
+        )
+        if (
+            isinstance(max_experiments, bool)
+            or not isinstance(max_experiments, int)
+            or not 1 <= max_experiments <= settings.max_experiments
+        ):
+            raise ValueError(
+                f"maxExperiments must be an integer between 1 and {settings.max_experiments}"
+            )
+        if (
+            isinstance(max_cost_usd, bool)
+            or not isinstance(max_cost_usd, (int, float))
+            or not math.isfinite(float(max_cost_usd))
+            or not 0 <= float(max_cost_usd) <= settings.max_cost_usd
+        ):
+            raise ValueError(
+                f"maxCostUSD must be finite and between 0 and {settings.max_cost_usd}"
+            )
+        if (
+            isinstance(max_training_time, bool)
+            or not isinstance(max_training_time, int)
+            or not 1 <= max_training_time <= settings.max_training_time_min
+        ):
+            raise ValueError(
+                "maxTrainingTimeMin must be a positive integer within the configured limit"
+            )
+        budget.update(
+            {
+                "maxExperiments": max_experiments,
+                "maxCostUSD": float(max_cost_usd),
+                "maxTrainingTimeMin": max_training_time,
+            }
+        )
 
         # Generate a unique run ID and reserve the bounded comparison slot.
         run_id = (

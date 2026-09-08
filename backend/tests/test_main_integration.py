@@ -6,7 +6,12 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.core.state import OptimizationRun
-from app.main import _create_run_registry, _record_phase_telemetry, app
+from app.main import (
+    _create_application_orchestrator,
+    _create_run_registry,
+    _record_phase_telemetry,
+    app,
+)
 from app.observability import EventType, TelemetryRecorder
 from app.providers.repository import DynamoDBRunRepository
 
@@ -32,6 +37,27 @@ def test_aws_registry_constructs_without_provisioning_resources() -> None:
     assert repository.table_name == "existing-post-training-runs"
 
 
+def test_application_orchestrator_receives_configured_model() -> None:
+    configured_model = "nvidia.nemotron-super-3-120b"
+    orchestrator = _create_application_orchestrator(
+        SimpleNamespace(app_mode="local", aws_region="us-east-1", strands_model=configured_model)
+    )
+
+    assert orchestrator.model_id == configured_model
+    for agent_name in (
+        "benchmark_agent",
+        "failure_analyst_agent",
+        "research_agent",
+        "data_curator_agent",
+        "training_designer_agent",
+        "training_executor_agent",
+        "eval_agent",
+        "champion_manager_agent",
+    ):
+        model = getattr(orchestrator, agent_name).agent.model
+        assert getattr(model, "config", {}).get("model_id") == configured_model
+
+
 @pytest.mark.anyio
 async def test_main_exposes_comparison_and_telemetry_readiness() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -41,6 +67,7 @@ async def test_main_exposes_comparison_and_telemetry_readiness() -> None:
     assert health.status_code == 200
     assert health.json()["components"]["telemetry"] == "ready"
     assert health.json()["components"]["run_history"] == "ready"
+    assert health.json()["reasoning_model"] == "nvidia.nemotron-super-3-120b"
     assert comparison.status_code == 200
     assert comparison.json()["run_count"] == 0
     assert type(app.state.telemetry).__name__ == "TelemetryRecorder"

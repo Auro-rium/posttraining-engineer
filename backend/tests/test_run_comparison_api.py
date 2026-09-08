@@ -64,6 +64,17 @@ class FakeRegistry:
         )
 
 
+class EmptyRegistry:
+    def compare(self, run_ids: list[str] | None = None) -> ComparisonDTO:
+        del run_ids
+        return ComparisonDTO(
+            comparison_id="comparison-empty",
+            run_ids=(),
+            rows=(),
+            created_at=datetime(2026, 9, 8, tzinfo=UTC),
+        )
+
+
 @pytest.mark.anyio
 async def test_comparison_endpoint_returns_ordered_rows() -> None:
     app = FastAPI()
@@ -104,3 +115,15 @@ async def test_comparison_endpoint_rejects_more_than_five_requested_runs() -> No
         )
 
     assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_graph_endpoint_rejects_empty_history_as_unprocessable() -> None:
+    app = FastAPI()
+    install_run_comparison_api(app, EmptyRegistry())
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/runs/graph")
+
+    assert response.status_code == 422
+    assert "at least one run" in response.json()["detail"]
