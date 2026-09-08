@@ -11,6 +11,7 @@ from app.runtime_config import RuntimeConfig
 def test_defaults_match_bounded_five_run_demo_contract() -> None:
     settings = RuntimeConfig(_env_file=None)
 
+    assert settings.bedrock_auth_mode == "sigv4"
     assert settings.max_experiments == 5
     assert settings.max_cost_usd == 25.0
     assert settings.objective_suite == "AgentGym/AgentEval"
@@ -43,3 +44,8 @@ def test_telemetry_can_be_disabled_for_local_diagnostics() -> None:
 
     assert settings.telemetry_enabled is False
     assert settings.telemetry_exporter == "none"
+
+
+def test_bedrock_auth_mode_rejects_bearer_fallback() -> None:
+    with pytest.raises(ValidationError, match="bedrock_auth_mode"):
+        RuntimeConfig(_env_file=None, bedrock_auth_mode="bearer")

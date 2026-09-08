@@ -77,6 +77,9 @@ The API is intentionally small:
 - `POST /api/runs/{run_id}/cancel`
 - `GET /api/runs/compare`
 - `GET /api/runs/graph`
+- `GET /api/live/readiness`
+- `GET /api/traces`
+- `GET /api/cycles`
 - `POST /api/demo/reset-environment`
 - `GET /health`
 
@@ -198,11 +201,26 @@ docker compose config --quiet
 
 ## AWS deployment status
 
-The AWS/Strands implementation has not been executed as a live post-training run in this checkout. The repository does not provision cloud resources; AWS mode only constructs adapters for pre-existing configured S3, DynamoDB, and SageMaker resources. Do not describe local state or explanatory adapters as live AWS evidence.
+The AWS/Strands implementation has not been executed as a live post-training
+run in this checkout. The guarded live controller and AWS adapters exist, but
+the public local `/api/runs` workflow still uses process-local state and
+`EXPLANATION` fixtures. Do not describe that path as a live AWS result.
 
-For a live submission path, wire the existing role contracts to AWS adapters in this order: Bedrock `nvidia.nemotron-super-3-120b` invocation for agent decisions; S3 for immutable trajectories, datasets, and checkpoints; DynamoDB for `OptimizationRun` and events; SageMaker for QLoRA execution; and optional AgentCore hosting plus CloudWatch traces. Record the exact AWS resource IDs, prompt metadata, and artifact hashes in the run before showing a metric.
+The repository includes a CDK foundation in [infra/cdk](infra/cdk). It can
+provision the retained storage, ECR, VPC, ECS/Fargate, CloudWatch, IAM, and
+SageMaker role boundary described in [infra/cdk/README.md](infra/cdk/README.md).
+It does not provision the objective worker, trainer/evaluator images,
+FunctionGemma checkpoint or AgentEval data, Bedrock model entitlement, approval
+secret, GPU placement capacity, or public ingress/authentication. Those are
+deployment prerequisites and must be configured before the read-only
+`/api/live/readiness` or `scripts/live_preflight.py` can report `READY`.
 
-No infrastructure-as-code stack is included yet. An AWS-native deployment stack can be added after the local workflow is made live; no cloud provider is implied by the current demo.
+The live controller reuses existing resources and never deletes persistent
+S3, DynamoDB, IAM, ECR, VPC, or ECS infrastructure. It only stops the current
+run's in-progress SageMaker jobs during cleanup. A real run is claimable only
+after a successful preflight, an explicit signed approval, provider job IDs,
+immutable artifact hashes, held-out evidence, and a deterministic promotion
+decision have been retained.
 
 ## Living documentation
 

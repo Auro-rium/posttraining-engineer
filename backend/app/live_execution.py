@@ -975,6 +975,7 @@ class AutonomousRunController:
         parent_run_id = champion_record.run_id if champion_record else None
         champion_run_id = champion_record.run_id if champion_record else None
         checkpoint_sha256 = self._checkpoint_sha256(champion_record)
+        checkpoint_uri = self._checkpoint_uri(champion_record)
         if packet.checkpoint_sha256 != checkpoint_sha256:
             raise LiveExecutionBlocked(
                 "approval packet checkpoint digest does not match the selected artifact"
@@ -985,6 +986,7 @@ class AutonomousRunController:
             parent_run_id=parent_run_id,
             champion_run_id=champion_run_id,
             checkpoint_sha256=checkpoint_sha256,
+            checkpoint_uri=checkpoint_uri,
         )
         manifest_sha256 = hashlib.sha256(
             json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode()
@@ -1022,14 +1024,11 @@ class AutonomousRunController:
             self._event(EventType.RUN_STARTED, run_id, run_number, status="running")
             baseline = self._benchmark(
                 run_id=run_id,
-                model_uri=(
-                    self._checkpoint_uri()
-                    if champion_record is None
-                    else self._champion_uri(champion_record)
-                ),
+                model_uri=checkpoint_uri,
                 split="baseline",
                 episodes=self.config.baseline_episodes,
                 output_s3_uri=f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/{run_id}/baseline",
+                manifest_sha256=manifest_sha256,
             )
             training_request = TrainingJobRequest(
                 job_name=f"apt-{run_id}-train",
@@ -1052,7 +1051,14 @@ class AutonomousRunController:
                 job=training_job,
                 manifest_sha256=manifest_sha256,
             ))
-            self._event(EventType.JOB_SUBMITTED, run_id, run_number, status="training")
+            self._event(
+                EventType.JOB_SUBMITTED,
+                run_id,
+                run_number,
+                phase="training",
+                job_id=str(training_job.provider_job_id),
+                status="submitted",
+            )
             training_job = wait_for_training_job(
                 self.provider,
                 training_job.job_name,
@@ -1061,7 +1067,14 @@ class AutonomousRunController:
             )
             if training_job.status is not JobStatus.COMPLETED or not training_job.artifact_uri:
                 raise LiveExecutionFailed("training did not complete with a model artifact")
-            self._event(EventType.JOB_COMPLETED, run_id, run_number, status="training")
+            self._event(
+                EventType.JOB_COMPLETED,
+                run_id,
+                run_number,
+                phase="training",
+                job_id=str(training_job.provider_job_id),
+                status="completed",
+            )
             candidate_artifact = self._artifact_from_job(training_job, ArtifactKind.CHECKPOINT)
 
             evaluation_request = EvaluationJobRequest(
@@ -1086,7 +1099,14 @@ class AutonomousRunController:
                 job=evaluation_job,
                 manifest_sha256=manifest_sha256,
             ))
-            self._event(EventType.JOB_SUBMITTED, run_id, run_number, status="evaluation")
+            self._event(
+                EventType.JOB_SUBMITTED,
+                run_id,
+                run_number,
+                phase="evaluation",
+                job_id=str(evaluation_job.provider_job_id),
+                status="submitted",
+            )
             evaluation_job = wait_for_evaluation_job(
                 self.provider,
                 evaluation_job.job_name,
@@ -1095,13 +1115,21 @@ class AutonomousRunController:
             )
             if evaluation_job.status is not JobStatus.COMPLETED:
                 raise LiveExecutionFailed("evaluation did not complete")
-            self._event(EventType.JOB_COMPLETED, run_id, run_number, status="evaluation")
+            self._event(
+                EventType.JOB_COMPLETED,
+                run_id,
+                run_number,
+                phase="evaluation",
+                job_id=str(evaluation_job.provider_job_id),
+                status="completed",
+            )
             candidate = self._benchmark(
                 run_id=run_id,
                 model_uri=training_job.artifact_uri,
                 split="held_out",
                 episodes=self.config.held_out_episodes,
                 output_s3_uri=f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/{run_id}/held-out",
+                manifest_sha256=manifest_sha256,
             )
             if (
                 candidate.evidence_label
@@ -1119,6 +1147,19 @@ class AutonomousRunController:
             )
             status = RunStatus.COMPLETED if gate.passed else RunStatus.REJECTED
             decision = RunDecision.PROMOTE if gate.passed else RunDecision.REJECT
+            self._event(
+                EventType.PROMOTION_DECIDED,
+                run_id,
+                run_number,
+                phase="promotion",
+                evidence_label=candidate.evidence_label,
+                status=decision.value,
+                attributes={
+                    "decision": decision.value,
+                    "baseline_score": baseline.metrics.aggregate,
+                    "candidate_score": candidate.metrics.aggregate,
+                },
+            )
             record = self._record(
                 run_id=run_id,
                 run_number=run_number,
@@ -1161,6 +1202,7 @@ class AutonomousRunController:
                     champion_run_id=champion_run_id,
                     manifest_sha256=manifest_sha256,
                     manifest_artifact=manifest_artifact,
+                    job_metadata_artifacts=tuple(job_metadata_artifacts),
                 )
             self._event(EventType.RUN_FAILED, run_id, run_number, status="blocked")
             raise
@@ -1173,6 +1215,7 @@ class AutonomousRunController:
                     champion_run_id=champion_run_id,
                     manifest_sha256=manifest_sha256,
                     manifest_artifact=manifest_artifact,
+                    job_metadata_artifacts=tuple(job_metadata_artifacts),
                 )
             self._event(EventType.RUN_FAILED, run_id, run_number, status="failed")
             raise LiveExecutionFailed(
@@ -1190,6 +1233,7 @@ class AutonomousRunController:
         champion_run_id: str | None,
         manifest_sha256: str,
         manifest_artifact: ArtifactReference | None,
+        job_metadata_artifacts: tuple[ArtifactReference, ...] = (),
     ) -> None:
         """Close a reserved slot without inventing metrics or evidence."""
 
@@ -1200,7 +1244,11 @@ class AutonomousRunController:
             champion_run_id=champion_run_id,
             status=RunStatus.FAILED,
             manifest_sha256=manifest_sha256,
-            artifact_refs=(manifest_artifact,) if manifest_artifact else (),
+            artifact_refs=tuple(
+                item
+                for item in (manifest_artifact, *job_metadata_artifacts)
+                if item is not None
+            ),
             decision_reasons=("live execution failed before verified evidence",),
         )
         try:
@@ -1266,12 +1314,14 @@ class AutonomousRunController:
         parent_run_id = champion_record.run_id if champion_record else None
         champion_run_id = champion_record.run_id if champion_record else None
         checkpoint_sha256 = self._checkpoint_sha256(champion_record)
+        checkpoint_uri = self._checkpoint_uri(champion_record)
         manifest_payload = self._manifest_payload(
             run_id=actual_run_id,
             run_number=run_number,
             parent_run_id=parent_run_id,
             champion_run_id=champion_run_id,
             checkpoint_sha256=checkpoint_sha256,
+            checkpoint_uri=checkpoint_uri,
         )
         manifest_sha256 = hashlib.sha256(
             json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode()
@@ -1310,10 +1360,7 @@ class AutonomousRunController:
 
     def _checkpoint_sha256(self, champion_record: RunHistoryRecord | None) -> str:
         if champion_record is not None:
-            for artifact in champion_record.artifact_refs:
-                if artifact.artifact_id == champion_record.candidate_artifact_id:
-                    return artifact.sha256
-            raise LiveExecutionBlocked("promoted champion checkpoint digest is missing")
+            return self._champion_artifact(champion_record).sha256
         if self.config.checkpoint_sha256 is None:
             raise LiveExecutionBlocked(
                 "a verified checkpoint_sha256 is required before approving run 1"
@@ -1328,6 +1375,7 @@ class AutonomousRunController:
         parent_run_id: str | None,
         champion_run_id: str | None,
         checkpoint_sha256: str,
+        checkpoint_uri: str,
     ) -> dict[str, Any]:
         return {
             "run_id": run_id,
@@ -1338,7 +1386,7 @@ class AutonomousRunController:
             "hf_repo_id": self.config.hf_repo_id,
             "hf_revision": self.config.hf_revision,
             "checkpoint_sha256": checkpoint_sha256,
-            "checkpoint_s3_uri": self.config.checkpoint_s3_uri,
+            "checkpoint_s3_uri": checkpoint_uri,
             "training_input_s3_uri": self.config.training_input_s3_uri,
             "evaluation_input_s3_uri": self.config.evaluation_input_s3_uri,
             "suite": self.config.objective_suite,
@@ -1380,7 +1428,9 @@ class AutonomousRunController:
         if preflight.gpu_capacity_status is not GpuCapacityStatus.VERIFIED_BY_QUOTA:
             raise LiveExecutionBlocked("GPU quota/capacity is not verified for this run")
 
-    def _checkpoint_uri(self) -> str:
+    def _checkpoint_uri(self, champion_record: RunHistoryRecord | None = None) -> str:
+        if champion_record is not None:
+            return self._champion_artifact(champion_record).uri
         if not self.config.checkpoint_s3_uri:
             raise LiveExecutionBlocked(
                 "a versioned checkpoint_s3_uri is required before starting a run"
@@ -1395,6 +1445,7 @@ class AutonomousRunController:
         split: str,
         episodes: int,
         output_s3_uri: str,
+        manifest_sha256: str,
     ) -> ObjectiveBenchmarkResult:
         request = ObjectiveBenchmarkRequest(
             run_id=run_id,
@@ -1406,7 +1457,20 @@ class AutonomousRunController:
             split=split,
             output_s3_uri=output_s3_uri,
         )
-        return execute_objective_benchmark(self.objective_worker, request)
+        result = execute_objective_benchmark(self.objective_worker, request)
+        if result.manifest_sha256 != manifest_sha256:
+            raise LiveExecutionFailed(
+                f"objective {split} result manifest does not match the run manifest"
+            )
+        if (
+            result.evidence_label
+            not in {EvidenceLabel.LIVE, EvidenceLabel.PRIOR_VERIFIED_RUN}
+            or not result.verified
+        ):
+            raise LiveExecutionFailed(
+                f"objective {split} result is not verified live evidence"
+            )
+        return result
 
     def _gate(
         self,
@@ -1440,11 +1504,25 @@ class AutonomousRunController:
         return MultiRunPromotionGate()(champion, candidate_eval)
 
     @staticmethod
-    def _champion_uri(record: RunHistoryRecord) -> str:
+    def _champion_artifact(record: RunHistoryRecord) -> ArtifactReference:
         for artifact in record.artifact_refs:
             if artifact.artifact_id == record.candidate_artifact_id:
-                return artifact.uri
+                if artifact.kind is not ArtifactKind.CHECKPOINT:
+                    raise LiveExecutionBlocked(
+                        "promoted champion artifact is not a checkpoint"
+                    )
+                if urlparse(artifact.uri).scheme != "s3":
+                    raise LiveExecutionBlocked(
+                        "promoted champion checkpoint is not an S3 URI"
+                    )
+                return artifact
         raise LiveExecutionBlocked("promoted champion artifact reference is missing")
+
+    @staticmethod
+    def _champion_uri(record: RunHistoryRecord) -> str:
+        """Return the immutable, versioned URI of the promoted checkpoint."""
+
+        return AutonomousRunController._champion_artifact(record).uri
 
     def _record(
         self,
@@ -1534,30 +1612,57 @@ class AutonomousRunController:
         run_number: int,
     ) -> None:
         cleanup_ok = True
-        for job, stop in (
-            (training, self.provider.stop_training),
-            (evaluation, self.provider.stop_evaluation),
-        ):
+        jobs = (
+            ("training", training, self.provider.stop_training),
+            ("evaluation", evaluation, self.provider.stop_evaluation),
+        )
+        for phase, job, stop in jobs:
             if job is not None and job.status in {JobStatus.SUBMITTED, JobStatus.IN_PROGRESS}:
                 try:
                     stop(job.job_name)
                 except Exception:
                     cleanup_ok = False
-        self._event(
-            EventType.CLEANUP_COMPLETED if cleanup_ok else EventType.CLEANUP_FAILED,
-            run_id,
-            run_number,
-            status="completed" if cleanup_ok else "failed",
-        )
+            if job is not None:
+                self._event(
+                    EventType.CLEANUP_COMPLETED if cleanup_ok else EventType.CLEANUP_FAILED,
+                    run_id,
+                    run_number,
+                    phase=phase,
+                    job_id=str(job.provider_job_id or job.job_name),
+                    status="completed" if cleanup_ok else "failed",
+                )
+        if not any(job is not None for _, job, _ in jobs):
+            self._event(
+                EventType.CLEANUP_COMPLETED if cleanup_ok else EventType.CLEANUP_FAILED,
+                run_id,
+                run_number,
+                phase="cleanup",
+                status="completed" if cleanup_ok else "failed",
+            )
 
-    def _event(self, event_type: EventType, run_id: str, run_number: int, *, status: str) -> None:
+    def _event(
+        self,
+        event_type: EventType,
+        run_id: str,
+        run_number: int,
+        *,
+        status: str,
+        phase: str | None = None,
+        job_id: str | None = None,
+        evidence_label: EvidenceLabel | None = None,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> None:
         try:
             self.telemetry.record(
                 event_type,
                 run_id=run_id,
                 run_number=run_number,
                 experiment_id=f"{run_id}-experiment",
+                phase=phase,
+                job_id=job_id,
+                evidence_label=evidence_label,
                 status=status,
+                attributes=attributes,
             )
         except Exception:
             pass

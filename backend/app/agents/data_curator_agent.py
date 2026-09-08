@@ -15,7 +15,7 @@ from typing import Any
 
 from strands import Agent, tool
 
-from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+from .prompt_contract import get_prompt_contract, resolve_agent_model
 
 _EVIDENCE_CLASSES = {"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"}
 _VERIFIED_EVIDENCE = {"LIVE", "PRIOR_VERIFIED_RUN"}
@@ -44,12 +44,14 @@ def _evidence_class(value: Any) -> str:
 class DataCuratorAgent:
     """Data Curator Agent; authoritative operations are adapter-owned."""
 
-    def __init__(self, model: str | None = None, adapter: Any = None):
+    def __init__(
+        self, model: str | None = None, adapter: Any = None, model_provider: Any = None
+    ):
         self.adapter = adapter
         prompt_contract = get_prompt_contract("DataCuratorAgent")
         self.agent = Agent(
             name="DataCuratorAgent",
-            model=resolve_nemotron_model(model),
+            model=resolve_agent_model(model, model_provider=model_provider),
             system_prompt=prompt_contract.prompt,
         )
         self.prompt_contract = prompt_contract
@@ -294,6 +296,8 @@ class DataCuratorAgent:
         return json.dumps(result, indent=2, sort_keys=True, default=str)
 
 
-def create_data_curator_agent(model: str | None = None, adapter: Any = None) -> DataCuratorAgent:
+def create_data_curator_agent(
+    model: str | None = None, adapter: Any = None, model_provider: Any = None
+) -> DataCuratorAgent:
     """Create a Data Curator Agent with an optional objective adapter."""
-    return DataCuratorAgent(model, adapter)
+    return DataCuratorAgent(model, adapter, model_provider)

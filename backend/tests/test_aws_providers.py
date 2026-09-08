@@ -349,6 +349,65 @@ def test_bedrock_wrapper_defers_model_construction() -> None:
     assert constructed == [{"model_id": "amazon.nova-lite-v1:0", "region_name": "us-east-1"}]
 
 
+def test_bedrock_sigv4_uses_explicit_session_even_with_bearer_env(monkeypatch) -> None:
+    """A stale bearer token must not be selected by the live model path."""
+
+    import boto3
+
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "intentionally-invalid")
+    explicit_session = object()
+    monkeypatch.setattr(boto3, "Session", lambda *, region_name: explicit_session)
+    constructed: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> object:
+        constructed.append(kwargs)
+        return object()
+
+    wrapper = BedrockStrandsModel(
+        "nvidia.nemotron-super-3-120b",
+        region_name="us-east-1",
+    )
+    # Keep the test offline while exercising the production session-creation
+    # branch (which is skipped when a custom factory is injected).
+    monkeypatch.setattr(wrapper, "_factory", lambda: factory)
+    wrapper.create_model()
+
+    assert len(constructed) == 1
+    assert constructed[0]["model_id"] == "nvidia.nemotron-super-3-120b"
+    assert constructed[0]["boto_session"] is explicit_session
+    client_config = constructed[0]["boto_client_config"]
+    assert getattr(client_config, "signature_version", None) == "v4"
+    # The wrapper neither reads nor mutates the bearer token; auth is owned by
+    # the explicit boto session (and therefore the IAM/SigV4 credential chain).
+    import os
+
+    assert os.environ["AWS_BEARER_TOKEN_BEDROCK"] == "intentionally-invalid"
+
+
+def test_bedrock_sigv4_mode_rejects_unknown_auth_mode() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="SigV4"):
+        BedrockStrandsModel("nvidia.nemotron-super-3-120b", auth_mode="bearer")  # type: ignore[arg-type]
+
+
+def test_sigv4_boto_session_does_not_use_bearer_environment_token(monkeypatch) -> None:
+    """The SDK client signer remains SigV4 when a bearer token is present."""
+
+    import boto3
+
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "intentionally-invalid")
+    session = boto3.Session(
+        aws_access_key_id="test-access-key",
+        aws_secret_access_key="test-secret-key",
+        region_name="us-east-1",
+    )
+    client = session.client("bedrock-runtime")
+
+    assert client._request_signer._credentials.method == "explicit"
+    assert client._request_signer._credentials.access_key == "test-access-key"
+
+
 def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> None:
     class FakeSageMaker:
         def __init__(self) -> None:

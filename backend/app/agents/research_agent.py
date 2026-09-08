@@ -4,7 +4,7 @@ Responsible for proposing explanations that can be validated through experimenta
 """
 from strands import Agent, tool
 
-from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+from .prompt_contract import get_prompt_contract, resolve_agent_model
 from strands.types.tools import ToolResult, ToolUse
 from typing import Dict, Any, List
 import json
@@ -15,11 +15,11 @@ from app.core.state import OptimizationRun
 class ResearchAgent:
     """Agent responsible for generating research hypotheses from failure analysis."""
     
-    def __init__(self, model: str = None):
+    def __init__(self, model: str = None, model_provider: Any = None):
         prompt_contract = get_prompt_contract("ResearchAgent")
         self.agent = Agent(
             name="ResearchAgent",
-            model=resolve_nemotron_model(model),
+            model=resolve_agent_model(model, model_provider=model_provider),
             system_prompt=prompt_contract.prompt,
         )
         
@@ -222,6 +222,6 @@ class ResearchAgent:
 
 
 # Factory function
-def create_research_agent(model: str = None) -> ResearchAgent:
+def create_research_agent(model: str = None, model_provider: Any = None) -> ResearchAgent:
     """Create a Research Agent instance."""
-    return ResearchAgent(model)
+    return ResearchAgent(model, model_provider)

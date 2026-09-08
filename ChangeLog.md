@@ -1,5 +1,13 @@
 # Change Log
 
+## 2026-09-08 — `MAINT-2026-09-08-001`
+
+- **Goal:** Align local configuration and deployment documentation with the guarded Nemotron/AWS live path.
+- **Summary of changes:** Set Docker Compose's default reasoning model to `nvidia.nemotron-super-3-120b`; documented all live controller variables, checkpoint and GPU admission requirements, Bedrock bearer-token precedence, the `/api/live/readiness` surface, and the existing-but-incomplete CDK foundation.
+- **Affected files and components:** `.env.example`, `docker-compose.yml`, `README.md`, `backend/README.md`, and live configuration documentation.
+- **Tests and verification:** `docker compose config --quiet`, `backend/scripts/check_docs_sync.py`, and `git diff --check`.
+- **Known limitations and follow-up:** No secrets or AWS resources were created; live execution remains blocked until the documented external artifacts, worker, images, resources, and Bedrock authorization are configured.
+
 ## 2026-08-15 — `CHANGE-2026-08-15-003`
 
 - **Goal:** Improve the FunctionGemma fine-tuning tools section while preserving AgentGym WebShop compatibility.

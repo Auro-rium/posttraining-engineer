@@ -8,6 +8,7 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.agents.prompt_contract import NEMOTRON_MODEL_ID
+from app.providers.bedrock import SIGV4_AUTH_MODE, BedrockAuthMode
 
 
 class RuntimeConfig(BaseSettings):
@@ -23,6 +24,10 @@ class RuntimeConfig(BaseSettings):
     app_mode: Literal["local", "aws"] = "local"
     service_role: Literal["coordinator", "research", "execution"] = "coordinator"
     aws_region: str = "us-east-1"
+    # Keep Bedrock authentication explicit.  SigV4 uses the configured AWS IAM
+    # credential chain and is not affected by a stale AWS_BEARER_TOKEN_BEDROCK
+    # environment variable.
+    bedrock_auth_mode: BedrockAuthMode = SIGV4_AUTH_MODE
     # Reasoning is intentionally pinned: changing this model invalidates prompt
     # provenance and makes comparisons between autonomous runs ambiguous.
     strands_model: str = Field(default=NEMOTRON_MODEL_ID, min_length=1)

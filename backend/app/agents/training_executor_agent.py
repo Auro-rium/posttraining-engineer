@@ -13,7 +13,7 @@ from typing import Any
 
 from strands import Agent, tool
 
-from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+from .prompt_contract import get_prompt_contract, resolve_agent_model
 
 _EVIDENCE_CLASSES = {"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"}
 _TERMINAL_STATUSES = {"COMPLETED", "FAILED", "STOPPED", "CANCELLED"}
@@ -49,12 +49,14 @@ def _parse_object(value: Any, name: str) -> tuple[dict[str, Any] | None, str | N
 class TrainingExecutorAgent:
     """Training Executor Agent; provider work is delegated to an adapter."""
 
-    def __init__(self, model: str | None = None, adapter: Any = None):
+    def __init__(
+        self, model: str | None = None, adapter: Any = None, model_provider: Any = None
+    ):
         self.adapter = adapter
         prompt_contract = get_prompt_contract("TrainingExecutorAgent")
         self.agent = Agent(
             name="TrainingExecutorAgent",
-            model=resolve_nemotron_model(model),
+            model=resolve_agent_model(model, model_provider=model_provider),
             system_prompt=prompt_contract.prompt,
         )
         self.prompt_contract = prompt_contract
@@ -251,7 +253,7 @@ class TrainingExecutorAgent:
 
 
 def create_training_executor_agent(
-    model: str | None = None, adapter: Any = None
+    model: str | None = None, adapter: Any = None, model_provider: Any = None
 ) -> TrainingExecutorAgent:
     """Create a Training Executor Agent with an optional provider adapter."""
-    return TrainingExecutorAgent(model, adapter)
+    return TrainingExecutorAgent(model, adapter, model_provider)

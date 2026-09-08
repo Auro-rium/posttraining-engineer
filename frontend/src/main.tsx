@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -59,7 +59,12 @@ type CompareRun = {
   status?: string;
 };
 type ComparePayload = { rows?: CompareRun[]; total?: number };
-type Health = { status?: string; aws_region?: string; components?: Record<string, string> };
+type Health = {
+  status?: string;
+  mode?: "local" | "aws" | string;
+  aws_region?: string;
+  components?: Record<string, string>;
+};
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -93,7 +98,6 @@ function App() {
   const [checkpoint, setCheckpoint] = useState("s3://post-training/checkpoints/functiongemma-base");
   const [environment, setEnvironment] = useState("agentgym-service-recovery");
   const [events, setEvents] = useState<string[]>([]);
-  const eventSource = useRef<EventSource | null>(null);
 
   const loadComparison = useCallback(async () => {
     try {
@@ -135,9 +139,14 @@ function App() {
     return () => window.clearInterval(interval);
   }, [loadComparison, loadHealth, loadRun, run?.runId]);
 
-  useEffect(() => () => eventSource.current?.close(), []);
-
   const startRun = async () => {
+    // The public API currently exposes the local explanatory workflow. Never
+    // use it as an implicit AWS launch: live AWS runs require the guarded
+    // preflight and approval-token path from the live CLI.
+    if (health?.mode !== "local") {
+      setError("Local workflow is unavailable. AWS runs require live preflight and an approval token.");
+      return;
+    }
     setConnecting(true);
     setError(null);
     try {
@@ -145,26 +154,14 @@ function App() {
         `/api/runs?target_model=${encodeURIComponent(model)}&base_checkpoint=${encodeURIComponent(checkpoint)}&environment=${encodeURIComponent(environment)}`,
         { method: "POST" },
       );
-      const first = await loadRun(created.runId);
-      if (first) subscribeToRun(created.runId);
+      await api(`/api/runs/${encodeURIComponent(created.runId)}/auto`, { method: "POST" });
+      await loadRun(created.runId);
+      setEvents((current) => [`${new Date().toLocaleTimeString()}  workflow started automatically`, ...current].slice(0, 8));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Run could not be created");
     } finally {
       setConnecting(false);
     }
-  };
-
-  const subscribeToRun = (runId: string) => {
-    eventSource.current?.close();
-    // The AWS coordinator may expose SSE in a deployed environment. Local mode
-    // intentionally falls back to the same safe status polling path.
-    const stream = new EventSource(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/events`);
-    eventSource.current = stream;
-    stream.onmessage = (message) => {
-      if (message.data) setEvents((current) => [`${new Date().toLocaleTimeString()}  event received`, ...current].slice(0, 8));
-      void loadRun(runId);
-    };
-    stream.onerror = () => stream.close();
   };
 
   const stepRun = async () => {
@@ -191,6 +188,20 @@ function App() {
 
   const activeIndex = phaseIndex(run?.currentPhase);
   const runIsActive = run?.status === "running" || run?.status === "created";
+  const localMode = health?.mode === "local";
+  const awsReadiness = health?.mode === "aws"
+    ? health.components?.sagemaker_provider === "configured" && health.components?.objective_worker === "configured"
+    : false;
+  const healthLabel = !health
+    ? "Awaiting control plane"
+    : health.mode === "local"
+      ? "Local demo mode"
+      : health.mode === "aws"
+        ? awsReadiness ? "AWS control plane ready" : "AWS readiness blocked"
+        : "Control plane status unknown";
+  const evidenceLabel = run?.status === "completed"
+    ? health?.mode === "aws" ? "verify run evidence" : "EXPLANATION"
+    : "awaiting verified run";
   const chartRows = comparison?.rows ?? [];
   const champion = run?.championPerformance ?? run?.baselinePerformance;
 
@@ -201,7 +212,7 @@ function App() {
           <div className="brand-mark"><Sparkles size={18} /></div>
           <div><p className="eyebrow">Autonomous post-training</p><h1>Control room</h1></div>
         </div>
-        <div className="topbar-meta"><span className={`connection-dot ${health ? "online" : ""}`} /> <span>{health ? "AWS control plane connected" : "Awaiting control plane"}</span><span className="divider" /><span>Nemotron Super 3 · 120B</span></div>
+        <div className="topbar-meta"><span className={`connection-dot ${health ? "online" : ""}`} /> <span>{healthLabel}</span><span className="divider" /><span>Nemotron Super 3 · 120B</span></div>
       </header>
 
       <section className="hero-grid">
@@ -209,7 +220,7 @@ function App() {
           <p className="eyebrow">Live execution bench / 5-run budget</p>
           <h2>Watch the model<br /><em>get better.</em></h2>
           <p className="hero-description">Eight specialist agents turn observed failures into a measured candidate. Every handoff is visible. Every promotion is earned.</p>
-          <div className="hero-actions"><button className="primary-button" onClick={startRun} disabled={connecting || Boolean(runIsActive)}><Radio size={16} /> {connecting ? "Launching…" : runIsActive ? "Run in progress" : "Launch a run"}</button>{runIsActive && <button className="ghost-button" onClick={cancelRun}><X size={16} /> Stop safely</button>}</div>
+          <div className="hero-actions"><button className="primary-button" onClick={startRun} disabled={connecting || Boolean(runIsActive) || !localMode} title={!localMode ? "AWS runs require guarded preflight and approval" : undefined}><Radio size={16} /> {connecting ? "Launching…" : runIsActive ? "Run in progress" : localMode ? "Launch local workflow" : "Approval required"}</button>{runIsActive && <button className="ghost-button" onClick={cancelRun}><X size={16} /> Stop safely</button>}</div>
           {error && <div className="error-strip"><CircleAlert size={16} /> {error}<button onClick={() => setError(null)} aria-label="Dismiss error"><X size={14} /></button></div>}
         </div>
         <div className="launch-card">
@@ -244,7 +255,7 @@ function App() {
         <div className="panel comparison-panel"><div className="panel-heading"><div><p className="eyebrow">History / max 5</p><h3>Run comparison</h3></div><GitBranch size={17} /></div>{chartRows.length ? <div className="comparison-list">{chartRows.map((row) => <div className="comparison-row" key={row.run_id}><span className="run-tag">R{row.run_number}</span><div className="comparison-bars"><div className="mini-track"><i className="mini-fill baseline" style={{ width: `${Math.max(0, Math.min(100, (row.baseline_aggregate ?? 0) * 100))}%` }} /></div><div className="mini-track"><i className="mini-fill candidate" style={{ width: `${Math.max(0, Math.min(100, (row.candidate_aggregate ?? 0) * 100))}%` }} /></div></div><span className={`decision ${row.decision === "PROMOTE" ? "promote" : ""}`}>{row.decision ?? row.status ?? "pending"}</span></div>)}</div> : <div className="empty-panel graph-empty"><GitBranch size={24} /><p>Complete a run to draw the comparison graph.</p><span>No metrics are invented for the demo.</span></div>}<div className="legend"><span><i className="legend-dot baseline" /> baseline</span><span><i className="legend-dot candidate" /> candidate</span></div></div>
       </section>
 
-      <footer className="footer-bar"><span><Cpu size={14} /> AWS / {health?.aws_region ?? "us-east-1"}</span><span>Target: FunctionGemma</span><span>Evidence: {run?.status === "completed" ? "LIVE" : "awaiting live run"}</span><a href="https://github.com" target="_blank" rel="noreferrer">View runbook <ArrowUpRight size={13} /></a></footer>
+      <footer className="footer-bar"><span><Cpu size={14} /> AWS / {health?.aws_region ?? "us-east-1"}</span><span>Target: FunctionGemma</span><span>Evidence: {evidenceLabel}</span><a href="https://github.com" target="_blank" rel="noreferrer">View runbook <ArrowUpRight size={13} /></a></footer>
     </main>
   );
 }

@@ -4,7 +4,7 @@ Responsible for accept/reject decisions using predefined improvement and regress
 """
 from strands import Agent, tool
 
-from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+from .prompt_contract import get_prompt_contract, resolve_agent_model
 from strands.types.tools import ToolResult, ToolUse
 from typing import Dict, Any, List
 import json
@@ -15,11 +15,11 @@ from app.core.state import OptimizationRun
 class ChampionManagerAgent:
     """Agent responsible for making promotion decisions."""
     
-    def __init__(self, model: str = None):
+    def __init__(self, model: str = None, model_provider: Any = None):
         prompt_contract = get_prompt_contract("ChampionManagerAgent")
         self.agent = Agent(
             name="ChampionManagerAgent",
-            model=resolve_nemotron_model(model),
+            model=resolve_agent_model(model, model_provider=model_provider),
             system_prompt=prompt_contract.prompt,
         )
         
@@ -280,6 +280,6 @@ class ChampionManagerAgent:
 
 
 # Factory function
-def create_champion_manager_agent(model: str = None) -> ChampionManagerAgent:
+def create_champion_manager_agent(model: str = None, model_provider: Any = None) -> ChampionManagerAgent:
     """Create a Champion Manager Agent instance."""
-    return ChampionManagerAgent(model)
+    return ChampionManagerAgent(model, model_provider)

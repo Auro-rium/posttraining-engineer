@@ -4,7 +4,7 @@ Responsible for failure pattern recognition and categorization.
 """
 from strands import Agent, tool
 
-from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+from .prompt_contract import get_prompt_contract, resolve_agent_model
 from strands.types.tools import ToolResult, ToolUse
 from typing import Dict, Any, List
 import json
@@ -15,11 +15,11 @@ from app.core.state import OptimizationRun
 class FailureAnalystAgent:
     """Agent responsible for analyzing failures and categorizing them."""
     
-    def __init__(self, model: str = None):
+    def __init__(self, model: str = None, model_provider: Any = None):
         prompt_contract = get_prompt_contract("FailureAnalystAgent")
         self.agent = Agent(
             name="FailureAnalystAgent",
-            model=resolve_nemotron_model(model),
+            model=resolve_agent_model(model, model_provider=model_provider),
             system_prompt=prompt_contract.prompt,
         )
         
@@ -199,6 +199,6 @@ class FailureAnalystAgent:
 
 
 # Factory function
-def create_failure_analyst_agent(model: str = None) -> FailureAnalystAgent:
+def create_failure_analyst_agent(model: str = None, model_provider: Any = None) -> FailureAnalystAgent:
     """Create a Failure Analyst Agent instance."""
-    return FailureAnalystAgent(model)
+    return FailureAnalystAgent(model, model_provider)

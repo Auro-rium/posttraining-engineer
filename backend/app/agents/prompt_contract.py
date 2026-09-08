@@ -14,7 +14,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 NEMOTRON_MODEL_ID: Final[str] = "nvidia.nemotron-super-3-120b"
 PROMPT_CONTRACT_VERSION: Final[str] = "nemotron-120b-contract-v2"
@@ -203,6 +203,26 @@ def resolve_nemotron_model(model: str | None = None) -> str:
             f"{NEMOTRON_MODEL_ID}; received {model!r}"
         )
     return NEMOTRON_MODEL_ID
+
+
+def resolve_agent_model(model: str | None = None, *, model_provider: Any = None) -> Any:
+    """Resolve the pinned model id or an explicitly configured provider.
+
+    Strands accepts either a Bedrock model instance or a model id.  Live AWS
+    startup passes a provider built with an explicit SigV4 boto session so the
+    default string shortcut cannot accidentally select bearer authentication.
+    """
+
+    resolved = resolve_nemotron_model(model)
+    if model_provider is None:
+        return resolved
+    provider_model_id = getattr(model_provider, "model_id", None)
+    if provider_model_id != resolved:
+        raise ValueError(
+            "the configured Bedrock provider must use "
+            f"{resolved}; received {provider_model_id!r}"
+        )
+    return getattr(model_provider, "model", model_provider)
 
 
 def agent_prompt_metadata(agent_key: str) -> dict[str, str]:

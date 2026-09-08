@@ -12,6 +12,7 @@ from .prompt_contract import (
     AgentPromptContract,
     agent_prompt_metadata,
     get_prompt_contract,
+    resolve_agent_model,
     resolve_nemotron_model,
 )
 from .research_agent import ResearchAgent, create_research_agent
@@ -41,5 +42,6 @@ __all__ = [
     "create_training_designer_agent",
     "create_training_executor_agent",
     "get_prompt_contract",
+    "resolve_agent_model",
     "resolve_nemotron_model",
 ]

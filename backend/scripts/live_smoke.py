@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import os
 import uuid
+from contextlib import redirect_stdout
 from typing import Any
 
 import boto3
-from strands import Agent
-from strands.models import BedrockModel
+
+from app.agents.prompt_contract import NEMOTRON_MODEL_ID, resolve_nemotron_model
+from app.providers.bedrock import BedrockStrandsModel
 
 
 class SmokeFailure(RuntimeError):
@@ -27,18 +30,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket", default=os.getenv("S3_ARTIFACT_BUCKET"), required=False)
     parser.add_argument("--region", default=os.getenv("AWS_REGION", "us-east-1"))
     parser.add_argument(
-        "--model-id", default=os.getenv("STRANDS_MODEL", "nvidia.nemotron-super-3-120b")
+        "--model-id", default=os.getenv("STRANDS_MODEL", NEMOTRON_MODEL_ID)
     )
     return parser.parse_args()
 
 
-def invoke_strands(region: str, model_id: str) -> str:
-    model = BedrockModel(model_id=model_id, region_name=region)
-    agent = Agent(model=model, system_prompt="Reply with exactly READY and nothing else.")
-    response = str(agent("health check"))
+def invoke_strands(region: str, model_id: str) -> dict[str, object]:
+    resolved_model_id = resolve_nemotron_model(model_id)
+    model_provider = BedrockStrandsModel(resolved_model_id, region_name=region)
+    agent = model_provider.create_agent(
+        name="LiveSmokeAgent",
+        system_prompt="Reply with exactly READY and nothing else.",
+    )
+    # Strands may echo a response through its default callback; capture that
+    # stream so the smoke command emits metadata only.
+    with redirect_stdout(io.StringIO()):
+        response = str(agent("health check"))
     if "READY" not in response.upper():
-        raise SmokeFailure(f"Bedrock response did not contain READY: {response[:100]!r}")
-    return response
+        raise SmokeFailure("Bedrock response did not contain the expected readiness marker")
+    # Keep the live script metadata-only; raw model output is not an artifact.
+    return {
+        "status": "passed",
+        "model_id": resolved_model_id,
+        "response_sha256": hashlib.sha256(response.encode()).hexdigest(),
+        "response_chars": len(response),
+    }
 
 
 def s3_round_trip(bucket: str, region: str) -> dict[str, Any]:
@@ -71,15 +87,15 @@ def main() -> int:
         raise SystemExit("Pass --bucket or set S3_ARTIFACT_BUCKET")
 
     identity = boto3.client("sts", region_name=args.region).get_caller_identity()
-    response = invoke_strands(args.region, args.model_id)
+    bedrock = invoke_strands(args.region, args.model_id)
     artifact = s3_round_trip(args.bucket, args.region)
     print(
         {
             "status": "passed",
             "account": identity.get("Account"),
             "region": args.region,
-            "model_id": args.model_id,
-            "bedrock_response": response[:100],
+            "model_id": bedrock["model_id"],
+            "bedrock": bedrock,
             "s3_artifact": artifact,
             "resources_created": [],
         }

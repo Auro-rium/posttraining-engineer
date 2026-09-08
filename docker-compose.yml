@@ -10,7 +10,7 @@ services:
       ARTIFACT_BACKEND: local
       ARTIFACT_ROOT: /data/artifacts
       TARGET_MODEL: ${TARGET_MODEL:-google/functiongemma-270m-it}
-      STRANDS_MODEL: ${STRANDS_MODEL:-us.amazon.nova-pro-v1:0}
+      STRANDS_MODEL: ${STRANDS_MODEL:-nvidia.nemotron-super-3-120b}
       AWS_REGION: ${AWS_REGION:-us-east-1}
       MAX_EXPERIMENTS: ${MAX_EXPERIMENTS:-2}
       ENVIRONMENT: local
@@ -41,7 +41,7 @@ services:
       ARTIFACT_BACKEND: local
       ARTIFACT_ROOT: /data/artifacts
       TARGET_MODEL: ${TARGET_MODEL:-google/functiongemma-270m-it}
-      STRANDS_MODEL: ${STRANDS_MODEL:-us.amazon.nova-pro-v1:0}
+      STRANDS_MODEL: ${STRANDS_MODEL:-nvidia.nemotron-super-3-120b}
       AWS_REGION: ${AWS_REGION:-us-east-1}
       ENVIRONMENT: local
     ports:
@@ -66,7 +66,7 @@ services:
       ARTIFACT_BACKEND: local
       ARTIFACT_ROOT: /data/artifacts
       TARGET_MODEL: ${TARGET_MODEL:-google/functiongemma-270m-it}
-      STRANDS_MODEL: ${STRANDS_MODEL:-us.amazon.nova-pro-v1:0}
+      STRANDS_MODEL: ${STRANDS_MODEL:-nvidia.nemotron-super-3-120b}
       AWS_REGION: ${AWS_REGION:-us-east-1}
       ENVIRONMENT: local
     ports:

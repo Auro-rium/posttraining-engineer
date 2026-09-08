@@ -6,7 +6,12 @@ without the optional SDKs installed).
 """
 
 from .artifacts import ArtifactRef, ArtifactStore, S3ArtifactProvider, S3ArtifactStore
-from .bedrock import BedrockModelProvider, BedrockStrandsModel
+from .bedrock import (
+    SIGV4_AUTH_MODE,
+    BedrockAuthMode,
+    BedrockModelProvider,
+    BedrockStrandsModel,
+)
 from .repository import (
     ConcurrentUpdateError,
     DynamoDBRunRepository,
@@ -27,8 +32,10 @@ from .sagemaker import (
 )
 
 __all__ = [
+    "SIGV4_AUTH_MODE",
     "ArtifactRef",
     "ArtifactStore",
+    "BedrockAuthMode",
     "BedrockModelProvider",
     "BedrockStrandsModel",
     "ConcurrentUpdateError",

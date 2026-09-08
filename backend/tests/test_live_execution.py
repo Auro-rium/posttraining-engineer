@@ -2,17 +2,20 @@ from __future__ import annotations
 
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
 from app.live_execution import (
     ApprovalPacket,
+    AutonomousRunController,
     CheckStatus,
     GpuCapacityStatus,
     GpuQuotaStatus,
     LiveExecutionBlocked,
     LiveExecutionConfig,
+    LiveExecutionFailed,
     ObjectiveWorkerClient,
     PreflightClassification,
     PreflightRunner,
@@ -20,6 +23,11 @@ from app.live_execution import (
     config_from_environment,
     issue_approval_token,
 )
+from app.observability import TelemetryRecorder
+from app.posttraining.models import ArtifactKind, ArtifactReference, EvidenceLabel
+from app.posttraining.objective_workflow import ObjectiveBenchmarkRequest, ObjectiveBenchmarkResult
+from app.posttraining.run_history import BenchmarkMetrics, RunHistoryRecord
+from app.providers.sagemaker import JobResult, JobStatus
 
 
 def _config(**overrides: object) -> LiveExecutionConfig:
@@ -157,3 +165,125 @@ def test_approval_token_is_bound_to_packet_and_rejects_tampering() -> None:
     tampered_payload = urlsafe_b64encode(tampered.canonical_bytes()).decode("ascii").rstrip("=")
     with pytest.raises(LiveExecutionBlocked, match="signature"):
         _decode_approval_token(f"{version}.{tampered_payload}.{signature}", "demo-approval-secret")
+
+
+def _controller(**overrides: object) -> AutonomousRunController:
+    return AutonomousRunController(
+        config=_config(**overrides),
+        objective_worker=object(),
+        provider=cast(Any, object()),
+        artifact_store=cast(Any, object()),
+        slots=cast(Any, object()),
+    )
+
+
+def _champion_record(*, kind: ArtifactKind = ArtifactKind.CHECKPOINT) -> RunHistoryRecord:
+    artifact = ArtifactReference(
+        artifact_id="champion-checkpoint",
+        kind=kind,
+        uri="s3://demo-bucket/champion/model.tar.gz?versionId=v42",
+        sha256="c" * 64,
+    )
+    return RunHistoryRecord(
+        run_id="run-1",
+        run_number=1,
+        candidate_artifact_id=artifact.artifact_id,
+        artifact_refs=(artifact,),
+    )
+
+
+def test_promoted_champion_checkpoint_uri_and_digest_are_selected_from_artifact() -> None:
+    controller = _controller(checkpoint_s3_uri="s3://demo-bucket/initial/model.tar.gz")
+    champion = _champion_record()
+
+    assert controller._checkpoint_uri(champion) == (
+        "s3://demo-bucket/champion/model.tar.gz?versionId=v42"
+    )
+    assert controller._checkpoint_sha256(champion) == "c" * 64
+
+    payload = controller._manifest_payload(
+        run_id="run-2",
+        run_number=2,
+        parent_run_id="run-1",
+        champion_run_id="run-1",
+        checkpoint_sha256="c" * 64,
+        checkpoint_uri=controller._checkpoint_uri(champion),
+    )
+    assert payload["checkpoint_s3_uri"] == (
+        "s3://demo-bucket/champion/model.tar.gz?versionId=v42"
+    )
+
+
+def test_promoted_champion_must_reference_a_checkpoint_artifact() -> None:
+    controller = _controller()
+    with pytest.raises(LiveExecutionBlocked, match="not a checkpoint"):
+        controller._checkpoint_uri(_champion_record(kind=ArtifactKind.REPORT))
+
+
+def test_live_benchmark_rejects_result_with_different_manifest() -> None:
+    class Worker:
+        def execute_benchmark(
+            self, request: ObjectiveBenchmarkRequest
+        ) -> ObjectiveBenchmarkResult:
+            received = request
+            return ObjectiveBenchmarkResult(
+                benchmark_id="benchmark-1",
+                run_id=received.run_id,
+                suite=received.suite,
+                suite_version=received.suite_version,
+                model_id=received.model_uri,
+                seed=received.seed,
+                split=received.split,
+                metrics=BenchmarkMetrics(aggregate=0.5, per_environment={"web": 0.5}),
+                report_artifact=ArtifactReference(
+                    artifact_id="report-1",
+                    kind=ArtifactKind.REPORT,
+                    uri="s3://demo-bucket/report.json",
+                    sha256="d" * 64,
+                ),
+                manifest_sha256="e" * 64,
+                evidence_label=EvidenceLabel.LIVE,
+                verified=True,
+            )
+
+    controller = _controller()
+    controller.objective_worker = Worker()
+    with pytest.raises(LiveExecutionFailed, match="manifest"):
+        controller._benchmark(
+            run_id="run-1",
+            model_uri="s3://demo-bucket/base/model.tar.gz",
+            split="baseline",
+            episodes=2,
+            output_s3_uri="s3://demo-bucket/run-1/baseline",
+            manifest_sha256="f" * 64,
+        )
+
+
+def test_cleanup_telemetry_contains_provider_job_id_and_phase() -> None:
+    events: list[dict[str, object]] = []
+
+    class Provider:
+        def stop_training(self, job_name: str) -> None:
+            assert job_name == "train-1"
+
+        def stop_evaluation(self, job_name: str) -> None:
+            raise AssertionError("evaluation cleanup should not be called")
+
+    controller = AutonomousRunController(
+        config=_config(),
+        objective_worker=object(),
+        provider=cast(Any, Provider()),
+        artifact_store=cast(Any, object()),
+        slots=cast(Any, object()),
+        telemetry=TelemetryRecorder(exporter=events.append, logger=None, tracer=None),
+    )
+    controller._cleanup(
+        JobResult("train-1", "arn:train-1", JobStatus.IN_PROGRESS),
+        None,
+        run_id="run-1",
+        run_number=1,
+    )
+
+    assert events[-1]["event_type"] == "cleanup.completed"
+    assert events[-1]["phase"] == "training"
+    assert events[-1]["job_id"] == "arn:train-1"

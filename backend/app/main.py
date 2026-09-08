@@ -29,6 +29,7 @@ from app.posttraining.run_history import (
     RunRegistry,
 )
 from app.providers.repository import DynamoDBRunRepository
+from app.providers.bedrock import BedrockStrandsModel
 from app.providers.sagemaker import SageMakerProvider
 from app.runtime_config import get_runtime_config
 
@@ -116,8 +117,21 @@ def _create_application_orchestrator(config: Any) -> Any:
         if config.app_mode == "aws"
         else None
     )
+    # Pass a concrete Bedrock model in AWS mode.  This forces the Strands
+    # agents through the explicit SigV4 boto session instead of its model-id
+    # shortcut, which could inherit a stale bearer-token environment setting.
+    reasoning_model = (
+        BedrockStrandsModel(
+            config.strands_model,
+            region_name=config.aws_region,
+            auth_mode=config.bedrock_auth_mode,
+        )
+        if config.app_mode == "aws"
+        else None
+    )
     return create_orchestrator(
         model=config.strands_model,
+        model_provider=reasoning_model,
         training_adapter=provider,
         evaluation_adapter=provider,
     )

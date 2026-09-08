@@ -23,6 +23,7 @@ class OptimizationOrchestrator:
         self,
         *,
         model: str | None = None,
+        model_provider: Any = None,
         benchmark_adapter: Any = None,
         training_adapter: Any = None,
         evaluation_adapter: Any = None,
@@ -31,19 +32,29 @@ class OptimizationOrchestrator:
         resolved_model = model or "nvidia.nemotron-super-3-120b"
         self.model_id = resolved_model
         self.benchmark_agent = create_benchmark_agent(
-            model=resolved_model, adapter=benchmark_adapter
+            model=resolved_model, adapter=benchmark_adapter, model_provider=model_provider
         )
-        self.failure_analyst_agent = create_failure_analyst_agent(model=resolved_model)
-        self.research_agent = create_research_agent(model=resolved_model)
-        self.data_curator_agent = create_data_curator_agent(model=resolved_model)
-        self.training_designer_agent = create_training_designer_agent(model=resolved_model)
+        self.failure_analyst_agent = create_failure_analyst_agent(
+            model=resolved_model, model_provider=model_provider
+        )
+        self.research_agent = create_research_agent(
+            model=resolved_model, model_provider=model_provider
+        )
+        self.data_curator_agent = create_data_curator_agent(
+            model=resolved_model, model_provider=model_provider
+        )
+        self.training_designer_agent = create_training_designer_agent(
+            model=resolved_model, model_provider=model_provider
+        )
         self.training_executor_agent = create_training_executor_agent(
-            model=resolved_model, adapter=training_adapter
+            model=resolved_model, adapter=training_adapter, model_provider=model_provider
         )
         self.eval_agent = create_eval_agent(
-            model=resolved_model, adapter=evaluation_adapter
+            model=resolved_model, adapter=evaluation_adapter, model_provider=model_provider
         )
-        self.champion_manager_agent = create_champion_manager_agent(model=resolved_model)
+        self.champion_manager_agent = create_champion_manager_agent(
+            model=resolved_model, model_provider=model_provider
+        )
 
         # Define the workflow phases
         self.phases = [
@@ -531,6 +542,7 @@ class OptimizationOrchestrator:
 def create_orchestrator(
     *,
     model: str | None = None,
+    model_provider: Any = None,
     benchmark_adapter: Any = None,
     training_adapter: Any = None,
     evaluation_adapter: Any = None,
@@ -544,6 +556,7 @@ def create_orchestrator(
 
     return OptimizationOrchestrator(
         model=model,
+        model_provider=model_provider,
         benchmark_adapter=benchmark_adapter,
         training_adapter=training_adapter,
         evaluation_adapter=evaluation_adapter,

@@ -4,7 +4,7 @@ Responsible for selecting training parameters that respect budget and resource l
 """
 from strands import Agent, tool
 
-from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+from .prompt_contract import get_prompt_contract, resolve_agent_model
 from strands.types.tools import ToolResult, ToolUse
 from typing import Dict, Any, List
 import json
@@ -15,11 +15,11 @@ from app.core.state import OptimizationRun
 class TrainingDesignerAgent:
     """Agent responsible for designing QLoRA training configurations."""
     
-    def __init__(self, model: str = None):
+    def __init__(self, model: str = None, model_provider: Any = None):
         prompt_contract = get_prompt_contract("TrainingDesignerAgent")
         self.agent = Agent(
             name="TrainingDesignerAgent",
-            model=resolve_nemotron_model(model),
+            model=resolve_agent_model(model, model_provider=model_provider),
             system_prompt=prompt_contract.prompt,
         )
         
@@ -401,6 +401,6 @@ class TrainingDesignerAgent:
 
 
 # Factory function
-def create_training_designer_agent(model: str = None) -> TrainingDesignerAgent:
+def create_training_designer_agent(model: str = None, model_provider: Any = None) -> TrainingDesignerAgent:
     """Create a Training Designer Agent instance."""
-    return TrainingDesignerAgent(model)
+    return TrainingDesignerAgent(model, model_provider)

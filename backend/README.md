@@ -51,6 +51,22 @@ current run's training/processing jobs are stopped during cleanup; S3,
 DynamoDB, IAM, ECR, and networking resources are reused and never deleted by
 the controller.
 
+The complete variable template is the repository-level `.env.example`. The
+live path additionally requires `OBJECTIVE_WORKER_URL`, `HF_REPO_ID`, an
+immutable `HF_REVISION`, `TRAINING_INPUT_S3_URI`,
+`EVALUATION_INPUT_S3_URI`, `CHECKPOINT_S3_URI`, and a matching lowercase
+`CHECKPOINT_SHA256`. The checkpoint must already exist in versioned S3; the
+controller does not download or stage a Hugging Face checkpoint automatically.
+`SAGEMAKER_INSTANCE_TYPE` must be present in `GPU_INSTANCE_ALLOWLIST`, and
+the quota check confirms account allowance only—it is not a placement
+reservation. SageMaker makes the final capacity decision.
+
+For Bedrock authentication, use the configured AWS IAM/SigV4 credential chain
+with `nvidia.nemotron-super-3-120b` and leave `AWS_BEARER_TOKEN_BEDROCK`
+unset. If that variable is set, the AWS SDK may select it instead of IAM; set
+it only when a valid Bedrock API key is intentionally being used. A successful
+STS check alone is not proof that Bedrock model invocation is authorized.
+
 All agent prompts are versioned contracts. They include explicit schemas,
 evidence rules, sealed held-out-data boundaries, and bounded creative latitude.
 Prompt hashes and the Nemotron model ID are safe manifest/telemetry metadata;

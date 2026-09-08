@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 
-from strands import Agent
-from strands.models import BedrockModel
+from app.agents.prompt_contract import NEMOTRON_MODEL_ID, resolve_nemotron_model
+from app.providers.bedrock import BedrockStrandsModel
 
 
 @dataclass(frozen=True)
@@ -77,13 +80,12 @@ SPECIALISTS = (
 
 def main() -> int:
     region = os.getenv("AWS_REGION", "us-east-1")
-    model_id = os.getenv("STRANDS_MODEL", "nvidia.nemotron-super-3-120b")
-    model = BedrockModel(model_id=model_id, region_name=region)
+    model_id = resolve_nemotron_model(os.getenv("STRANDS_MODEL", NEMOTRON_MODEL_ID))
+    model_provider = BedrockStrandsModel(model_id, region_name=region)
     results: list[dict[str, str]] = []
 
     for specialist in SPECIALISTS:
-        agent = Agent(
-            model=model,
+        agent = model_provider.create_agent(
             name=specialist.name,
             system_prompt=(
                 f"You are {specialist.name}, a bounded professional post-training specialist. "
@@ -91,10 +93,21 @@ def main() -> int:
                 "or evaluation unless they are actually supplied."
             ),
         )
-        response = str(agent(specialist.prompt)).strip()
+        # Strands may echo a response through its default callback; capture
+        # that stream so this script remains metadata-only as well.
+        with redirect_stdout(io.StringIO()):
+            response = str(agent(specialist.prompt)).strip()
         if not response:
             raise RuntimeError(f"{specialist.name} returned an empty response")
-        results.append({"agent": specialist.name, "response": response[:240]})
+        # Keep the live script metadata-only: never print prompts or model
+        # completions into a terminal/log that may be retained as evidence.
+        results.append(
+            {
+                "agent": specialist.name,
+                "response_sha256": hashlib.sha256(response.encode()).hexdigest(),
+                "response_chars": str(len(response)),
+            }
+        )
 
     print({
         "status": "passed",

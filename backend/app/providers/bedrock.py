@@ -3,7 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Literal
+
+BedrockAuthMode = Literal["sigv4"]
+"""Supported Bedrock authentication mode.
+
+The application deliberately supports AWS SigV4 only.  ``AWS_BEARER_TOKEN_BEDROCK``
+is a separate bearer-token mechanism and, when set to a stale value, can make
+otherwise valid IAM credentials fail.  Keeping the mode explicit prevents a
+deployment from silently selecting that mechanism.
+"""
+
+SIGV4_AUTH_MODE: BedrockAuthMode = "sigv4"
 
 
 class OptionalDependencyError(RuntimeError):
@@ -24,14 +35,18 @@ class BedrockStrandsModel:
         *,
         region_name: str | None = None,
         boto_session: Any | None = None,
+        auth_mode: BedrockAuthMode = SIGV4_AUTH_MODE,
         model_factory: Callable[..., Any] | None = None,
         model_config: Mapping[str, Any] | None = None,
     ) -> None:
         if not model_id.strip():
             raise ValueError("model_id must not be empty")
+        if auth_mode != SIGV4_AUTH_MODE:
+            raise ValueError("BedrockStrandsModel supports SigV4 authentication only")
         self.model_id = model_id
         self.region_name = region_name
         self.boto_session = boto_session
+        self.auth_mode = auth_mode
         self.model_factory = model_factory
         self.model_config = dict(model_config or {})
         self._model: Any | None = None
@@ -52,10 +67,28 @@ class BedrockStrandsModel:
             return self._model
         kwargs = dict(self.model_config)
         kwargs.setdefault("model_id", self.model_id)
-        if self.region_name is not None:
+        session = self.boto_session
+        # Constructing an explicit boto3 session is the important auth
+        # boundary: it uses the configured IAM credential chain and SigV4.
+        # Do not pass bearer-token configuration to Strands.  Tests can still
+        # inject a factory without importing boto3 or creating a session.
+        if session is None and self.model_factory is None and self.auth_mode == SIGV4_AUTH_MODE:
+            try:
+                import boto3  # type: ignore[import-untyped]
+                from botocore.config import Config  # type: ignore[import-untyped]
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise OptionalDependencyError("Install boto3 to use SigV4 Bedrock auth") from exc
+            session = boto3.Session(region_name=self.region_name)
+            # Bedrock advertises both SigV4 and bearer auth.  Botocore may
+            # otherwise prefer AWS_BEARER_TOKEN_BEDROCK when it is present,
+            # even if the application is configured for IAM credentials.
+            # Explicitly selecting the SigV4 scheme makes the auth boundary
+            # deterministic without mutating the caller's environment.
+            kwargs.setdefault("boto_client_config", Config(signature_version="v4"))
+        if session is not None:
+            kwargs.setdefault("boto_session", session)
+        elif self.region_name is not None:
             kwargs.setdefault("region_name", self.region_name)
-        if self.boto_session is not None:
-            kwargs.setdefault("boto_session", self.boto_session)
         self._model = self._factory()(**kwargs)
         return self._model
 
