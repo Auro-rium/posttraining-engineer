@@ -24,19 +24,23 @@ def _evidence(
     suite: str = "agentgym",
     suite_version: str = "2026-09-01",
     manifest: str | None = MANIFEST,
+    benchmark_id: str = "agentgym-held-out",
+    seed: int | None = 17,
+    metrics: dict[str, float] | None = None,
+    kind: EvidenceKind = EvidenceKind.EVALUATION,
 ) -> Evidence:
     return Evidence(
         evidence_id=evidence_id,
-        kind=EvidenceKind.EVALUATION,
+        kind=kind,
         label=label,
         artifact_ids=(f"artifact-{evidence_id}",),
-        metrics={"aggregate": 0.0},
+        metrics=metrics or {"aggregate": 0.0},
         verified=verified,
-        benchmark_id="agentgym-held-out",
+        benchmark_id=benchmark_id,
         suite=suite,
         suite_version=suite_version,
         manifest_sha256=manifest,
-        seed=17,
+        seed=seed,
     )
 
 
@@ -49,13 +53,17 @@ def _evaluation(
     evidence: Evidence | None = None,
     champion_run_id: str | None = None,
 ) -> MultiRunEvaluation:
+    evidence = evidence or _evidence(
+        f"{run_id}-evaluation",
+        metrics={"aggregate": aggregate, **environments},
+    )
     return MultiRunEvaluation(
         run_id=run_id,
         run_number=run_number,
         champion_run_id=champion_run_id,
         aggregate_score=aggregate,
         environment_scores=environments,
-        evidence=evidence or _evidence(f"{run_id}-evaluation"),
+        evidence=evidence,
     )
 
 
@@ -115,7 +123,11 @@ def test_rejects_unverified_or_incompatible_evidence() -> None:
         0.56,
         {"babyai": 0.56},
         champion_run_id="run-000",
-        evidence=_evidence("candidate", label=EvidenceLabel.EXPLANATION),
+        evidence=_evidence(
+            "candidate",
+            label=EvidenceLabel.EXPLANATION,
+            metrics={"aggregate": 0.56, "babyai": 0.56},
+        ),
     )
 
     result = MultiRunPromotionGate().evaluate(champion, candidate)
@@ -129,10 +141,111 @@ def test_rejects_unverified_or_incompatible_evidence() -> None:
         0.56,
         {"babyai": 0.56},
         champion_run_id="run-000",
-        evidence=_evidence("candidate", suite_version="different"),
+        evidence=_evidence(
+            "candidate",
+            suite_version="different",
+            metrics={"aggregate": 0.56, "babyai": 0.56},
+        ),
     )
     mismatch_result = MultiRunPromotionGate().evaluate(champion, incompatible)
     assert mismatch_result.provenance_passed is False
+
+
+def test_rejects_evidence_that_is_not_an_evaluation() -> None:
+    champion = _evaluation("run-000", 0, 0.50, {"babyai": 0.50})
+    candidate = _evaluation(
+        "run-001",
+        1,
+        0.56,
+        {"babyai": 0.56},
+        champion_run_id="run-000",
+        evidence=_evidence(
+            "candidate",
+            kind=EvidenceKind.BENCHMARK,
+            metrics={"aggregate": 0.56, "babyai": 0.56},
+        ),
+    )
+
+    result = MultiRunPromotionGate().evaluate(champion, candidate)
+
+    assert result.decision is RunPromotionDecision.REJECT
+    assert result.provenance_passed is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("benchmark_id", "different-benchmark"),
+        ("seed", 18),
+        ("seed", None),
+        ("suite", "different-suite"),
+        ("suite_version", "different-version"),
+        ("manifest", "b" * 64),
+    ],
+)
+def test_rejects_evidence_with_incompatible_benchmark_provenance(
+    field: str, value: object
+) -> None:
+    champion = _evaluation("run-000", 0, 0.50, {"babyai": 0.50})
+    evidence_kwargs = {field: value}
+    candidate = _evaluation(
+        "run-001",
+        1,
+        0.56,
+        {"babyai": 0.56},
+        champion_run_id="run-000",
+        evidence=_evidence(
+            "candidate",
+            metrics={"aggregate": 0.56, "babyai": 0.56},
+            **evidence_kwargs,
+        ),
+    )
+
+    result = MultiRunPromotionGate().evaluate(champion, candidate)
+
+    assert result.decision is RunPromotionDecision.REJECT
+    assert result.provenance_passed is False
+
+
+def test_rejects_candidate_that_points_to_a_different_champion() -> None:
+    champion = _evaluation("run-000", 0, 0.50, {"babyai": 0.50})
+    candidate = _evaluation(
+        "run-001",
+        1,
+        0.56,
+        {"babyai": 0.56},
+        champion_run_id="run-other",
+    )
+
+    result = MultiRunPromotionGate().evaluate(champion, candidate)
+
+    assert result.decision is RunPromotionDecision.REJECT
+    assert result.run_sequence_passed is False
+
+
+def test_rejects_evidence_metric_mismatch_at_evaluation_boundary() -> None:
+    with pytest.raises(ValueError, match="evidence metrics"):
+        _evaluation(
+            "run-001",
+            1,
+            0.56,
+            {"babyai": 0.56},
+            champion_run_id="run-000",
+            evidence=_evidence(
+                "candidate",
+                metrics={"aggregate": 0.55, "babyai": 0.56},
+            ),
+        )
+
+
+def test_rejects_missing_environment_scores() -> None:
+    with pytest.raises(ValueError):
+        _evaluation("run-001", 1, 0.56, {}, champion_run_id="run-000")
+
+
+def test_run_number_zero_can_only_be_a_baseline_champion() -> None:
+    with pytest.raises(ValueError, match="baseline champion"):
+        _evaluation("run-000", 0, 0.50, {"babyai": 0.50}, champion_run_id="run-old")
 
 
 def test_enforces_sequential_run_numbers_and_hard_five_run_limit() -> None:

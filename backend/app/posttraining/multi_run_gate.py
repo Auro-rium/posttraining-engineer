@@ -10,10 +10,10 @@ from __future__ import annotations
 from enum import StrEnum
 from math import isfinite
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .gate import PromotionGate, PromotionGateConfig
-from .models import Evidence, EvidenceLabel
+from .models import Evidence, EvidenceKind, EvidenceLabel
 
 MAX_RUNS = 5
 _VERIFIED_LABELS = frozenset({EvidenceLabel.LIVE, EvidenceLabel.PRIOR_VERIFIED_RUN})
@@ -44,7 +44,19 @@ class MultiRunPromotionGateConfig(BaseModel):
 
 
 class MultiRunEvaluation(BaseModel):
-    """Objective score and provenance for one numbered candidate/champion run."""
+    """Objective score and provenance for one numbered candidate/champion run.
+
+    ``evidence.metrics`` is the signed objective-measurement payload for this
+    evaluation.  It must contain an ``aggregate`` value and one value for
+    every environment in ``environment_scores``; the values must agree within
+    floating-point comparison tolerance.  Keeping this invariant at the
+    boundary prevents callers from promoting a score that is different from
+    the score represented by its evidence artifact.
+
+    Run number zero is reserved for the durable baseline champion.  It cannot
+    point at a prior run; all numbered candidates must point at the champion
+    they were evaluated against.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -52,7 +64,7 @@ class MultiRunEvaluation(BaseModel):
     run_number: int = Field(ge=0)
     champion_run_id: str | None = Field(default=None, min_length=1)
     aggregate_score: float
-    environment_scores: dict[str, float] = Field(default_factory=dict)
+    environment_scores: dict[str, float] = Field(default_factory=dict, min_length=1)
     evidence: Evidence
 
     @field_validator("aggregate_score")
@@ -70,6 +82,22 @@ class MultiRunEvaluation(BaseModel):
         if any(not isfinite(score) for score in value.values()):
             raise ValueError("environment scores must be finite")
         return value
+
+    @model_validator(mode="after")
+    def validate_evidence_metrics(self) -> MultiRunEvaluation:
+        """Require the objective scores and their evidence to describe one result."""
+
+        expected_metrics = {"aggregate": self.aggregate_score, **self.environment_scores}
+        for name, expected in expected_metrics.items():
+            actual = self.evidence.metrics.get(name)
+            if actual is None or not _metrics_agree(actual, expected):
+                raise ValueError(
+                    "evidence metrics must contain values matching aggregate_score "
+                    "and every environment score"
+                )
+        if self.run_number == 0 and self.champion_run_id is not None:
+            raise ValueError("run_number 0 is reserved for a baseline champion record")
+        return self
 
 
 class EnvironmentComparison(BaseModel):
@@ -139,6 +167,7 @@ class MultiRunPromotionGate:
 
         run_sequence_passed = (
             candidate.run_id != champion.run_id
+            and candidate.champion_run_id == champion.run_id
             and candidate.run_number == champion.run_number + 1
             and 1 <= candidate.run_number <= self.config.max_runs
         )
@@ -162,8 +191,8 @@ class MultiRunPromotionGate:
             )
         if not run_sequence_passed:
             reasons.append(
-                "run number must be the next sequential run and cannot exceed "
-                f"maximum of {self.config.max_runs}"
+                "candidate must reference the champion and use the next sequential run number "
+                f"without exceeding maximum of {self.config.max_runs}"
             )
 
         passed = (
@@ -232,17 +261,31 @@ class MultiRunPromotionGate:
     @staticmethod
     def _compatible_evidence(candidate: Evidence, champion: Evidence) -> bool:
         return (
-            candidate.verified
+            candidate.kind is EvidenceKind.EVALUATION
+            and champion.kind is EvidenceKind.EVALUATION
+            and candidate.verified
             and champion.verified
             and candidate.label in _VERIFIED_LABELS
             and champion.label in _VERIFIED_LABELS
             and bool(candidate.artifact_ids)
             and bool(champion.artifact_ids)
+            and candidate.benchmark_id == champion.benchmark_id
+            and candidate.seed is not None
+            and champion.seed is not None
+            and candidate.seed == champion.seed
             and candidate.manifest_sha256 is not None
             and candidate.manifest_sha256 == champion.manifest_sha256
             and candidate.suite == champion.suite
             and candidate.suite_version == champion.suite_version
         )
+
+
+def _metrics_agree(actual: float, expected: float) -> bool:
+    """Compare serialized objective metrics without accepting material drift."""
+
+    # JSON serialization can introduce a few ulps of representation noise,
+    # while a larger difference indicates an inconsistent evidence record.
+    return abs(actual - expected) <= max(1e-12, 1e-9 * max(abs(actual), abs(expected)))
 
 
 def evaluate_multi_run_promotion(
