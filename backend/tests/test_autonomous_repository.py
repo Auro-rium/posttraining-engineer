@@ -170,10 +170,31 @@ def test_operation_intent_is_idempotent_and_result_reconciles() -> None:
         )
     with pytest.raises(OperationAlreadyExistsError):
         repository.put_operation_intent(
-            operation.model_copy(
-                update={"experiment_number": 2, "phase": RunPhase.EVALUATION}
-            )
+            operation.model_copy(update={"experiment_number": 2, "phase": RunPhase.EVALUATION})
         )
+
+
+def test_operation_retry_identity_uses_stable_request_digest_not_timestamps() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(make_run())
+    first = RunOperation(
+        operation_key="stable-key",
+        run_id="run-1",
+        experiment_number=1,
+        phase=RunPhase.TRAINING,
+        provider_name="job",
+        request_digest="d" * 64,
+    )
+    second = first.model_copy(
+        update={
+            "created_at": first.created_at + timedelta(seconds=1),
+            "updated_at": first.updated_at + timedelta(seconds=1),
+        }
+    )
+    assert repository.put_operation_intent(first) == first
+    assert repository.put_operation_intent(second) == first
+    with pytest.raises(OperationAlreadyExistsError):
+        repository.put_operation_intent(second.model_copy(update={"request_digest": "e" * 64}))
 
 
 def test_event_and_history_reads_are_paginated() -> None:
@@ -295,8 +316,11 @@ def seed_dynamo_table(table: StubDynamoTable) -> None:
             DynamoDBAutonomousRunRepository._item(
                 "EVENT#00000000000000000001",
                 RunEventRecord(
-                    run_id="run-1", sequence=1, event_type="x",
-                    to_status=AutonomousRunStatus.QUEUED, to_phase=RunPhase.QUEUED,
+                    run_id="run-1",
+                    sequence=1,
+                    event_type="x",
+                    to_status=AutonomousRunStatus.QUEUED,
+                    to_phase=RunPhase.QUEUED,
                     reason="queued",
                 ),
             ),
@@ -306,8 +330,11 @@ def seed_dynamo_table(table: StubDynamoTable) -> None:
             DynamoDBAutonomousRunRepository._item(
                 "OP#run-1:1:training",
                 RunOperation(
-                    operation_key="run-1:1:training", run_id="run-1", experiment_number=1,
-                    phase=RunPhase.TRAINING, provider_name="job",
+                    operation_key="run-1:1:training",
+                    run_id="run-1",
+                    experiment_number=1,
+                    phase=RunPhase.TRAINING,
+                    provider_name="job",
                 ),
             ),
         ]
@@ -328,6 +355,28 @@ def test_dynamo_reads_are_entity_bounded_and_keyset_paginated() -> None:
     assert [item.experiment_number for item in experiments.items] == [1]
     assert "BETWEEN" in str(table.queries[1]["KeyConditionExpression"])
     assert repository.get_operation("run-1", "run-1:1:training") is not None
+    assert repository.get_operation("run-1") is not None
+
+
+def test_dynamo_event_after_sequence_is_exclusive() -> None:
+    table = StubDynamoTable()
+    seed_dynamo_table(table)
+    table.items.append(
+        DynamoDBAutonomousRunRepository._item(
+            "EVENT#00000000000000000002",
+            RunEventRecord(
+                run_id="run-1",
+                sequence=2,
+                event_type="x",
+                to_status=AutonomousRunStatus.RUNNING,
+                to_phase=RunPhase.BASELINE,
+                reason="started",
+            ),
+        )
+    )
+    repository = DynamoDBAutonomousRunRepository(table=table, client=StubDynamoClient())
+    page = repository.list_events("run-1", after_sequence=1, limit=1)
+    assert [item.sequence for item in page.items] == [2]
 
 
 def test_dynamo_lease_uses_native_resource_expression_values_and_derived_name() -> None:
@@ -344,8 +393,11 @@ def test_dynamo_operation_intent_requires_existing_run_and_uses_transaction() ->
     client = StubDynamoClient()
     repository = DynamoDBAutonomousRunRepository(table=table, client=client)
     operation = RunOperation(
-        operation_key="orphan", run_id="missing", experiment_number=1,
-        phase=RunPhase.TRAINING, provider_name="job",
+        operation_key="orphan",
+        run_id="missing",
+        experiment_number=1,
+        phase=RunPhase.TRAINING,
+        provider_name="job",
     )
     with pytest.raises(RunNotFoundError):
         repository.put_operation_intent(operation)
@@ -361,8 +413,31 @@ def test_dynamo_operation_intent_requires_existing_run_and_uses_transaction() ->
 def test_event_contract_rejects_raw_content_and_nested_contracts_are_immutable() -> None:
     with pytest.raises(ValueError):
         RunEventRecord(
-            run_id="run-1", sequence=1, event_type="x", to_status=AutonomousRunStatus.QUEUED,
-            to_phase=RunPhase.QUEUED, reason="raw prompt: secret words",
+            run_id="run-1",
+            sequence=1,
+            event_type="x",
+            to_status=AutonomousRunStatus.QUEUED,
+            to_phase=RunPhase.QUEUED,
+            reason="raw prompt: secret words",
+        )
+    with pytest.raises(ValueError):
+        RunEventRecord(
+            run_id="run-1",
+            sequence=1,
+            event_type="x",
+            to_status=AutonomousRunStatus.QUEUED,
+            to_phase=RunPhase.QUEUED,
+            reason="arbitrary private answer",
+        )
+    with pytest.raises(ValueError):
+        RunEventRecord(
+            run_id="run-1",
+            sequence=1,
+            event_type="x",
+            to_status=AutonomousRunStatus.QUEUED,
+            to_phase=RunPhase.QUEUED,
+            reason="queued",
+            metadata={"status": "arbitrary full answer"},
         )
     state = make_run()
     with pytest.raises(TypeError):
@@ -372,11 +447,7 @@ def test_event_contract_rejects_raw_content_and_nested_contracts_are_immutable()
 def test_recovery_scan_rejects_zero_limit_and_returns_cursor_for_physical_pages() -> None:
     table = StubDynamoTable()
     for index in range(3):
-        table.items.append(
-            DynamoDBAutonomousRunRepository._item(
-                "STATE", make_run(f"run-{index}")
-            )
-        )
+        table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_run(f"run-{index}")))
     repository = DynamoDBAutonomousRunRepository(table=table)
     with pytest.raises(ValueError):
         repository.scan_recoverable(limit=0)

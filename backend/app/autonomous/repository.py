@@ -452,6 +452,11 @@ class InMemoryAutonomousRunRepository:
             key = (operation.run_id, operation.operation_key)
             existing = self._operations.get(key)
             if existing is not None:
+                if (
+                    existing.request_digest is not None
+                    and existing.request_digest == operation.request_digest
+                ):
+                    return copy_for_storage(existing)
                 if existing != operation:
                     raise OperationAlreadyExistsError(
                         "operation key is already bound to another intent"
@@ -703,9 +708,7 @@ class DynamoDBAutonomousRunRepository:
         return item
 
     @classmethod
-    def _ddb_item(
-        cls, sort_key: str, payload: Any, *, run_id: str | None = None
-    ) -> dict[str, Any]:
+    def _ddb_item(cls, sort_key: str, payload: Any, *, run_id: str | None = None) -> dict[str, Any]:
         """Encode a native resource item for the low-level DynamoDB client."""
 
         return {
@@ -1011,9 +1014,7 @@ class DynamoDBAutonomousRunRepository:
                     continue
                 state = self._decode(item, AutonomousRunState)
                 if state.status not in terminal and not (
-                    state.lease_owner
-                    and state.lease_expires_at
-                    and state.lease_expires_at > when
+                    state.lease_owner and state.lease_expires_at and state.lease_expires_at > when
                 ):
                     output.append(state)
                     page_cursor = {"pk": item.get("pk"), "sk": item.get("sk")}
@@ -1054,6 +1055,12 @@ class DynamoDBAutonomousRunRepository:
         except Exception as exc:
             if self._conditional(exc):
                 existing = self.get_operation(operation.run_id, operation.operation_key)
+                if (
+                    existing is not None
+                    and existing.request_digest is not None
+                    and existing.request_digest == operation.request_digest
+                ):
+                    return existing
                 if existing == operation:
                     return existing
                 raise OperationAlreadyExistsError(
@@ -1063,12 +1070,26 @@ class DynamoDBAutonomousRunRepository:
         return operation
 
     def get_operation(self, run_id: str, operation_key: str | None = None) -> RunOperation | None:
-        if operation_key is None:
-            raise ValueError("operation_key is required for an operation lookup")
-        response = self._table_or_create().get_item(
-            Key=self._key(run_id, self._operation_sk(operation_key)), ConsistentRead=True
+        if operation_key is not None:
+            response = self._table_or_create().get_item(
+                Key=self._key(run_id, self._operation_sk(operation_key)), ConsistentRead=True
+            )
+            item = response.get("Item")
+            return self._decode(item, RunOperation) if isinstance(item, Mapping) else None
+        response = self._table_or_create().query(
+            KeyConditionExpression="pk = :pk AND sk BETWEEN :start AND :end",
+            ExpressionAttributeValues={
+                ":pk": f"RUN#{run_id}",
+                ":start": "OP#",
+                ":end": "OP#\uffff",
+            },
+            Limit=2,
+            ScanIndexForward=True,
         )
-        item = response.get("Item")
+        items = response.get("Items", [])
+        if len(items) != 1:
+            return None
+        item = items[0]
         return self._decode(item, RunOperation) if isinstance(item, Mapping) else None
 
     def record_operation_result(
@@ -1116,9 +1137,7 @@ class DynamoDBAutonomousRunRepository:
             )
         except Exception as exc:
             if self._conditional(exc):
-                raise OperationAlreadyExistsError(
-                    "operation result changed concurrently"
-                ) from exc
+                raise OperationAlreadyExistsError("operation result changed concurrently") from exc
             raise
         return updated
 
@@ -1134,7 +1153,7 @@ class DynamoDBAutonomousRunRepository:
             raise ValueError("limit must be positive")
         expression_values: dict[str, Any] = {
             ":pk": f"RUN#{run_id}",
-            ":start": f"EVENT#{after_sequence:020d}",
+            ":start": f"EVENT#{after_sequence + 1:020d}",
             ":end": "EVENT#\uffff",
         }
         kwargs: dict[str, Any] = {
@@ -1145,9 +1164,7 @@ class DynamoDBAutonomousRunRepository:
         }
         if cursor is not None:
             kwargs["ExclusiveStartKey"] = dict(cursor)
-        response = self._table_or_create().query(
-            **kwargs
-        )
+        response = self._table_or_create().query(**kwargs)
         values = [self._decode(item, RunEventRecord) for item in response.get("Items", [])]
         return EventPage(
             values[:limit],
