@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from re import fullmatch
 from typing import Any, Protocol
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 class OptionalDependencyError(RuntimeError):
@@ -23,6 +23,28 @@ class OptionalDependencyError(RuntimeError):
 
 class ArtifactIntegrityError(ValueError):
     """Raised when an artifact cannot be proven immutable and content-addressed."""
+
+
+def _validate_s3_path(value: object, *, name: str, allow_empty: bool = False) -> str:
+    """Validate a slash-delimited S3 key/prefix without path traversal forms."""
+
+    if not isinstance(value, str):
+        raise ArtifactIntegrityError(f"{name} path must be a string")
+    if not value and allow_empty:
+        return value
+    if not value:
+        raise ArtifactIntegrityError(f"{name} path must not be empty")
+    segments = value.split("/")
+    if any(
+        not segment
+        or segment in {".", ".."}
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in segment)
+        for segment in segments
+    ):
+        raise ArtifactIntegrityError(
+            f"{name} path contains an empty, dot, or control segment"
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +110,33 @@ class ArtifactRef:
             content_type=content_type,
         )
 
+    @classmethod
+    def from_live_uri(
+        cls,
+        value: str,
+        *,
+        sha256: str,
+        size_bytes: int,
+        content_type: str | None = None,
+    ) -> ArtifactRef:
+        """Parse an S3 reference for live evidence with exactly one version id."""
+
+        parsed = urlparse(value)
+        if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+            raise ValueError(f"Not an S3 URI: {value!r}")
+        version_values = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
+        if len(version_values) != 1 or not version_values[0] or version_values[0].lower() == "null":
+            raise ValueError("S3 live URI must contain one immutable VersionId")
+        key = _validate_s3_path(unquote(parsed.path.lstrip("/")), name="artifact key")
+        return cls(
+            bucket=parsed.netloc,
+            key=key,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            version_id=version_values[0],
+            content_type=content_type,
+        )
+
 
 class ArtifactStore(Protocol):
     def put_bytes(
@@ -122,7 +171,7 @@ class S3ArtifactStore:
         if not bucket.strip():
             raise ValueError("bucket must not be empty")
         self.bucket = bucket
-        self.prefix = prefix.strip("/")
+        self.prefix = _validate_s3_path(prefix, name="artifact prefix", allow_empty=True)
         self._client = client
 
     @staticmethod
@@ -140,9 +189,7 @@ class S3ArtifactStore:
         return self._client
 
     def _key(self, key: str) -> str:
-        clean = key.strip("/")
-        if not clean:
-            raise ValueError("artifact key must not be empty")
+        clean = _validate_s3_path(key, name="artifact key")
         return f"{self.prefix}/{clean}" if self.prefix else clean
 
     def put_bytes(
@@ -235,8 +282,8 @@ class S3ArtifactStore:
 
     @staticmethod
     def _key_in_prefix(key: str, prefix: str) -> bool:
-        clean_prefix = prefix.strip("/")
-        clean_key = key.strip("/")
+        clean_prefix = _validate_s3_path(prefix, name="allowed prefix", allow_empty=True)
+        clean_key = _validate_s3_path(key, name="artifact key")
         return (
             not clean_prefix
             or clean_key == clean_prefix
@@ -311,7 +358,9 @@ class S3ArtifactStore:
         metadata_digest = self._metadata_value(metadata, "sha256")
         if metadata_digest != digest:
             raise ArtifactIntegrityError("S3 metadata SHA-256 does not match the expected digest")
-        observed_size = head.get("ContentLength")
+        observed_size = self._required_size(
+            head.get("ContentLength"), context="S3 head ContentLength"
+        )
         if observed_size != size_bytes:
             raise ArtifactIntegrityError("S3 metadata size does not match the expected size")
 
@@ -344,6 +393,8 @@ class S3ArtifactStore:
         output_uri: str,
         *,
         retained_prefix: str,
+        allowed_source_bucket: str,
+        allowed_source_prefix: str,
         expected_sha256: str | None = None,
         expected_size_bytes: int | None = None,
     ) -> ArtifactRef:
@@ -358,7 +409,19 @@ class S3ArtifactStore:
         parsed = urlparse(output_uri)
         if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
             raise ArtifactIntegrityError(f"Not an S3 output archive URI: {output_uri!r}")
-        source_key = parsed.path.lstrip("/")
+        source_key = _validate_s3_path(
+            unquote(parsed.path.lstrip("/")), name="SageMaker output key"
+        )
+        if not isinstance(allowed_source_bucket, str) or not allowed_source_bucket.strip():
+            raise ArtifactIntegrityError("allowed source bucket must not be empty")
+        if parsed.netloc != allowed_source_bucket:
+            raise ArtifactIntegrityError("SageMaker output is outside the allowed source bucket")
+        allowed_source_prefix = _validate_s3_path(
+            allowed_source_prefix, name="allowed source prefix"
+        )
+        if not self._key_in_prefix(source_key, allowed_source_prefix):
+            raise ArtifactIntegrityError("SageMaker output is outside the allowed source prefix")
+        clean_prefix = _validate_s3_path(retained_prefix, name="retained prefix")
         source_versions = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
         if len(source_versions) > 1 or (source_versions and not source_versions[0]):
             raise ArtifactIntegrityError("SageMaker output URI has an invalid VersionId")
@@ -368,15 +431,16 @@ class S3ArtifactStore:
             head_kwargs["VersionId"] = self._required_version(source_version, context="output")
         head = dict(self._client_or_create().head_object(**head_kwargs))
         resolved_version = self._required_version(head.get("VersionId"), context="SageMaker output")
+        if source_version and resolved_version != source_version:
+            raise ArtifactIntegrityError(
+                "S3 head VersionId does not match the requested source VersionId"
+            )
         source_ref = ArtifactRef(
             bucket=parsed.netloc,
             key=source_key,
             sha256="0" * 64,
-            size_bytes=(
-                int(head["ContentLength"])
-                if isinstance(head.get("ContentLength"), int)
-                and not isinstance(head.get("ContentLength"), bool)
-                else 0
+            size_bytes=self._required_size(
+                head.get("ContentLength"), context="SageMaker output ContentLength"
             ),
             version_id=resolved_version,
         )
@@ -392,9 +456,6 @@ class S3ArtifactStore:
             raise ArtifactIntegrityError(
                 "downloaded output archive size does not match expected size"
             )
-        clean_prefix = retained_prefix.strip("/")
-        if not clean_prefix:
-            raise ArtifactIntegrityError("retained_prefix must not be empty")
         retained_key = f"{clean_prefix}/{digest}.tar.gz"
         retained = self.put_bytes(
             retained_key,

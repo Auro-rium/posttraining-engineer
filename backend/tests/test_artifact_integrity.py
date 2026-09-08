@@ -234,6 +234,8 @@ def test_canonicalize_sagemaker_output_retains_downloaded_bytes_by_content_hash(
     retained = store.canonicalize_sagemaker_output(
         "s3://artifacts/jobs/run-1/model.tar.gz",
         retained_prefix="checkpoints/run-1",
+        allowed_source_bucket="artifacts",
+        allowed_source_prefix="jobs/run-1",
     )
 
     assert retained.bucket == "artifacts"
@@ -269,4 +271,115 @@ def test_canonicalize_sagemaker_output_requires_retained_version() -> None:
         store.canonicalize_sagemaker_output(
             "s3://artifacts/jobs/run-1/model.tar.gz",
             retained_prefix="checkpoints/run-1",
+            allowed_source_bucket="artifacts",
+            allowed_source_prefix="jobs/run-1",
+        )
+
+
+def test_canonicalize_rejects_source_version_rebinding() -> None:
+    data = b"sagemaker output archive"
+
+    class RebindingHead(_VersionedS3):
+        def head_object(self, **kwargs: object) -> dict[str, object]:
+            response = super().head_object(**kwargs)
+            response["VersionId"] = "source-v2"
+            return response
+
+    client = RebindingHead()
+    client.add("artifacts", "jobs/run-1/model.tar.gz", data, version_id="source-v1")
+    store = S3ArtifactStore("artifacts", client=client, prefix="retained")
+
+    with pytest.raises(ArtifactIntegrityError, match="requested source VersionId"):
+        store.canonicalize_sagemaker_output(
+            "s3://artifacts/jobs/run-1/model.tar.gz?versionId=source-v1",
+            retained_prefix="checkpoints/run-1",
+            allowed_source_bucket="artifacts",
+            allowed_source_prefix="jobs/run-1",
+        )
+
+
+@pytest.mark.parametrize(
+    "output_uri",
+    [
+        "s3://artifacts/jobs/run-1/model.tar.gz?versionId=source-v1&versionId=source-v2",
+        "s3://artifacts/jobs/run-1/model.tar.gz?versionId=",
+    ],
+)
+def test_canonicalize_requires_explicit_source_location_and_valid_uri_version(
+    output_uri: str,
+) -> None:
+    store = S3ArtifactStore("artifacts", client=_VersionedS3(), prefix="retained")
+
+    with pytest.raises(ArtifactIntegrityError, match=r"VersionId|source bucket"):
+        store.canonicalize_sagemaker_output(
+            output_uri,
+            retained_prefix="checkpoints/run-1",
+            allowed_source_bucket="artifacts",
+            allowed_source_prefix="jobs/run-1",
+        )
+
+    with pytest.raises(TypeError):
+        store.canonicalize_sagemaker_output(
+            "s3://artifacts/jobs/run-1/model.tar.gz",
+            retained_prefix="checkpoints/run-1",
+        )  # type: ignore[call-arg]
+
+
+def test_live_uri_parser_requires_one_nonblank_version_id() -> None:
+    data = b"archive"
+    for uri in (
+        "s3://artifacts/checkpoints/model.tar.gz",
+        "s3://artifacts/checkpoints/model.tar.gz?versionId=",
+        "s3://artifacts/checkpoints/model.tar.gz?versionId=v1&versionId=v2",
+        "s3://artifacts/checkpoints/model.tar.gz?versionId=null",
+    ):
+        with pytest.raises(ValueError, match="one immutable VersionId"):
+            ArtifactRef.from_live_uri(
+                uri,
+                sha256=hashlib.sha256(data).hexdigest(),
+                size_bytes=len(data),
+            )
+
+
+@pytest.mark.parametrize("value", ["runs/../model", "runs//model", "runs/./model", "runs/model\n"])
+def test_artifact_paths_reject_dot_empty_and_control_segments(value: str) -> None:
+    store = S3ArtifactStore("artifacts", client=_VersionedS3())
+    with pytest.raises(ArtifactIntegrityError, match="path"):
+        store.put_bytes(value, b"bytes")
+
+    with pytest.raises(ArtifactIntegrityError, match="path"):
+        store.canonicalize_sagemaker_output(
+            "s3://artifacts/jobs/run-1/model.tar.gz",
+            retained_prefix=value,
+            allowed_source_bucket="artifacts",
+            allowed_source_prefix="jobs/run-1",
+        )
+
+
+@pytest.mark.parametrize("invalid_length", [True, -1])
+def test_verify_rejects_boolean_or_negative_content_length(invalid_length: object) -> None:
+    data = b"checkpoint archive"
+
+    class InvalidLengthHead(_VersionedS3):
+        content_length: object = invalid_length
+
+        def head_object(self, **kwargs: object) -> dict[str, object]:
+            response = super().head_object(**kwargs)
+            response["ContentLength"] = self.content_length
+            return response
+
+    client = InvalidLengthHead()
+    client.add(
+        "artifacts",
+        "runs/run-1/model.tar.gz",
+        data,
+        version_id="source-v1",
+        metadata={"sha256": hashlib.sha256(data).hexdigest()},
+    )
+    store = S3ArtifactStore("artifacts", client=client, prefix="runs")
+    with pytest.raises(ArtifactIntegrityError, match="ContentLength"):
+        store.verify_immutable(
+            _ref(data),
+            expected_sha256=hashlib.sha256(data).hexdigest(),
+            expected_size_bytes=len(data),
         )
