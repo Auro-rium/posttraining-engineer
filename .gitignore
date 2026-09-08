@@ -24,6 +24,11 @@ crash.log
 artifacts/
 backend/artifacts/
 
+# Frontend dependencies and generated build metadata.
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
 # Generated/live documentation snapshots; canonical living docs stay tracked.
 live-docs/
 live_docs/
