@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal, overload
 
 from .models import (
     ALLOWED_TOOLS,
@@ -35,6 +36,16 @@ class _TaskDefinition:
     split: ObjectiveSplit
     service_name: str
     failure_mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SealedEvaluation:
+    """Private hidden-evaluation result with no serializing model methods."""
+
+    task_id: str
+    reward: int
+    success: bool
+    steps: int
 
 
 class ServiceRecoveryEngine:
@@ -117,20 +128,21 @@ class ServiceRecoveryEngine:
         self._step += 1
         service = str(call.arguments.get("service", self._definition.service_name))
         if service not in _SERVICES:
-            return self._result(call, False, -0.05, f"invalid service: {service}", service=service)
+            return self._result(call, False, f"invalid service: {service}", service=service)
 
         if tool == "edit_config":
             content = call.arguments.get("content")
             if not isinstance(content, str) or not content.strip():
-                return self._result(call, False, -0.05, "content is required", service=service)
+                return self._result(call, False, "content is required", service=service)
             if (
-                service == self._definition.service_name
+                self._definition.failure_mode == "config_error"
+                and service == self._definition.service_name
                 and "broken_value_should_be_fixed" not in content
             ):
                 self._active_issue = False
-                return self._result(call, True, 1.1, "configuration updated", service=service)
+                return self._result(call, True, "configuration updated", service=service)
             return self._result(
-                call, False, -0.05, "configuration did not resolve the issue", service=service
+                call, False, "configuration did not resolve the issue", service=service
             )
 
         if tool == "run_healthcheck":
@@ -138,30 +150,37 @@ class ServiceRecoveryEngine:
             return self._result(
                 call,
                 healthy,
-                0.6 if healthy else -0.05,
                 "health check passed" if healthy else "health check failed",
                 service=service,
                 healthy=healthy,
             )
 
         if tool == "restart_service":
+            if (
+                self._active_issue
+                and service == self._definition.service_name
+                and self._definition.failure_mode in {"dependency_failure", "healthcheck_failure"}
+            ):
+                self._active_issue = False
             healthy = not self._active_issue
             return self._result(
                 call,
                 healthy,
-                0.1 if healthy else -0.05,
                 "service restarted" if healthy else "service still requires repair",
                 service=service,
                 healthy=healthy,
             )
 
         if tool == "read_config":
-            content = (
-                "setting1=value1\nsetting2=broken_value_should_be_fixed\n"
-                if self._active_issue
-                else "setting1=value1\nsetting2=value2\n"
-            )
-            return self._result(call, True, 0.1, content, service=service, content=content)
+            if not self._active_issue:
+                content = "setting1=value1\nsetting2=value2\n"
+            elif self._definition.failure_mode == "config_error":
+                content = "setting1=value1\nsetting2=broken_value_should_be_fixed\n"
+            elif self._definition.failure_mode == "dependency_failure":
+                content = "setting1=value1\ndependency=unavailable\n"
+            else:
+                content = "setting1=value1\nhealthcheck=failed\n"
+            return self._result(call, True, content, service=service, content=content)
 
         if tool == "get_logs":
             message = (
@@ -169,29 +188,25 @@ class ServiceRecoveryEngine:
                 if self._active_issue
                 else "service started successfully"
             )
-            return self._result(call, True, 0.1, message, service=service)
+            return self._result(call, True, message, service=service)
 
         # inspect_service is deliberately descriptive but does not reveal the
         # private failure mode or verifier state.
         healthy = not self._active_issue
         return self._result(
-            call, True, 0.1, "service inspection complete", service=service, healthy=healthy
+            call, True, "service inspection complete", service=service, healthy=healthy
         )
 
     def _result(
         self,
         call: ToolCall,
         success: bool,
-        base_reward: float,
         message: str,
         *,
         service: str,
         healthy: bool | None = None,
         **extra: Any,
     ) -> StepResult:
-        reward = base_reward - (0.01 * self._step)
-        if self._active_issue is False:
-            reward += 2.0
         observation = self._public_observation(
             service=service,
             message=message,
@@ -202,12 +217,30 @@ class ServiceRecoveryEngine:
         return StepResult(
             call=call,
             success=success,
-            reward=round(max(-1.0, min(3.0, reward)), 8),
+            reward=int(done and not self._active_issue),
             done=done,
             step=self._step,
             observation=observation,
             error=None if success else message,
         )
+
+    @overload
+    def run_episode(  # type: ignore[overload-overlap]
+        self,
+        task_id: str,
+        actions: list[ToolCall] | tuple[ToolCall, ...],
+        *,
+        split: Literal[ObjectiveSplit.HIDDEN],
+    ) -> _SealedEvaluation: ...
+
+    @overload
+    def run_episode(
+        self,
+        task_id: str,
+        actions: list[ToolCall] | tuple[ToolCall, ...],
+        *,
+        split: ObjectiveSplit | None = None,
+    ) -> Trajectory: ...
 
     def run_episode(
         self,
@@ -215,16 +248,27 @@ class ServiceRecoveryEngine:
         actions: list[ToolCall] | tuple[ToolCall, ...],
         *,
         split: ObjectiveSplit | None = None,
-    ) -> Trajectory:
+    ) -> Trajectory | _SealedEvaluation:
         if split is None:
             split = ObjectiveSplit.REPLAY if task_id.startswith("replay-") else ObjectiveSplit.TRAIN
-        task = self.reset(split=split, task_id=task_id)
+        else:
+            split = ObjectiveSplit(split)
+        episode_engine = ServiceRecoveryEngine(seed=self.seed, sealed=self.sealed)
+        task = episode_engine.reset(split=split, task_id=task_id)
         results: list[StepResult] = []
         for action in actions:
-            result = self.step(action.tool, dict(action.arguments))
+            result = episode_engine.step(action.tool, dict(action.arguments))
             results.append(result)
             if result.done:
                 break
+        if split is ObjectiveSplit.HIDDEN:
+            success = bool(results and results[-1].done and not episode_engine._active_issue)
+            return _SealedEvaluation(
+                task_id=task.task_id,
+                reward=int(success),
+                success=success,
+                steps=len(results),
+            )
         executed_actions = [result.call.model_dump(mode="json") for result in results]
         trajectory_id = (
             "traj-"
@@ -249,7 +293,7 @@ class ServiceRecoveryEngine:
             seed=self.seed,
             steps=tuple(results),
             total_reward=round(sum(result.reward for result in results), 8),
-            success=bool(results and results[-1].done and not self._active_issue),
+            success=bool(results and results[-1].done and not episode_engine._active_issue),
             done=bool(results and results[-1].done),
         )
 
@@ -258,8 +302,12 @@ class ServiceRecoveryEngine:
             raise ValueError("trajectory provenance does not match engine")
         if trajectory.split is ObjectiveSplit.HIDDEN:
             raise ValueError("hidden split cannot be replayed by the objective service")
+        if not trajectory.steps:
+            raise TrajectoryNotAdmissible("verifier requires at least one trajectory step")
         actions = tuple(step.call for step in trajectory.steps)
         replayed = self.run_episode(trajectory.task_id, actions, split=trajectory.split)
+        if not isinstance(replayed, Trajectory):
+            raise ValueError("trajectory replay crossed the sealed hidden boundary")
         if replayed.trajectory_id != trajectory.trajectory_id:
             raise ValueError("trajectory provenance does not match replay")
         if replayed.steps != trajectory.steps or replayed.total_reward != trajectory.total_reward:
@@ -283,20 +331,30 @@ class ServiceRecoveryEngine:
         *,
         run_id: str,
         experiment_id: str,
+        scope: ObjectiveSplit = ObjectiveSplit.REPLAY,
     ) -> Dataset:
+        scope = ObjectiveSplit(scope)
+        if scope not in {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}:
+            raise TrajectoryNotAdmissible("dataset scope is limited to train and replay")
         rows: list[DatasetRow] = []
         for trajectory in trajectories:
+            if trajectory.split is not scope:
+                raise TrajectoryNotAdmissible("trajectory split does not match dataset scope")
             if not trajectory.verified:
                 raise TrajectoryNotAdmissible(
                     "only verifier-confirmed trajectories may enter a dataset"
                 )
-            if trajectory.split not in {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}:
-                raise TrajectoryNotAdmissible("dataset scope excludes validation and hidden splits")
+            try:
+                confirmed = self.verify(trajectory).trajectory
+            except ValueError as exc:
+                raise TrajectoryNotAdmissible(
+                    f"only verifier-confirmed trajectories may enter a dataset: {exc}"
+                ) from exc
             rows.append(
                 DatasetRow(
-                    source_trajectory_id=trajectory.trajectory_id,
-                    task_id=trajectory.task_id,
-                    split=trajectory.split,
+                    source_trajectory_id=confirmed.trajectory_id,
+                    task_id=confirmed.task_id,
+                    split=confirmed.split,
                     messages=tuple(
                         {
                             "role": "tool",
@@ -304,7 +362,7 @@ class ServiceRecoveryEngine:
                             "arguments": step.call.arguments,
                             "observation": step.observation,
                         }
-                        for step in trajectory.steps
+                        for step in confirmed.steps
                     )
                     or ({"role": "tool", "name": "noop", "observation": {}},),
                     failure_label="service_recovery",
@@ -326,6 +384,8 @@ class ServiceRecoveryEngine:
             experiment_id=experiment_id,
             row_count=len(rows),
             sha256=digest,
+            s3_uri=f"s3://objective-datasets/{dataset_id}.jsonl",
+            created_at=datetime.now(UTC),
             source_trajectory_ids=tuple(row.source_trajectory_id for row in rows),
             target_failure_classes=("service_recovery",),
         )

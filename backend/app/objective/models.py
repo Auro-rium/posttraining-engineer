@@ -8,8 +8,10 @@ split.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -133,6 +135,8 @@ class DatasetManifest(ContractModel):
     experiment_id: str = Field(min_length=1)
     row_count: int = Field(ge=0)
     sha256: str
+    s3_uri: str = Field(min_length=1)
+    created_at: datetime
     source_trajectory_ids: tuple[str, ...] = Field(default_factory=tuple)
     target_failure_classes: tuple[str, ...] = Field(default_factory=tuple)
 
@@ -141,6 +145,13 @@ class DatasetManifest(ContractModel):
     def validate_sha256(cls, value: str) -> str:
         if not _SHA256.fullmatch(value):
             raise ValueError("sha256 must be a lowercase 64-character digest")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def require_aware_created_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("created_at must include a timezone")
         return value
 
 
@@ -152,6 +163,10 @@ class Dataset(ContractModel):
     def row_count_matches(self) -> Dataset:
         if self.manifest.row_count != len(self.rows):
             raise ValueError("dataset manifest row_count does not match rows")
+        payload = "\n".join(row.canonical_json() for row in self.rows)
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+        if digest != self.manifest.sha256:
+            raise ValueError("dataset manifest digest does not match rows")
         return self
 
 

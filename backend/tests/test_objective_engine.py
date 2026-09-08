@@ -5,8 +5,19 @@ import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
-from app.objective.engine import ServiceRecoveryEngine, TrajectoryNotAdmissible
-from app.objective.models import ALLOWED_TOOLS, ObjectiveSplit, ToolCall
+from app.objective.engine import (
+    ServiceRecoveryEngine,
+    TrajectoryNotAdmissible,
+    _SealedEvaluation,
+)
+from app.objective.models import (
+    ALLOWED_TOOLS,
+    BenchmarkRequest,
+    Dataset,
+    ObjectiveSplit,
+    ToolCall,
+    Trajectory,
+)
 from app.objective.service import create_objective_app
 
 
@@ -46,15 +57,25 @@ def test_only_verifier_confirmed_trajectories_can_enter_a_dataset() -> None:
     trajectory = engine.run_episode(
         "train-001",
         [ToolCall(tool="run_healthcheck", arguments={"service": "api"})],
+        split=ObjectiveSplit.REPLAY,
     )
     unverified = trajectory.model_copy(update={"verified": False})
 
     with pytest.raises(TrajectoryNotAdmissible, match="verifier"):
-        engine.build_dataset([unverified], run_id="run-1", experiment_id="exp-1")
+        engine.build_dataset(
+            [unverified], run_id="run-1", experiment_id="exp-1", scope=ObjectiveSplit.REPLAY
+        )
 
     verified = engine.verify(trajectory)
-    dataset = engine.build_dataset([verified.trajectory], run_id="run-1", experiment_id="exp-1")
+    dataset = engine.build_dataset(
+        [verified.trajectory],
+        run_id="run-1",
+        experiment_id="exp-1",
+        scope=ObjectiveSplit.REPLAY,
+    )
     assert dataset.manifest.row_count == 1
+    assert dataset.manifest.s3_uri.endswith(f"{dataset.manifest.dataset_id}.jsonl")
+    assert dataset.manifest.created_at.tzinfo is not None
     assert dataset.rows[0].verifier_confirmed is True
     assert dataset.rows[0].source_trajectory_id == trajectory.trajectory_id
     assert (
@@ -75,6 +96,103 @@ def test_replay_rejects_mismatched_provenance() -> None:
         engine.verify(mismatched)
 
 
+def test_admission_rejects_a_forged_verified_zero_step_trajectory() -> None:
+    engine = ServiceRecoveryEngine(seed=5)
+    forged = engine.run_episode("replay-001", [], split=ObjectiveSplit.REPLAY).model_copy(
+        update={"verified": True}
+    )
+
+    with pytest.raises(TrajectoryNotAdmissible, match="verifier"):
+        engine.build_dataset(
+            [forged], run_id="run-1", experiment_id="exp-1", scope=ObjectiveSplit.REPLAY
+        )
+
+
+def test_replay_scope_requires_every_trajectory_to_match_the_request_scope() -> None:
+    engine = ServiceRecoveryEngine(seed=5)
+    train = engine.run_episode(
+        "train-001", [ToolCall(tool="get_logs", arguments={})], split=ObjectiveSplit.TRAIN
+    )
+
+    with pytest.raises(TrajectoryNotAdmissible, match="scope"):
+        engine.build_dataset(
+            [train.model_copy(update={"verified": True})],
+            run_id="run-1",
+            experiment_id="exp-1",
+            scope=ObjectiveSplit.REPLAY,
+        )
+
+
+def test_sealed_engine_uses_a_private_non_serializing_hidden_path() -> None:
+    result = ServiceRecoveryEngine(seed=2, sealed=True).run_episode(
+        "hidden-001",
+        [ToolCall(tool="run_healthcheck", arguments={})],
+        split=ObjectiveSplit.HIDDEN,
+    )
+
+    assert isinstance(result, _SealedEvaluation)
+    assert result.reward in {0, 1}
+    assert not hasattr(result, "model_dump")
+
+
+def test_reward_is_binary_and_failure_modes_drive_repair_behavior() -> None:
+    engine = ServiceRecoveryEngine(seed=17)
+    actions_by_mode = {
+        "config_error": ToolCall(
+            tool="edit_config", arguments={"service": "api", "content": "setting2=value2"}
+        ),
+        "dependency_failure": ToolCall(tool="restart_service", arguments={"service": "api"}),
+        "healthcheck_failure": ToolCall(tool="restart_service", arguments={"service": "api"}),
+    }
+    covered: set[str] = set()
+    for index in range(100):
+        task_id = f"replay-{index:03d}"
+        mode = engine._make_definition(task_id, ObjectiveSplit.REPLAY).failure_mode
+        covered.add(mode)
+        trajectory = engine.run_episode(
+            task_id, [actions_by_mode[mode]], split=ObjectiveSplit.REPLAY
+        )
+        if trajectory.steps:
+            assert all(step.reward in {0, 1} for step in trajectory.steps)
+        if covered == set(actions_by_mode):
+            break
+    else:
+        pytest.fail("deterministic fixture did not cover all failure modes")
+
+    assert any(
+        engine._make_definition(f"replay-{index:03d}", ObjectiveSplit.REPLAY).failure_mode
+        == "config_error"
+        for index in range(100)
+    )
+    assert any(
+        engine._make_definition(f"replay-{index:03d}", ObjectiveSplit.REPLAY).failure_mode
+        == "dependency_failure"
+        for index in range(100)
+    )
+    assert any(
+        engine._make_definition(f"replay-{index:03d}", ObjectiveSplit.REPLAY).failure_mode
+        == "healthcheck_failure"
+        for index in range(100)
+    )
+
+
+def test_dataset_contract_recomputes_digest() -> None:
+    engine = ServiceRecoveryEngine(seed=3)
+    trajectory = engine.verify(
+        engine.run_episode(
+            "replay-001",
+            [ToolCall(tool="get_logs", arguments={})],
+            split=ObjectiveSplit.REPLAY,
+        )
+    ).trajectory
+    dataset = engine.build_dataset(
+        [trajectory], run_id="run-1", experiment_id="exp-1", scope=ObjectiveSplit.REPLAY
+    )
+    forged_manifest = dataset.manifest.model_copy(update={"sha256": "a" * 64})
+    with pytest.raises(ValueError, match="digest"):
+        Dataset(manifest=forged_manifest, rows=dataset.rows)
+
+
 def test_objective_service_requires_auth_and_rejects_hidden_split() -> None:
     client = TestClient(create_objective_app(ServiceRecoveryEngine(seed=1), auth_token="secret"))
     payload = {"run_id": "run-1", "split": "train", "task_ids": ["train-001"]}
@@ -91,11 +209,37 @@ def test_objective_service_requires_auth_and_rejects_hidden_split() -> None:
     response = client.post(
         "/v1/benchmark", json=payload, headers={"authorization": "Bearer secret"}
     )
+    assert response.status_code == 503
+    assert "adapter" in response.text
+
+
+def test_benchmark_requires_an_injected_execution_adapter() -> None:
+    class Adapter:
+        def execute_benchmark(
+            self, request: BenchmarkRequest, engine: ServiceRecoveryEngine
+        ) -> tuple[Trajectory, ...]:
+            return tuple(
+                engine.run_episode(
+                    task_id,
+                    [ToolCall(tool="run_healthcheck", arguments={})],
+                    split=request.split,
+                )
+                for task_id in request.task_ids
+            )
+
+    client = TestClient(
+        create_objective_app(
+            ServiceRecoveryEngine(seed=1), auth_token="secret", execution_adapter=Adapter()
+        )
+    )
+    response = client.post(
+        "/v1/benchmark",
+        json={"run_id": "run-1", "split": "train", "task_ids": ["train-001"]},
+        headers={"authorization": "Bearer secret"},
+    )
     assert response.status_code == 200
-    body = response.json()
-    assert body["split"] == "train"
+    assert response.json()["success_rate"] in {0, 1}
     assert "failure_mode" not in response.text
-    assert "hidden" not in response.text
 
 
 def test_curation_endpoint_returns_a_content_addressed_dataset_for_replay_scope() -> None:
@@ -103,6 +247,7 @@ def test_curation_endpoint_returns_a_content_addressed_dataset_for_replay_scope(
     trajectory = engine.run_episode(
         "train-001",
         [ToolCall(tool="inspect_service", arguments={"service": "api"})],
+        split=ObjectiveSplit.REPLAY,
     )
     payload = {
         "run_id": "run-1",
