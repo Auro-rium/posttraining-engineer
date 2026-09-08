@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -79,6 +81,56 @@ _SENSITIVE_VALUE = (
     re.compile(r"\bheld[-_ ]?out\b|\bsealed\s+task\b", re.IGNORECASE),
 )
 _SAFE_IDENTIFIER = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
+_OPERATIONAL_METADATA_KEYS = frozenset(
+    {
+        "artifact_id",
+        "artifact_sha256",
+        "attempt",
+        "baseline_score",
+        "benchmark_id",
+        "candidate_score",
+        "checkpoint_version",
+        "component",
+        "cost_usd",
+        "dataset_version",
+        "decision",
+        "duration_ms",
+        "environment",
+        "episode_count",
+        "error_code",
+        "evaluation_status",
+        "experiment_id",
+        "job_id",
+        "job_type",
+        "latency_ms",
+        "manifest_sha256",
+        "metric",
+        "metric_name",
+        "metric_value",
+        "mode",
+        "model_id",
+        "model_family",
+        "operation",
+        "outcome",
+        "phase",
+        "provider",
+        "region",
+        "regression",
+        "resource_type",
+        "retry_count",
+        "role",
+        "service",
+        "status",
+        "suite",
+        "suite_version",
+        "task_count",
+        "training_status",
+    }
+)
+
+
+def _metadata_key(key: str) -> str:
+    return re.sub(r"[- ]+", "_", key.strip().lower())
 
 
 def _redact_value(key: str, value: Any) -> Any:
@@ -87,7 +139,10 @@ def _redact_value(key: str, value: Any) -> Any:
     if _SENSITIVE_KEY.search(key):
         return _REDACTED
     if isinstance(value, str):
-        if any(pattern.search(value) for pattern in _SENSITIVE_VALUE):
+        if (
+            _metadata_key(key) not in _OPERATIONAL_METADATA_KEYS
+            or any(pattern.search(value) for pattern in _SENSITIVE_VALUE)
+        ):
             return _REDACTED
         return value
     if isinstance(value, Mapping):
@@ -120,6 +175,28 @@ def _sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]
     except (TypeError, ValueError):
         return {"metadata_error": _REDACTED}
     return sanitized
+
+
+def _freeze_value(value: Any) -> Any:
+    """Recursively make metadata immutable after event creation."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_value(child) for key, child in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(child) for child in value)
+    return value
+
+
+def _thaw_value(value: Any) -> Any:
+    """Create a JSON-friendly mutable copy for sink serialization."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_value(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_value(child) for child in value]
+    return value
 
 
 def _validate_identifier(name: str, value: str) -> str:
@@ -167,6 +244,15 @@ class TelemetryEvent:
     cost_usd: float | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Frozen dataclasses protect field reassignment but not nested dicts;
+        # freeze the sanitized tree so callers cannot mutate an emitted event.
+        object.__setattr__(
+            self,
+            "attributes",
+            _freeze_value(_sanitize_attributes(self.attributes)),
+        )
+
     def to_dict(self) -> dict[str, object]:
         """Serialize the event without including arbitrary object values."""
 
@@ -183,7 +269,7 @@ class TelemetryEvent:
             "status": self.status,
             "latency_ms": self.latency_ms,
             "cost_usd": self.cost_usd,
-            "attributes": self.attributes,
+            "attributes": _thaw_value(self.attributes),
         }
 
 
@@ -228,14 +314,24 @@ class TelemetryRecorder:
             normalized_type = (
                 event_type if isinstance(event_type, EventType) else EventType(event_type)
             )
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise ValueError(f"unknown event_type: {event_type!r}") from exc
         if not isinstance(run_number, int) or isinstance(run_number, bool) or run_number < 1:
             raise ValueError("run_number must be a positive integer")
-        if latency_ms is not None and (not isinstance(latency_ms, (int, float)) or latency_ms < 0):
-            raise ValueError("latency_ms must be non-negative")
-        if cost_usd is not None and (not isinstance(cost_usd, (int, float)) or cost_usd < 0):
-            raise ValueError("cost_usd must be non-negative")
+        if latency_ms is not None and (
+            not isinstance(latency_ms, (int, float))
+            or isinstance(latency_ms, bool)
+            or not math.isfinite(float(latency_ms))
+            or latency_ms < 0
+        ):
+            raise ValueError("latency_ms must be finite and non-negative")
+        if cost_usd is not None and (
+            not isinstance(cost_usd, (int, float))
+            or isinstance(cost_usd, bool)
+            or not math.isfinite(float(cost_usd))
+            or cost_usd < 0
+        ):
+            raise ValueError("cost_usd must be finite and non-negative")
         if normalized_type is EventType.PROMOTION_DECIDED and evidence_label is None:
             raise ValueError("promotion events require evidence_label")
 

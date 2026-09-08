@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+from types import MappingProxyType
 
 import pytest
 
@@ -128,6 +130,22 @@ def test_rejects_invalid_correlation_and_measurements() -> None:
             experiment_id="experiment-001",
             latency_ms=-1,
         )
+    with pytest.raises(ValueError, match="latency_ms"):
+        recorder.record(
+            EventType.RUN_STARTED,
+            run_id="run-001",
+            run_number=1,
+            experiment_id="experiment-001",
+            latency_ms=math.inf,
+        )
+    with pytest.raises(ValueError, match="cost_usd"):
+        recorder.record(
+            EventType.RUN_STARTED,
+            run_id="run-001",
+            run_number=1,
+            experiment_id="experiment-001",
+            cost_usd=math.nan,
+        )
     with pytest.raises(ValueError, match="evidence_label"):
         recorder.record(
             EventType.PROMOTION_DECIDED,
@@ -171,3 +189,45 @@ def test_exporter_and_logger_failures_do_not_break_local_runs() -> None:
 
     assert event.run_id == "run-001"
     assert calls == ["exporter", "logger"]
+
+
+def test_redacts_unknown_metadata_strings_and_freezes_nested_attributes() -> None:
+    exported: list[dict[str, object]] = []
+    recorder = TelemetryRecorder(exporter=exported.append, logger=None, tracer=None)
+
+    event = recorder.record(
+        EventType.PHASE_COMPLETED,
+        run_id="run-001",
+        run_number=1,
+        experiment_id="experiment-001",
+        attributes={
+            "suite": "agentgym",
+            "unknown_string": "do not retain arbitrary content",
+            "nested": {
+                "environment": "webshop",
+                "freeform": "do not retain nested content",
+            },
+            "attempt": 2,
+            "items": [1, 2],
+        },
+    )
+
+    assert exported[0]["attributes"] == {
+        "suite": "agentgym",
+        "unknown_string": "[REDACTED]",
+        "nested": {"environment": "webshop", "freeform": "[REDACTED]"},
+        "attempt": 2,
+        "items": [1, 2],
+    }
+    assert isinstance(event.attributes, MappingProxyType)
+    assert isinstance(event.attributes["nested"], MappingProxyType)
+    assert event.attributes["items"] == (1, 2)
+    with pytest.raises(TypeError):
+        event.attributes["suite"] = "changed"
+    with pytest.raises(TypeError):
+        event.attributes["nested"]["environment"] = "changed"
+
+    payload = event.to_dict()
+    assert isinstance(payload["attributes"], dict)
+    payload["attributes"]["suite"] = "changed"
+    assert event.attributes["suite"] == "agentgym"
