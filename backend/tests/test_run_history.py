@@ -4,9 +4,10 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.posttraining.models import Artifact, ArtifactKind
+from app.posttraining.models import Artifact, ArtifactKind, Evidence, EvidenceKind, EvidenceLabel
 from app.posttraining.run_history import (
     MAX_RUNS,
+    BenchmarkMetrics,
     ComparisonDTO,
     RunDecision,
     RunHistoryRecord,
@@ -29,6 +30,23 @@ def checkpoint(artifact_id: str, digest: str = HASH_A) -> Artifact:
     )
 
 
+def evaluation_evidence(number: int) -> Evidence:
+    return Evidence(
+        evidence_id=f"evaluation-{number:03d}",
+        kind=EvidenceKind.EVALUATION,
+        label=EvidenceLabel.LIVE,
+        artifact_ids=(f"candidate-{number:03d}",),
+        metrics={"aggregate": 0.50 + number / 100, "WebShop": 0.45, "Wordle": 0.50},
+        verified=True,
+        benchmark_id="agentgym-held-out",
+        suite="AgentGym",
+        suite_version="v1",
+        manifest_sha256=HASH_A,
+        seed=7,
+        model_id="google/functiongemma-270m-it",
+    )
+
+
 def run_record(
     number: int,
     *,
@@ -48,15 +66,21 @@ def run_record(
         status=status,
         decision=decision,
         manifest_sha256=manifest_sha256,
-        baseline_metrics={
-            "aggregate": 0.40 + number / 100,
-            "per_environment": {"WebShop": 0.30, "Wordle": 0.40},
-        },
-        candidate_metrics={
-            "aggregate": 0.50 + number / 100,
-            "per_environment": {"WebShop": 0.45, "Wordle": 0.50},
-        },
+        benchmark_id="agentgym-held-out",
+        suite="AgentGym",
+        suite_version="v1",
+        seed=7,
+        model_id="google/functiongemma-270m-it",
+        baseline_metrics=BenchmarkMetrics(
+            aggregate=0.40 + number / 100,
+            per_environment={"WebShop": 0.30, "Wordle": 0.40},
+        ),
+        candidate_metrics=BenchmarkMetrics(
+            aggregate=0.50 + number / 100,
+            per_environment={"WebShop": 0.45, "Wordle": 0.50},
+        ),
         artifact_refs=(checkpoint(f"candidate-{number:03d}", HASH_B),),
+        evidence=(evaluation_evidence(number),),
         created_at=datetime(2026, 9, number, tzinfo=UTC),
         updated_at=datetime(2026, 9, number, tzinfo=UTC),
     )
@@ -131,7 +155,6 @@ def test_registry_reserves_at_most_five_runs_and_preserves_links() -> None:
 def test_registry_builds_api_and_graph_comparison_dto() -> None:
     repository: RunHistoryRepository = MemoryRunHistory()
     registry = RunRegistry(repository)
-    registry.register(run_record(2, parent_run_id="run-001", champion_run_id="run-001"))
     registry.register(
         run_record(
             1,
@@ -140,6 +163,7 @@ def test_registry_builds_api_and_graph_comparison_dto() -> None:
             manifest_sha256=HASH_A,
         )
     )
+    registry.register(run_record(2, parent_run_id="run-001", champion_run_id="run-001"))
 
     comparison = registry.compare()
 
@@ -185,3 +209,62 @@ def test_record_requires_manifest_for_terminal_decision() -> None:
     )
     assert pending.status is RunStatus.RUNNING
     assert pending.decision is None
+
+
+def test_record_rejects_mutation_of_nested_metrics_and_artifact_metadata() -> None:
+    record = run_record(1)
+    assert record.candidate_metrics is not None
+
+    with pytest.raises(TypeError):
+        record.candidate_metrics.per_environment["WebShop"] = 0.99
+    with pytest.raises(TypeError):
+        record.artifact_refs[0].metadata["source"] = "changed"
+    with pytest.raises(ValueError, match="frozen"):
+        record.evidence[0].verified = False
+    with pytest.raises(TypeError):
+        record.evidence[0].metrics["aggregate"] = 0.01
+
+
+def test_terminal_record_requires_verified_provenance_and_artifacts() -> None:
+    required = run_record(1).model_dump(mode="python")
+    required["evidence"] = ()
+    with pytest.raises(ValueError, match="verified evidence"):
+        RunHistoryRecord(**required)
+
+    required = run_record(1).model_dump(mode="python")
+    required["artifact_refs"] = ()
+    with pytest.raises(ValueError, match="artifact references"):
+        RunHistoryRecord(**required)
+
+    required = run_record(1).model_dump(mode="python")
+    required["benchmark_id"] = None
+    with pytest.raises(ValueError, match="benchmark_id"):
+        RunHistoryRecord(**required)
+
+
+@pytest.mark.parametrize(
+    ("status", "decision"),
+    [
+        (RunStatus.COMPLETED, None),
+        (RunStatus.REJECTED, None),
+        (RunStatus.RUNNING, RunDecision.PROMOTE),
+        (RunStatus.COMPLETED, RunDecision.REJECT),
+        (RunStatus.REJECTED, RunDecision.PROMOTE),
+    ],
+)
+def test_record_rejects_inconsistent_status_and_decision(
+    status: RunStatus, decision: RunDecision | None
+) -> None:
+    with pytest.raises(ValueError, match="status and decision"):
+        run_record(1, status=status, decision=decision)
+
+
+def test_registry_requires_sequential_existing_links() -> None:
+    registry = RunRegistry(MemoryRunHistory())
+
+    with pytest.raises(ValueError, match="next sequential"):
+        registry.register(run_record(2, parent_run_id="run-001", champion_run_id="run-001"))
+
+    registry.register(run_record(1))
+    with pytest.raises(ValueError, match="parent_run_id"):
+        registry.register(run_record(2, parent_run_id="missing", champion_run_id="run-001"))

@@ -9,7 +9,7 @@ responsible for making ``reserve_run`` atomic across coordinator instances.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
@@ -18,10 +18,62 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
-from .models import ArtifactReference
+from .models import ArtifactReference, Evidence, EvidenceKind, EvidenceLabel
 
 MAX_RUNS = 5
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class FrozenDict(dict[str, object]):
+    """A dict-compatible mapping that rejects every mutation operation.
+
+    Pydantic's ``frozen`` model option protects model attributes, but does not
+    recursively freeze ordinary dictionaries.  Keeping this as a dict
+    subclass preserves existing ``model_dump`` and JSON serialization while
+    making nested history snapshots safe to retain and share.
+    """
+
+    def _immutable(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("mapping is immutable")
+
+    __setitem__ = _immutable  # type: ignore[assignment]
+    __delitem__ = _immutable  # type: ignore[assignment]
+    clear = _immutable  # type: ignore[assignment]
+    pop = _immutable  # type: ignore[assignment]
+    popitem = _immutable  # type: ignore[assignment]
+    setdefault = _immutable  # type: ignore[assignment]
+    update = _immutable  # type: ignore[assignment]
+    __ior__ = _immutable  # type: ignore[assignment]
+
+
+def _freeze_mapping(value: Mapping[str, object]) -> FrozenDict:
+    return FrozenDict(value)
+
+
+def _freeze_artifact(value: ArtifactReference) -> ArtifactReference:
+    """Copy an artifact before freezing its nested metadata mapping."""
+
+    copied = value.model_copy(deep=True)
+    object.__setattr__(copied, "metadata", _freeze_mapping(dict(copied.metadata)))
+    return copied
+
+
+def _freeze_evidence(value: Evidence) -> Evidence:
+    """Copy evidence before freezing its objective metrics mapping."""
+
+    return _FrozenEvidence.model_validate(value.model_dump(mode="python"))
+
+
+class _FrozenEvidence(Evidence):
+    """Evidence model compatible with :class:`Evidence` but immutable."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    @field_validator("metrics", mode="after")
+    @classmethod
+    def freeze_metrics(cls, value: dict[str, float]) -> dict[str, float]:
+        return _freeze_mapping(value)  # type: ignore[return-value]
 
 
 class RunStatus(StrEnum):
@@ -72,7 +124,7 @@ class BenchmarkMetrics(BaseModel):
             if not isfinite(metric):
                 raise ValueError(f"metric for {name!r} must be finite")
             normalized[name] = metric
-        return normalized
+        return _freeze_mapping(normalized)  # type: ignore[return-value]
 
 
 class RunHistoryRecord(BaseModel):
@@ -86,12 +138,18 @@ class RunHistoryRecord(BaseModel):
     champion_run_id: str | None = None
     champion_artifact_id: str | None = None
     candidate_artifact_id: str | None = None
+    benchmark_id: str | None = None
+    suite: str | None = None
+    suite_version: str | None = None
+    seed: int | None = None
+    model_id: str | None = None
     status: RunStatus = RunStatus.PENDING
     decision: RunDecision | None = None
     manifest_sha256: str | None = None
     baseline_metrics: BenchmarkMetrics | None = None
     candidate_metrics: BenchmarkMetrics | None = None
     artifact_refs: tuple[ArtifactReference, ...] = Field(default_factory=tuple)
+    evidence: tuple[Evidence, ...] = Field(default_factory=tuple)
     decision_reasons: tuple[str, ...] = Field(default_factory=tuple)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -118,10 +176,46 @@ class RunHistoryRecord(BaseModel):
             raise ValueError("manifest_sha256 must be a lowercase 64-character digest")
         return value
 
+    @field_validator("benchmark_id", "suite", "suite_version", "model_id")
+    @classmethod
+    def validate_optional_provenance(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("provenance values must not be blank")
+        return value
+
+    @field_validator("artifact_refs", mode="after")
+    @classmethod
+    def freeze_artifact_refs(
+        cls, value: tuple[ArtifactReference, ...]
+    ) -> tuple[ArtifactReference, ...]:
+        return tuple(_freeze_artifact(item) for item in value)
+
+    @field_validator("evidence", mode="after")
+    @classmethod
+    def freeze_evidence(cls, value: tuple[Evidence, ...]) -> tuple[Evidence, ...]:
+        return tuple(_freeze_evidence(item) for item in value)
+
     @model_validator(mode="after")
     def validate_terminal_record(self) -> RunHistoryRecord:
         if self.parent_run_id == self.run_id or self.champion_run_id == self.run_id:
             raise ValueError("a run cannot link to itself")
+
+        if self.run_number == 1 and (self.parent_run_id or self.champion_run_id):
+            raise ValueError("run 1 cannot link to a prior run")
+        if self.run_number > 1 and (self.parent_run_id is None or self.champion_run_id is None):
+            raise ValueError("runs after run 1 require parent_run_id and champion_run_id")
+
+        if self.status is RunStatus.COMPLETED and self.decision is not RunDecision.PROMOTE:
+            raise ValueError("status and decision must agree: completed requires PROMOTE")
+        if self.status is RunStatus.REJECTED and self.decision is not RunDecision.REJECT:
+            raise ValueError("status and decision must agree: rejected requires REJECT")
+        if (
+            self.status not in {RunStatus.COMPLETED, RunStatus.REJECTED}
+            and self.decision is not None
+        ):
+            raise ValueError("status and decision must agree: non-terminal runs have no decision")
+        if self.status in {RunStatus.COMPLETED, RunStatus.REJECTED} and self.decision is None:
+            raise ValueError("status and decision must agree: terminal runs require a decision")
 
         has_decision = self.decision is not None
         requires_evidence = has_decision or self.status in {
@@ -134,6 +228,53 @@ class RunHistoryRecord(BaseModel):
             self.baseline_metrics is None or self.candidate_metrics is None
         ):
             raise ValueError("baseline_metrics and candidate_metrics are required for a decision")
+        if requires_evidence:
+            if not self.artifact_refs or self.candidate_artifact_id is None:
+                raise ValueError(
+                    "verified evidence requires artifact references and a candidate artifact"
+                )
+            artifact_ids = {item.artifact_id for item in self.artifact_refs}
+            if self.candidate_artifact_id not in artifact_ids:
+                raise ValueError("candidate_artifact_id must have an artifact reference")
+            if any(
+                value is None
+                for value in (
+                    self.benchmark_id,
+                    self.suite,
+                    self.suite_version,
+                    self.seed,
+                    self.model_id,
+                )
+            ):
+                raise ValueError(
+                    "benchmark_id, suite, suite_version, seed, and model_id are required "
+                    "for a terminal decision"
+                )
+            if not self.evidence:
+                raise ValueError("verified evidence is required for a terminal decision")
+            for evidence in self.evidence:
+                if (
+                    evidence.kind is not EvidenceKind.EVALUATION
+                    or evidence.label not in {EvidenceLabel.LIVE, EvidenceLabel.PRIOR_VERIFIED_RUN}
+                    or not evidence.verified
+                    or not evidence.artifact_ids
+                ):
+                    raise ValueError(
+                        "terminal decisions require verified evidence with artifact references"
+                    )
+                if any(item not in artifact_ids for item in evidence.artifact_ids):
+                    raise ValueError(
+                        "evidence artifact references must be present in artifact_refs"
+                    )
+                if (
+                    evidence.benchmark_id != self.benchmark_id
+                    or evidence.suite != self.suite
+                    or evidence.suite_version != self.suite_version
+                    or evidence.seed != self.seed
+                    or evidence.model_id != self.model_id
+                    or evidence.manifest_sha256 != self.manifest_sha256
+                ):
+                    raise ValueError("evidence provenance must match the terminal run provenance")
         return self
 
 
@@ -149,6 +290,11 @@ class RunComparisonRow(BaseModel):
     status: RunStatus
     decision: RunDecision | None = None
     manifest_sha256: str | None = None
+    benchmark_id: str | None = None
+    suite: str | None = None
+    suite_version: str | None = None
+    seed: int | None = None
+    model_id: str | None = None
     champion_artifact_id: str | None = None
     candidate_artifact_id: str | None = None
     baseline_aggregate: float | None = None
@@ -158,7 +304,25 @@ class RunComparisonRow(BaseModel):
     baseline_per_environment: dict[str, float] = Field(default_factory=dict)
     candidate_per_environment: dict[str, float] = Field(default_factory=dict)
     artifact_refs: tuple[ArtifactReference, ...] = Field(default_factory=tuple)
+    evidence: tuple[Evidence, ...] = Field(default_factory=tuple)
     decision_reasons: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("baseline_per_environment", "candidate_per_environment", mode="after")
+    @classmethod
+    def freeze_metric_mappings(cls, value: dict[str, float]) -> dict[str, float]:
+        return _freeze_mapping(dict(value))  # type: ignore[return-value]
+
+    @field_validator("artifact_refs", mode="after")
+    @classmethod
+    def freeze_artifact_mappings(
+        cls, value: tuple[ArtifactReference, ...]
+    ) -> tuple[ArtifactReference, ...]:
+        return tuple(_freeze_artifact(item) for item in value)
+
+    @field_validator("evidence", mode="after")
+    @classmethod
+    def freeze_evidence_mappings(cls, value: tuple[Evidence, ...]) -> tuple[Evidence, ...]:
+        return tuple(_freeze_evidence(item) for item in value)
 
     @classmethod
     def from_record(cls, record: RunHistoryRecord) -> RunComparisonRow:
@@ -184,6 +348,11 @@ class RunComparisonRow(BaseModel):
             status=record.status,
             decision=record.decision,
             manifest_sha256=record.manifest_sha256,
+            benchmark_id=record.benchmark_id,
+            suite=record.suite,
+            suite_version=record.suite_version,
+            seed=record.seed,
+            model_id=record.model_id,
             champion_artifact_id=record.champion_artifact_id,
             candidate_artifact_id=record.candidate_artifact_id,
             baseline_aggregate=baseline_aggregate,
@@ -193,6 +362,7 @@ class RunComparisonRow(BaseModel):
             baseline_per_environment=baseline.per_environment if baseline else {},
             candidate_per_environment=candidate.per_environment if candidate else {},
             artifact_refs=record.artifact_refs,
+            evidence=record.evidence,
             decision_reasons=record.decision_reasons,
         )
 
@@ -245,9 +415,19 @@ class ComparisonDTO(BaseModel):
 class RunHistoryRepository(Protocol):
     """Persistence contract for an atomic five-run registry.
 
-    ``reserve_run`` must enforce the supplied cap atomically in the backing
-    store.  The registry intentionally does not implement a read-count-then-
-    write sequence because that would permit a sixth run under concurrency.
+    ``reserve_run`` is the single write boundary for the history.  An
+    implementation MUST atomically validate all of these conditions in its
+    backing store and commit the record and reservation together:
+
+    * the current reservation count is below ``max_runs`` (at most five);
+    * ``record.run_id`` is new; and
+    * ``record.run_number`` is the next sequence number.
+
+    A failed conditional transaction must leave both the counter and record
+    unchanged and raise :class:`RunLimitExceeded` for the cap or a repository
+    duplicate error for an existing id.  The registry performs read-only link
+    diagnostics before this call, but never replaces this atomic reservation
+    with a read-count-then-write sequence.
     """
 
     def reserve_run(
@@ -277,6 +457,28 @@ class RunRegistry:
 
         if record.run_number > self._max_runs:
             raise RunLimitExceeded(f"maximum of {self._max_runs} runs reached")
+        existing = tuple(self._repository.list_runs(limit=self._max_runs))
+        if len(existing) >= self._max_runs:
+            raise RunLimitExceeded(f"maximum of {self._max_runs} runs reached")
+        expected_number = max((item.run_number for item in existing), default=0) + 1
+        if record.run_number != expected_number:
+            raise ValueError(
+                "run_number must be next sequential number "
+                f"{expected_number}, got {record.run_number}"
+            )
+        if record.run_number > 1:
+            assert record.parent_run_id is not None
+            assert record.champion_run_id is not None
+            parent = self._repository.get_run(record.parent_run_id)
+            if parent is None:
+                raise ValueError(f"parent_run_id {record.parent_run_id!r} does not exist")
+            if parent.run_number != record.run_number - 1:
+                raise ValueError("parent_run_id must reference the previous run")
+            champion = self._repository.get_run(record.champion_run_id)
+            if champion is None:
+                raise ValueError(f"champion_run_id {record.champion_run_id!r} does not exist")
+            if champion.run_number >= record.run_number:
+                raise ValueError("champion_run_id must reference an earlier run")
         return self._repository.reserve_run(record, max_runs=self._max_runs)
 
     def get(self, run_id: str) -> RunHistoryRecord:
