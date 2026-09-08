@@ -11,8 +11,9 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from math import isfinite
 from typing import Any, Final, cast
@@ -26,7 +27,7 @@ _JOB_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 def _finite_number(value: object, name: str, *, nonnegative: bool = True) -> float:
-    """Validate a JSON/Python numeric policy input and return a float."""
+    """Validate a finite numeric non-budget input and return a float."""
 
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be a real number")
@@ -36,6 +37,33 @@ def _finite_number(value: object, name: str, *, nonnegative: bool = True) -> flo
     if nonnegative and result < 0:
         raise ValueError(f"{name} must be non-negative")
     return result
+
+
+def _cents(value: object, name: str, *, nonnegative: bool = True) -> int:
+    """Convert a budget amount to exact cents without binary-float arithmetic."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise TypeError(f"{name} must be an int, float, or Decimal")
+    if isinstance(value, float) and not isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{name} must be a valid decimal amount") from exc
+    if not amount.is_finite():
+        raise ValueError(f"{name} must be finite")
+    if nonnegative and amount < 0:
+        raise ValueError(f"{name} must be non-negative")
+    cents = amount * 100
+    if cents != cents.to_integral_value():
+        raise ValueError(f"{name} must be expressed in whole cents")
+    return int(cents)
+
+
+def _usd(cents: int) -> float:
+    """Expose exact cents in the existing USD float-shaped API."""
+
+    return float(Decimal(cents) / 100)
 
 
 def _required_text(value: object, name: str, pattern: re.Pattern[str] | None = None) -> str:
@@ -149,7 +177,6 @@ def bounded_exponential_polling_schedule(
 exponential_poll_schedule = bounded_exponential_polling_schedule
 
 
-@dataclass(slots=True)
 class BudgetLedger:
     """Hard budget ledger with per-operation reservations.
 
@@ -158,77 +185,180 @@ class BudgetLedger:
     atomic from the caller's perspective (validation happens before mutation).
     """
 
-    approved_budget_usd: float
-    spent_budget_usd: float = 0.0
-    reserved_budget_usd: float = 0.0
-    _reservations: dict[str, float] = field(default_factory=dict, init=False, repr=False)
-    _reconciled: set[str] = field(default_factory=set, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.approved_budget_usd = _finite_number(
-            self.approved_budget_usd, "approved_budget_usd"
-        )
-        self.spent_budget_usd = _finite_number(self.spent_budget_usd, "spent_budget_usd")
-        self.reserved_budget_usd = _finite_number(
-            self.reserved_budget_usd, "reserved_budget_usd"
-        )
-        if self.approved_budget_usd <= 0:
+    def __init__(
+        self,
+        approved_budget_usd: int | float | Decimal,
+        spent_budget_usd: int | float | Decimal = 0.0,
+        reserved_budget_usd: int | float | Decimal = 0.0,
+    ) -> None:
+        self._approved_cents = _cents(approved_budget_usd, "approved_budget_usd")
+        self._spent_cents = _cents(spent_budget_usd, "spent_budget_usd")
+        self._reserved_cents = _cents(reserved_budget_usd, "reserved_budget_usd")
+        self._reservations: dict[str, int] = {}
+        self._reconciled: set[str] = set()
+        if self._approved_cents <= 0:
             raise ValueError("approved_budget_usd must be positive")
-        if self.spent_budget_usd + self.reserved_budget_usd > self.approved_budget_usd:
+        if self._spent_cents + self._reserved_cents > self._approved_cents:
             raise ValueError("committed budget exceeds approved budget")
 
     @property
     def remaining_budget_usd(self) -> float:
-        return self.approved_budget_usd - self.spent_budget_usd - self.reserved_budget_usd
+        return _usd(self.remaining_budget_cents)
 
     @property
     def available_budget_usd(self) -> float:
         return self.remaining_budget_usd
 
-    def reserve(self, operation_key: str, estimated_cost_usd: float) -> None:
+    @property
+    def approved_budget_usd(self) -> float:
+        return _usd(self._approved_cents)
+
+    @property
+    def spent_budget_usd(self) -> float:
+        return _usd(self._spent_cents)
+
+    @property
+    def reserved_budget_usd(self) -> float:
+        return _usd(self._reserved_cents)
+
+    @property
+    def remaining_budget_cents(self) -> int:
+        return self._approved_cents - self._spent_cents - self._reserved_cents
+
+    @property
+    def reconciled_operation_keys(self) -> tuple[str, ...]:
+        return tuple(sorted(self._reconciled))
+
+    def reserve(self, operation_key: str, estimated_cost_usd: int | float | Decimal) -> None:
         key = _required_text(operation_key, "operation_key", _OPERATION_KEY)
-        cost = _finite_number(estimated_cost_usd, "estimated_cost_usd")
+        cost = _cents(estimated_cost_usd, "estimated_cost_usd")
         if key in self._reservations or key in self._reconciled:
             raise ValueError(f"budget reservation already exists for {key!r}")
-        if self.spent_budget_usd + self.reserved_budget_usd + cost > self.approved_budget_usd:
+        if self._spent_cents + self._reserved_cents + cost > self._approved_cents:
             raise ValueError("budget reservation exceeds approved budget")
         self._reservations[key] = cost
-        self.reserved_budget_usd += cost
+        self._reserved_cents += cost
 
-    def reconcile(self, operation_key: str, actual_cost_usd: float) -> None:
+    def reconcile(self, operation_key: str, actual_cost_usd: int | float | Decimal) -> None:
         key = _required_text(operation_key, "operation_key", _OPERATION_KEY)
-        actual = _finite_number(actual_cost_usd, "actual_cost_usd")
+        actual = _cents(actual_cost_usd, "actual_cost_usd")
         if key not in self._reservations:
             raise ValueError(f"no budget reservation exists for {key!r}")
         reservation = self._reservations[key]
-        new_spent = self.spent_budget_usd + actual
-        if new_spent + self.reserved_budget_usd - reservation > self.approved_budget_usd:
+        new_spent = self._spent_cents + actual
+        if new_spent + self._reserved_cents - reservation > self._approved_cents:
             raise ValueError("actual cost exceeds approved budget")
         del self._reservations[key]
         self._reconciled.add(key)
-        self.reserved_budget_usd -= reservation
-        self.spent_budget_usd = new_spent
+        self._reserved_cents -= reservation
+        self._spent_cents = new_spent
 
     def reservation(self, operation_key: str) -> float:
         key = _required_text(operation_key, "operation_key", _OPERATION_KEY)
         try:
-            return self._reservations[key]
+            return _usd(self._reservations[key])
         except KeyError as exc:
             raise ValueError(f"no budget reservation exists for {key!r}") from exc
+
+    def snapshot(self) -> dict[str, object]:
+        """Return a JSON-serializable, deterministic restart snapshot."""
+
+        return {
+            "version": 1,
+            "approved_budget_cents": self._approved_cents,
+            "spent_budget_cents": self._spent_cents,
+            "reserved_budget_cents": self._reserved_cents,
+            "reservations": [
+                {"operation_key": key, "cost_cents": self._reservations[key]}
+                for key in sorted(self._reservations)
+            ],
+            "reconciled_operation_keys": list(self.reconciled_operation_keys),
+        }
+
+    to_snapshot = snapshot
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Mapping[str, object]) -> BudgetLedger:
+        """Hydrate a ledger while validating every persisted invariant."""
+
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("snapshot must be a mapping")
+        expected = {
+            "version",
+            "approved_budget_cents",
+            "spent_budget_cents",
+            "reserved_budget_cents",
+            "reservations",
+            "reconciled_operation_keys",
+        }
+        if set(snapshot) != expected:
+            raise ValueError("snapshot has unknown or missing fields")
+
+        def snapshot_cents(name: str) -> int:
+            value = snapshot[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+            return value
+
+        version = snapshot["version"]
+        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+            raise ValueError("unsupported budget snapshot version")
+        approved = snapshot_cents("approved_budget_cents")
+        spent = snapshot_cents("spent_budget_cents")
+        reserved = snapshot_cents("reserved_budget_cents")
+        if approved <= 0 or spent + reserved > approved:
+            raise ValueError("snapshot violates hard budget invariant")
+
+        raw_reservations = snapshot["reservations"]
+        if not isinstance(raw_reservations, list):
+            raise TypeError("reservations must be a JSON list")
+        reservations: dict[str, int] = {}
+        for item in raw_reservations:
+            if not isinstance(item, Mapping) or set(item) != {"operation_key", "cost_cents"}:
+                raise ValueError("reservation has unknown or missing fields")
+            key = _required_text(item["operation_key"], "operation_key", _OPERATION_KEY)
+            cost = item["cost_cents"]
+            if isinstance(cost, bool) or not isinstance(cost, int) or cost < 0:
+                raise ValueError("cost_cents must be a non-negative integer")
+            if key in reservations:
+                raise ValueError("snapshot contains duplicate reservations")
+            reservations[key] = cost
+        if sum(reservations.values()) != reserved:
+            raise ValueError("reservation aggregate does not match reservation records")
+
+        raw_reconciled = snapshot["reconciled_operation_keys"]
+        if not isinstance(raw_reconciled, list):
+            raise TypeError("reconciled_operation_keys must be a JSON list")
+        reconciled: set[str] = set()
+        for item in raw_reconciled:
+            key = _required_text(item, "operation_key", _OPERATION_KEY)
+            if key in reconciled or key in reservations:
+                raise ValueError("snapshot contains duplicate operation identities")
+            reconciled.add(key)
+
+        ledger = cls.__new__(cls)
+        ledger._approved_cents = approved
+        ledger._spent_cents = spent
+        ledger._reserved_cents = reserved
+        ledger._reservations = reservations
+        ledger._reconciled = reconciled
+        return ledger
 
     reserve_incremental = reserve
     reconcile_actual = reconcile
 
 
 def reserve_incremental_budget(
-    ledger: BudgetLedger, operation_key: str, estimated_cost_usd: float
+    ledger: BudgetLedger, operation_key: str, estimated_cost_usd: int | float | Decimal
 ) -> None:
     if not isinstance(ledger, BudgetLedger):
         raise TypeError("ledger must be a BudgetLedger")
     ledger.reserve(operation_key, estimated_cost_usd)
 
 
-def reconcile_actual_cost(ledger: BudgetLedger, operation_key: str, actual_cost_usd: float) -> None:
+def reconcile_actual_cost(
+    ledger: BudgetLedger, operation_key: str, actual_cost_usd: int | float | Decimal
+) -> None:
     if not isinstance(ledger, BudgetLedger):
         raise TypeError("ledger must be a BudgetLedger")
     ledger.reconcile(operation_key, actual_cost_usd)

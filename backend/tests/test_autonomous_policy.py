@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from math import inf, nan
 
 import pytest
@@ -81,6 +83,35 @@ def test_budget_rejects_nonfinite_costs() -> None:
     for cost in (-1.0, nan, inf, True):
         with pytest.raises((TypeError, ValueError)):
             ledger.reserve("op", cost)
+
+
+def test_budget_uses_exact_cents_and_rejects_sub_cent_ambiguity() -> None:
+    ledger = BudgetLedger(approved_budget_usd=Decimal("0.30"))
+    ledger.reserve("op-1", Decimal("0.10"))
+    ledger.reserve("op-2", 0.20)
+    assert ledger.remaining_budget_usd == 0.0
+    with pytest.raises(ValueError, match="whole cents"):
+        BudgetLedger(approved_budget_usd=1).reserve("op-3", Decimal("0.001"))
+
+
+def test_budget_snapshot_hydrates_in_flight_and_reconciled_operations() -> None:
+    ledger = BudgetLedger(approved_budget_usd=10)
+    ledger.reserve("op-1", Decimal("4.25"))
+    ledger.reserve("op-2", Decimal("1.75"))
+    ledger.reconcile("op-2", Decimal("1.25"))
+
+    serialized = json.loads(json.dumps(ledger.snapshot()))
+    restored = BudgetLedger.from_snapshot(serialized)
+    assert restored.reservation("op-1") == 4.25
+    assert restored.reserved_budget_usd == 4.25
+    restored.reconcile("op-1", Decimal("4.00"))
+    with pytest.raises(ValueError, match="already exists"):
+        restored.reserve("op-1", 1)
+    with pytest.raises(ValueError, match="already exists"):
+        restored.reserve("op-2", 1)
+
+    with pytest.raises(ValueError, match="aggregate"):
+        BudgetLedger.from_snapshot({**ledger.snapshot(), "reserved_budget_cents": 0})
 
 
 def test_experiment_cap_and_target_score_stop() -> None:
