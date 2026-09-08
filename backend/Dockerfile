@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir uv \
     && uv sync --frozen --no-dev --extra cloud --no-install-project
 
 COPY app ./app
+COPY prompts ./prompts
 RUN uv sync --frozen --no-dev --extra cloud
 
 ENV PATH="/srv/backend/.venv/bin:${PATH}"

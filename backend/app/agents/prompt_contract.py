@@ -10,12 +10,21 @@ different model or from emitting an untraceable system prompt.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final
 
 NEMOTRON_MODEL_ID: Final[str] = "nvidia.nemotron-super-3-120b"
-PROMPT_CONTRACT_VERSION: Final[str] = "nemotron-120b-contract-v1"
+PROMPT_CONTRACT_VERSION: Final[str] = "nemotron-120b-contract-v2"
+PROMPT_LIBRARY_DIR: Final[Path] = Path(__file__).resolve().parents[2] / "prompts"
+_LIBRARY_SECTIONS: Final[tuple[str, ...]] = (
+    "MISSION",
+    "INPUT CONTRACT",
+    "OUTPUT CONTRACT",
+    "BOUNDED CREATIVITY",
+)
 
 
 @dataclass(frozen=True)
@@ -23,10 +32,52 @@ class AgentPromptContract:
     """Immutable prompt and provenance contract for one specialist."""
 
     agent_key: str
-    mission: str
-    inputs: str
-    outputs: str
-    creative_lane: str
+    prompt_file: str
+
+    def _sections(self) -> dict[str, str]:
+        """Load and validate this role's reviewable markdown contract."""
+
+        path = PROMPT_LIBRARY_DIR / self.prompt_file
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"prompt library file unavailable: {path}") from exc
+        if not source.endswith("\n"):
+            raise RuntimeError(f"prompt library file must end with a newline: {path}")
+        heading = re.match(r"^# ([^\n]+)\n", source)
+        if heading is None or heading.group(1).strip() != self.agent_key:
+            raise RuntimeError(f"prompt library heading does not match {self.agent_key}: {path}")
+        matches = list(re.finditer(r"^## (.+?)\s*$", source, flags=re.MULTILINE))
+        names = tuple(match.group(1).strip() for match in matches)
+        if names != _LIBRARY_SECTIONS:
+            raise RuntimeError(
+                f"prompt library sections for {self.agent_key} must be {_LIBRARY_SECTIONS}; got {names}"
+            )
+        sections: dict[str, str] = {}
+        for index, match in enumerate(matches):
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+            value = source[start:end].strip()
+            if not value:
+                raise RuntimeError(f"prompt library section is empty: {path} ({names[index]})")
+            sections[names[index]] = value
+        return sections
+
+    @property
+    def mission(self) -> str:
+        return self._sections()["MISSION"]
+
+    @property
+    def inputs(self) -> str:
+        return self._sections()["INPUT CONTRACT"]
+
+    @property
+    def outputs(self) -> str:
+        return self._sections()["OUTPUT CONTRACT"]
+
+    @property
+    def creative_lane(self) -> str:
+        return self._sections()["BOUNDED CREATIVITY"]
 
     def render(self) -> str:
         """Render an explicit, auditable system prompt."""
@@ -42,6 +93,26 @@ OPERATING CONTEXT
   artifacts, approvals, budgets, and promotion. You are an analyst/dispatcher, never the source of truth.
 - Work only on the current run and phase. Preserve run_id, run_number, parent_champion_id, suite, version,
   seed, and manifest_hash exactly as supplied. Never silently repair missing context.
+
+AUTONOMOUS EXECUTION LOOP
+- First inspect the complete typed context, current phase, prior handoff, budget, and available tool results.
+- Form a short plan with the smallest safe next action; prefer idempotent reads before writes.
+- Use only injected tools for AWS, objective-worker, artifact, or registry operations. Never emulate a tool result.
+- After every action, verify the returned status, identifiers, hashes, and provenance against the request.
+- Persist or hand off verified references before moving to the next phase. If a phase cannot be verified, stop.
+- Make progress independently within your role, but do not cross role ownership or wait for a human when a safe
+  adapter-backed action is available. Escalate only missing authority, missing inputs, policy conflicts, or provider failure.
+- Reuse an existing verified checkpoint, dataset, role, table, or bucket only when its immutable identifier and
+  provenance match this run. Never create duplicate resources or silently reuse a mismatched artifact.
+
+KNOWLEDGE AND REASONING STANDARD
+- Apply current knowledge of SageMaker jobs, S3 versioning, DynamoDB conditional writes, QLoRA, AgentGym/AgentEval,
+  tool-calling failure modes, and reproducible ML experiments to interpret the supplied facts.
+- Separate OBSERVED facts, INFERRED explanations, and UNKNOWN values in your reasoning and output fields.
+- Prefer causal, falsifiable explanations over generic advice. State the exact observation that would disprove a claim.
+- Check units, ranges, seed/suite/version alignment, artifact hashes, and cost arithmetic before recommending action.
+- When multiple safe paths exist, rank them by expected information gain, reversibility, latency, and cost.
+- Never let domain knowledge override provider responses, typed contracts, approval requirements, or deterministic gates.
 
 INPUT CONTRACT
 {self.inputs}
@@ -92,6 +163,7 @@ observed, what you inferred, and what remains unknown. A safe BLOCKED result is 
             "model_id": NEMOTRON_MODEL_ID,
             "prompt_version": PROMPT_CONTRACT_VERSION,
             "prompt_sha256": self.prompt_sha256,
+            "prompt_file": self.prompt_file,
         }
 
 
@@ -102,96 +174,14 @@ references; do not load or echo sealed content unless an authorized adapter requ
 
 
 _CONTRACTS: Mapping[str, AgentPromptContract] = {
-    "BenchmarkAgent": AgentPromptContract(
-        "BenchmarkAgent",
-        """Request the objective worker to evaluate the specified FunctionGemma checkpoint on the declared
-        suite and return only its verified measurements and artifact references.""",
-        _COMMON_INPUTS + """
-Additional: checkpoint_uri (S3 URI), environment_config (object), episode_count (positive integer).""",
-        """status (LIVE|BLOCKED|FAILED), evidence_class, checkpoint_uri, objective_metrics (object),
-        trajectory_artifact_ids (opaque IDs only), provider_job_id (string or null), and errors (array).""",
-        """You may identify coverage gaps or propose a clearly labeled diagnostic slice. Never generate a
-        replacement trajectory or estimate a metric when the worker has not run.""",
-    ),
-    "FailureAnalystAgent": AgentPromptContract(
-        "FailureAnalystAgent",
-        """Classify failures from verified benchmark references into reproducible behavioral clusters without
-        prescribing a fix.""",
-        _COMMON_INPUTS + """
-Additional: benchmark_evidence_ref (opaque artifact ID), failure_taxonomy (array).""",
-        """status, evidence_class, clusters (array of cluster_id, failure_type, count, evidence_refs), and
-        errors (array).""",
-        """You may suggest a new taxonomy label only when it is behaviorally observable and include a falsifiable
-        discriminator. Do not infer hidden weights, intentions, or architecture internals.""",
-    ),
-    "ResearchAgent": AgentPromptContract(
-        "ResearchAgent",
-        """Turn verified failure clusters into a small set of falsifiable hypotheses and validation experiments.""",
-        _COMMON_INPUTS + """
-Additional: failure_clusters (array), constraints (object).""",
-        """status, evidence_class, hypotheses (array of hypothesis_id, statement, evidence_refs, prediction,
-        falsifier, confidence), and errors (array).""",
-        """Be inventive about competing explanations and cheap discriminating experiments. Label confidence as
-        inference, keep it bounded, and never present a hypothesis as a measured result.""",
-    ),
-    "DataCuratorAgent": AgentPromptContract(
-        "DataCuratorAgent",
-        """Select and deterministically format only verified, eligible correction records for FunctionGemma SFT.""",
-        _COMMON_INPUTS + """
-Additional: decision_refs (opaque IDs), correction_refs (opaque IDs), data_policy (object).""",
-        """status, evidence_class, selected_record_ids (array), dataset_artifact_ref (string or null),
-        record_count (integer), and errors (array).""",
-        """You may propose record ordering or deduplication rationale, but may not author synthetic trajectories,
-        repair labels, or held-out examples. If verification is absent, stop with BLOCKED.""",
-    ),
-    "TrainingDesignerAgent": AgentPromptContract(
-        "TrainingDesignerAgent",
-        """Choose one allowed, budget-compliant QLoRA configuration for the verified dataset and explain the
-        tradeoff so the executor can reproduce it.""",
-        _COMMON_INPUTS + """
-Additional: dataset_artifact_ref (string), dataset_stats (object), allowed_configs (object),
-budget (object).""",
-        """status, evidence_class, configuration (object containing only allowed values), rationale (array),
-        estimated_resources (object or null), and errors (array).""",
-        """Explore a few principled configurations mentally and select the one best supported by constraints.
-        Do not invent dataset statistics, resource prices, or improvement forecasts.""",
-    ),
-    "TrainingExecutorAgent": AgentPromptContract(
-        "TrainingExecutorAgent",
-        """Submit and monitor exactly one SageMaker-managed training job using verified inputs, then return its
-        provider-owned terminal status and checkpoint artifact.""",
-        _COMMON_INPUTS + """
-Additional: training_configuration (object), dataset_artifact_ref (string), base_checkpoint_uri
-(string), role_arn (string), training_image_uri (string), approval_token (string).""",
-        """status (SUBMITTED|RUNNING|COMPLETED|FAILED|STOPPED|BLOCKED), evidence_class, provider_job_id (string
-        or null), checkpoint_artifact_ref (string or null), provider_status (string or null), and errors (array).""",
-        """You may recommend a safe retry reason or cleanup order, but may not submit a second job, report a
-        guessed status, or claim an artifact before the provider returns it.""",
-    ),
-    "EvalAgent": AgentPromptContract(
-        "EvalAgent",
-        """Evaluate champion and candidate on identical sealed held-out and regression inputs, then calculate
-        deterministic summaries from provider measurements.""",
-        _COMMON_INPUTS + """
-Additional: champion_checkpoint_uri (string), candidate_checkpoint_uri (string), sealed_suite_ref
-(opaque ID), evaluation_image_uri (string), evaluation_role_arn (string).""",
-        """status, evidence_class, champion_metrics (object), candidate_metrics (object), regression_metrics
-        (object), provider_job_ids (array), provenance (object), and errors (array).""",
-        """You may flag suspicious variance or suggest a diagnostic follow-up, but may not inspect or echo sealed
-        inputs, substitute an easier suite, or fill missing metrics.""",
-    ),
-    "ChampionManagerAgent": AgentPromptContract(
-        "ChampionManagerAgent",
-        """Explain the deterministic promotion gate over verified, provenance-matched measurements; the gate
-        implementation remains authoritative and your output cannot override it.""",
-        _COMMON_INPUTS + """
-Additional: champion_metrics (object), candidate_metrics (object), regression_metrics (object),
-gate_policy (object), candidate_artifact_ref (string).""",
-        """status, evidence_class, decision (PROMOTE|REJECT|BLOCKED), gate_results (object), reason_codes
-        (array), and errors (array).""",
-        """You may make the explanation vivid and easy to demo, but never exercise discretion, soften a failed
-        gate, or call PROMOTE without every deterministic gate result and verified provenance.""",
-    ),
+    "BenchmarkAgent": AgentPromptContract("BenchmarkAgent", "benchmark_agent.md"),
+    "FailureAnalystAgent": AgentPromptContract("FailureAnalystAgent", "failure_analyst_agent.md"),
+    "ResearchAgent": AgentPromptContract("ResearchAgent", "research_agent.md"),
+    "DataCuratorAgent": AgentPromptContract("DataCuratorAgent", "data_curator_agent.md"),
+    "TrainingDesignerAgent": AgentPromptContract("TrainingDesignerAgent", "training_designer_agent.md"),
+    "TrainingExecutorAgent": AgentPromptContract("TrainingExecutorAgent", "training_executor_agent.md"),
+    "EvalAgent": AgentPromptContract("EvalAgent", "eval_agent.md"),
+    "ChampionManagerAgent": AgentPromptContract("ChampionManagerAgent", "champion_manager_agent.md"),
 }
 
 

@@ -20,6 +20,7 @@ from app.agents.champion_manager_agent import create_champion_manager_agent
 from app.agents.data_curator_agent import create_data_curator_agent
 from app.agents.eval_agent import create_eval_agent
 from app.agents.failure_analyst_agent import create_failure_analyst_agent
+from app.agents.prompt_contract import PROMPT_LIBRARY_DIR
 from app.agents.research_agent import create_research_agent
 from app.agents.training_designer_agent import create_training_designer_agent
 from app.agents.training_executor_agent import create_training_executor_agent
@@ -75,6 +76,7 @@ def test_prompt_contracts_are_explicit_hashed_and_safe() -> None:
             "model_id": NEMOTRON_MODEL_ID,
             "prompt_version": PROMPT_CONTRACT_VERSION,
             "prompt_sha256": contract.prompt_sha256,
+            "prompt_file": contract.prompt_file,
         }
 
 
@@ -89,6 +91,19 @@ def test_contract_registry_has_exactly_eight_specialists() -> None:
         "EvalAgent",
         "ChampionManagerAgent",
     )
+
+
+def test_prompt_library_has_one_reviewable_file_per_specialist() -> None:
+    library_files = {
+        path.name for path in PROMPT_LIBRARY_DIR.glob("*.md") if path.name != "README.md"
+    }
+    registered_files = {get_prompt_contract(agent_key).prompt_file for agent_key in AGENT_KEYS}
+    assert library_files == registered_files
+    assert len(library_files) == 8
+    for agent_key in AGENT_KEYS:
+        source = (PROMPT_LIBRARY_DIR / get_prompt_contract(agent_key).prompt_file).read_text()
+        assert source.startswith(f"# {agent_key}\n")
+        assert "held-out" in source.lower()
 
 
 def test_model_resolver_accepts_only_pinned_id() -> None:
