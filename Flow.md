@@ -41,6 +41,25 @@ held-out tasks, credentials, and secret-like values are redacted and event
 attributes are immutable after emission.
 ```
 
+## Reasoning model and prompt contract
+
+All eight specialist agents use the fixed Bedrock model
+`nvidia.nemotron-super-3-120b` (NVIDIA Nemotron Super 3 120B). The coordinator
+may orchestrate these agents, but it does not replace their model or relax
+their contracts. The optimized target is FunctionGemma, represented by a
+separately pinned Hugging Face checkpoint; Nemotron is the reasoning model, not
+the post-training target.
+
+Each handoff is governed by a versioned `AgentPromptContract`. A contract
+contains the role mission, required typed inputs, exact output shape,
+preconditions, failure/blocked behavior, evidence-class rules, and forbidden
+actions. Creative reasoning is encouraged only for falsifiable hypotheses,
+experiment alternatives, and bounded repair strategies. It can never create a
+trajectory, metric, provider job ID, artifact, approval, or promotion result.
+The contract version, model ID, and prompt SHA-256 travel as metadata in the
+manifest and telemetry. Raw prompts, completions, trajectories, and sealed
+evaluation contents do not.
+
 The current local path uses the same role boundaries but keeps state in memory
 and returns `EXPLANATION` fixtures. It is a reproducible demonstration, not
 live AWS evidence. `backend/scripts/live_smoke.py` separately verifies AWS
@@ -172,6 +191,8 @@ restart.
   generation.
 - Model-generating agents may propose work; deterministic code verifies
   budgets, replay/evaluation results, and promotion.
+- Every agent must use the declared Nemotron model and preserve run context;
+  missing or contradictory inputs produce `BLOCKED`, never a guessed value.
 
 ## API surface
 
@@ -189,6 +210,12 @@ restart.
 The list above is the currently implemented local surface. A live deployment
 may add an authenticated resumable event-stream endpoint once durable event
 storage is connected; it must not be described as available in the local demo.
+
+The hackathon observer renders this same lifecycle as moving role bots:
+launcher -> benchmark -> failure analysis -> data curation -> training ->
+evaluation -> promotion. Animation is presentation only. A bot may enter a
+phase when a corresponding event exists, and a blocked/failed event must stop
+that phase visibly; the observer cannot approve a run or manufacture progress.
 
 ## Evidence labels
 
@@ -209,3 +236,7 @@ provider adapters wired before `APP_MODE=aws` can claim live execution.
 Missing credentials, unavailable AWS services, invalid artifacts, unknown job
 states, or failed deterministic gates must stop the run; the system must not
 manufacture progress.
+
+The guarded command path is `live_preflight.py` (read-only), `live_run.py` (one
+approved run), and `live_batch.py` (sequential runs with a fresh approval token
+between runs). Preflight must pass before any SageMaker job is submitted.

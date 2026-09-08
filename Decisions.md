@@ -286,3 +286,27 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** Local mode remains process-local; a live `LIVE` result still requires an external objective worker, pre-existing AWS resources, model checkpoint, and hashed evaluation manifest.
 - **Affected components:** Run history, DynamoDB repository, comparison graph/API, objective benchmark/SageMaker lifecycle boundary, runtime configuration, orchestrator guards, telemetry, and documentation.
 - **Validation:** Full backend pytest passed; focused Ruff and mypy checks passed. No live AWS training, held-out evaluation, checkpoint improvement, or promotion was executed.
+
+## DEC-025 — Pin Nemotron reasoning and make prompts auditable
+
+- **Date / run:** 2026-09-08 / `NEMOTRON-PROMPT-CONTRACT-001`
+- **Status:** Accepted
+- **Context:** The live demo needs one predictable reasoning model for every working agent while still allowing useful, creative experiment design. Free-form role prompts make model drift, unsafe evidence claims, and irreproducible handoffs difficult to review.
+- **Decision:** Pin all eight specialist agents and coordinator reasoning to NVIDIA Nemotron Super 3 120B, `nvidia.nemotron-super-3-120b`. Keep FunctionGemma as the separate post-training target. Compile each role from a versioned `AgentPromptContract` with typed inputs/outputs, preconditions, stop conditions, evidence labels, sealed-data rules, forbidden actions, and a bounded creativity lane. Persist only the model ID, prompt version, and prompt SHA-256 in manifests and metadata-only telemetry.
+- **Alternatives:** Allow per-agent model overrides; use one untyped general prompt; log full prompts and completions for debugging.
+- **Reason:** A single pinned reasoning model and explicit contracts make agent behavior comparable across five runs, preserve the held-out boundary, and let Nemotron generate inventive but falsifiable hypotheses without becoming the source of metrics or promotion decisions.
+- **Trade-offs:** Changing the reasoning model or a role contract is a provenance change and requires a new prompt version/hash; raw prompt debugging is intentionally unavailable in telemetry.
+- **Affected components:** Strands agent factories, prompt contracts, runtime configuration, run manifests, telemetry, live scripts, and documentation.
+- **Validation:** Contract tests must verify model identity, prompt structure/hash stability, blocked behavior, redaction, and absence of fabricated evidence. No live SageMaker training or FunctionGemma improvement is claimed by this decision.
+
+## DEC-026 — Show execution as a safe animated observer
+
+- **Date / run:** 2026-09-08 / `EXECUTION-OBSERVER-001`
+- **Status:** Accepted
+- **Context:** The hackathon audience needs to understand how multiple agents collaborate during a run, including pauses and failures, without treating visual activity as proof of AWS work.
+- **Decision:** Provide a browser observer in which role bots move through launcher, benchmark, failure analysis, data curation, training, evaluation, and promotion. Drive state from lifecycle metadata/events and render run comparisons and graphs from the same API records. Animation cannot create approval, advance a phase, or invent a metric, artifact, or provider job.
+- **Alternatives:** Show a static dashboard; expose raw agent transcripts; let visual completion imply phase completion.
+- **Reason:** A phase-linked observer makes the autonomous workflow legible while preserving the evidence boundary and metadata-only telemetry policy.
+- **Trade-offs:** The observer is read-only and may show a blocked or incomplete run; authenticated durable events remain a live deployment prerequisite.
+- **Affected components:** Frontend observer, run/event APIs, comparison graph, telemetry, and demo documentation.
+- **Validation:** UI tests must verify event-driven phase movement, visible blocked/failed states, one-to-five run comparisons, and the absence of raw prompt/completion/task content.

@@ -44,6 +44,25 @@ The Python backend provides eight logical roles behind three service modes:
 
 The same immutable container runs all modes through `SERVICE_ROLE`. The AWS submission path is Strands-first and is designed to use Amazon Bedrock, S3, DynamoDB, SageMaker, and optional AgentCore/CloudWatch integrations. The repository now includes a bounded five-run history/graph contract, guarded objective-worker and SageMaker lifecycle boundaries, and metadata-only telemetry. The current repository run still uses in-memory state and explicit `EXPLANATION` adapters; those outputs are not a hackathon result.
 
+### Reasoning model and post-training target
+
+Every working agent uses the single pinned Bedrock reasoning model
+`nvidia.nemotron-super-3-120b` (NVIDIA Nemotron Super 3 120B). This is the
+agent brain for planning, analysis, data selection, training dispatch,
+evaluation interpretation, and gate explanation. It is not the model being
+improved. The post-training target remains the user-supplied
+`google/functiongemma-270m-it` checkpoint, pinned by an immutable Hugging Face
+revision before a live run.
+
+Each role uses a versioned `AgentPromptContract`. Prompts state the mission,
+typed inputs and outputs, preconditions, stop conditions, evidence labels,
+sealed-evaluation rules, and forbidden actions. Nemotron may be inventive when
+forming hypotheses, experiment choices, or repair strategies, but it cannot
+invent trajectories, metrics, provider IDs, artifacts, approvals, or promotion
+decisions. Prompt version and SHA-256 are recorded as safe metadata in the run
+manifest and telemetry so a comparison can be reproduced without logging raw
+prompts or completions.
+
 Each specialist has an explicit safety contract: Benchmark Runner accepts train-side evidence only; Failure Analyst must ground clusters in trajectory IDs; Research Agent must return a falsifiable hypothesis; Data Curator may propose but never verify repairs; Training Designer must stay inside the QLoRA whitelist; Training Executor may report only provider-backed artifacts; Evaluation Agent returns objective evidence without deciding promotion; and Champion Manager explains but cannot override the deterministic gate.
 
 In a live AWS deployment, the coordinator must fail fast unless its authenticated service and artifact destinations are configured. The local path is intentionally a credential-free demonstration and does not silently promote simulated evidence.
@@ -82,6 +101,8 @@ claimed; no `LIVE_AWS` run is included in this repository state.
 | Evaluation and promotion | Deterministic gate code is exercised locally, but local metrics are simulated and cannot prove improvement. | Independent evaluation on identical sealed inputs, with artifact-backed metrics and a deterministic promotion decision. |
 | Continuous trigger and event ingestion | `TraceEvent` validation, duplicate suppression, ordered in-memory storage, and deterministic per-run threshold triggering are covered locally; they are not wired to the FastAPI run routes. | EventBridge/SQS delivery into durable event storage, idempotent cycle creation, and a worker that starts the post-training run. |
 | State, artifacts, and run API | Process memory plus JSON/SVG comparison responses; no durable local run/event log. | DynamoDB run history/events, S3 artifacts, and a resumable ordered event stream. |
+| Agent reasoning and prompt provenance | Nemotron prompt contracts can be inspected and tested without exposing task contents. | Bedrock-backed Nemotron decisions with prompt hashes, model ID, run manifest, and provider-backed evidence. |
+| Execution view | Browser demo shows phase progression and explanatory agent activity; it never presents simulated metrics as live improvement. | Browser view consumes authenticated lifecycle events and displays only safe metadata, real job states, and retained artifact references. |
 
 Telemetry/observation is emitted at run, phase, job, and promotion transitions.
 Events correlate `run_id`, run number, experiment, phase, and provider job while
@@ -137,6 +158,23 @@ without creating resources:
 uv run --extra cloud python scripts/live_agentic_test.py
 ```
 
+For the guarded live path, run the read-only preflight before approving any
+compute. Then authorize one run at a time; the batch command pauses for a new
+approval token before each subsequent run and never exceeds five runs or the
+$25 budget:
+
+```bash
+uv run --extra cloud python scripts/live_preflight.py
+uv run --extra cloud python scripts/live_run.py --approval-token TOKEN
+uv run --extra cloud python scripts/live_batch.py
+```
+
+The browser execution view renders the same lifecycle metadata as the API:
+animated role bots move through launcher, benchmark, failure analysis, data
+curation, training, evaluation, and promotion. It must show a blocked or
+failed phase plainly and never substitute an animation for a provider job,
+metric, or artifact.
+
 Docker Compose is retained only as a three-role image and healthcheck smoke harness:
 
 ```bash
@@ -162,7 +200,7 @@ docker compose config --quiet
 
 The AWS/Strands implementation has not been executed as a live post-training run in this checkout. The repository does not provision cloud resources; AWS mode only constructs adapters for pre-existing configured S3, DynamoDB, and SageMaker resources. Do not describe local state or explanatory adapters as live AWS evidence.
 
-For a live submission path, wire the existing role contracts to AWS adapters in this order: Bedrock model invocation for agent decisions; S3 for immutable trajectories, datasets, and checkpoints; DynamoDB for `OptimizationRun` and events; SageMaker for QLoRA execution; and optional AgentCore hosting plus CloudWatch traces. Record the exact AWS resource IDs and artifact hashes in the run before showing a metric.
+For a live submission path, wire the existing role contracts to AWS adapters in this order: Bedrock `nvidia.nemotron-super-3-120b` invocation for agent decisions; S3 for immutable trajectories, datasets, and checkpoints; DynamoDB for `OptimizationRun` and events; SageMaker for QLoRA execution; and optional AgentCore hosting plus CloudWatch traces. Record the exact AWS resource IDs, prompt metadata, and artifact hashes in the run before showing a metric.
 
 No infrastructure-as-code stack is included yet. An AWS-native deployment stack can be added after the local workflow is made live; no cloud provider is implied by the current demo.
 
@@ -177,4 +215,4 @@ All contributors and agents must follow [AGENTS.md](AGENTS.md): read the living 
 - Credential-free adapters execute only the local service-recovery explanation fixture; live environments require configured AWS workers and model access.
 - S3/DynamoDB/SageMaker/AgentCore resources and the sandboxed objective worker are deployment prerequisites and are not provisioned by this repository.
 - A process restart currently loses in-memory runs; durable AWS persistence and provider job reconciliation remain required before claiming recoverability.
-- Authentication, multi-tenancy, billing, continuous training, multiple target models, and a frontend are out of scope.
+- Authentication, multi-tenancy, billing, and multiple target models are out of scope. The hackathon execution view is a safe observer only; it does not grant approval or mutate AWS resources.
