@@ -108,6 +108,12 @@ class Trajectory(ContractModel):
         return self
 
 
+class BenchmarkExecutionResult(ContractModel):
+    """Typed output returned by the real benchmark execution adapter."""
+
+    trajectories: tuple[Trajectory, ...] = Field(default_factory=tuple)
+
+
 class ReplayResult(ContractModel):
     trajectory: Trajectory
     verified: bool
@@ -182,6 +188,13 @@ class BenchmarkRequest(ContractModel):
             raise ValueError(f"split {value.value!r} is outside the train/replay scope")
         return value
 
+    @field_validator("task_ids")
+    @classmethod
+    def require_unique_task_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("task_ids must be unique")
+        return value
+
 
 class TrajectoryReference(ContractModel):
     trajectory_id: str = Field(min_length=1)
@@ -204,7 +217,10 @@ class CurationRequest(ContractModel):
     run_id: str = Field(min_length=1)
     experiment_id: str = Field(min_length=1)
     split: ObjectiveSplit = ObjectiveSplit.REPLAY
-    trajectories: tuple[Trajectory, ...] = Field(min_length=1, max_length=100)
+    trajectories: tuple[Trajectory, ...] = Field(default_factory=tuple, max_length=100)
+    trajectory_references: tuple[TrajectoryReference, ...] = Field(
+        default_factory=tuple, max_length=100
+    )
 
     @field_validator("split")
     @classmethod
@@ -212,6 +228,12 @@ class CurationRequest(ContractModel):
         if value is not ObjectiveSplit.REPLAY:
             raise ValueError(f"split {value.value!r} is outside replay scope")
         return value
+
+    @model_validator(mode="after")
+    def require_trajectory_input(self) -> CurationRequest:
+        if not self.trajectories and not self.trajectory_references:
+            raise ValueError("trajectories or trajectory_references is required")
+        return self
 
 
 # The wire response is the dataset itself so workers can pass the manifest to

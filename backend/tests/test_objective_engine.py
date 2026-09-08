@@ -12,13 +12,13 @@ from app.objective.engine import (
 )
 from app.objective.models import (
     ALLOWED_TOOLS,
+    BenchmarkExecutionResult,
     BenchmarkRequest,
     Dataset,
     ObjectiveSplit,
     ToolCall,
-    Trajectory,
 )
-from app.objective.service import create_objective_app
+from app.objective.service import InMemoryTrajectoryArtifactStore, create_objective_app
 
 
 def test_service_recovery_exposes_only_the_allowlisted_tools() -> None:
@@ -217,19 +217,20 @@ def test_benchmark_requires_an_injected_execution_adapter() -> None:
     class Adapter:
         def execute_benchmark(
             self, request: BenchmarkRequest, engine: ServiceRecoveryEngine
-        ) -> tuple[Trajectory, ...]:
-            return tuple(
+        ) -> BenchmarkExecutionResult:
+            return BenchmarkExecutionResult(trajectories=tuple(
                 engine.run_episode(
                     task_id,
                     [ToolCall(tool="run_healthcheck", arguments={})],
                     split=request.split,
                 )
                 for task_id in request.task_ids
-            )
+            ))
 
     client = TestClient(
         create_objective_app(
             ServiceRecoveryEngine(seed=1), auth_token="secret", execution_adapter=Adapter()
+            , artifact_store=InMemoryTrajectoryArtifactStore()
         )
     )
     response = client.post(
@@ -240,6 +241,97 @@ def test_benchmark_requires_an_injected_execution_adapter() -> None:
     assert response.status_code == 200
     assert response.json()["success_rate"] in {0, 1}
     assert "failure_mode" not in response.text
+
+
+@pytest.mark.parametrize(
+    "trajectories",
+    [
+        (),
+        ("wrong-task",),
+        ("train-001", "train-001"),
+    ],
+)
+def test_benchmark_rejects_empty_incomplete_or_duplicate_adapter_output(
+    trajectories: tuple[str, ...],
+) -> None:
+    class Adapter:
+        def execute_benchmark(
+            self, request: BenchmarkRequest, engine: ServiceRecoveryEngine
+        ) -> BenchmarkExecutionResult:
+            return BenchmarkExecutionResult(
+                trajectories=tuple(
+                    engine.run_episode(
+                        task_id,
+                        [ToolCall(tool="get_logs", arguments={})],
+                        split=request.split,
+                    )
+                    for task_id in trajectories
+                )
+            )
+
+    client = TestClient(
+        create_objective_app(
+            ServiceRecoveryEngine(seed=1),
+            auth_token="secret",
+            execution_adapter=Adapter(),
+            artifact_store=InMemoryTrajectoryArtifactStore(),
+        )
+    )
+    response = client.post(
+        "/v1/benchmark",
+        json={"run_id": "run-1", "split": "train", "task_ids": ["train-001"]},
+        headers={"authorization": "Bearer secret"},
+    )
+    assert response.status_code == 503
+
+
+def test_benchmark_references_are_replay_verified_and_resolvable_by_curation() -> None:
+    class Adapter:
+        def execute_benchmark(
+            self, request: BenchmarkRequest, engine: ServiceRecoveryEngine
+        ) -> BenchmarkExecutionResult:
+            return BenchmarkExecutionResult(
+                trajectories=tuple(
+                    engine.run_episode(
+                        task_id,
+                        [ToolCall(tool="get_logs", arguments={})],
+                        split=request.split,
+                    )
+                    for task_id in request.task_ids
+                )
+            )
+
+    store = InMemoryTrajectoryArtifactStore()
+    client = TestClient(
+        create_objective_app(
+            ServiceRecoveryEngine(seed=1),
+            auth_token="secret",
+            execution_adapter=Adapter(),
+            artifact_store=store,
+        )
+    )
+    headers = {"authorization": "Bearer secret"}
+    benchmark = client.post(
+        "/v1/benchmark",
+        json={"run_id": "run-1", "split": "replay", "task_ids": ["replay-001"]},
+        headers=headers,
+    )
+    assert benchmark.status_code == 200
+    reference = benchmark.json()["trajectory_references"][0]
+    assert reference["verified"] is True
+
+    curated = client.post(
+        "/v1/verify-curation",
+        json={
+            "run_id": "run-1",
+            "experiment_id": "exp-1",
+            "split": "replay",
+            "trajectory_references": [reference],
+        },
+        headers=headers,
+    )
+    assert curated.status_code == 200
+    assert curated.json()["manifest"]["row_count"] == 1
 
 
 def test_curation_endpoint_returns_a_content_addressed_dataset_for_replay_scope() -> None:

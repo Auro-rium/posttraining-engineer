@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from threading import RLock
 from typing import Any, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from .engine import ServiceRecoveryEngine
 from .models import (
+    BenchmarkExecutionResult,
     BenchmarkRequest,
     BenchmarkResponse,
     CurationRequest,
     CurationResponse,
+    Trajectory,
     TrajectoryReference,
 )
 
@@ -30,7 +33,40 @@ class ObjectiveWorkerUnavailable(RuntimeError):
 class BenchmarkExecutionAdapter(Protocol):
     def execute_benchmark(
         self, request: BenchmarkRequest, engine: ServiceRecoveryEngine
-    ) -> tuple[Any, ...]: ...
+    ) -> BenchmarkExecutionResult: ...
+
+
+class TrajectoryArtifactStore(Protocol):
+    """Content-addressed reference store used by benchmark and curation."""
+
+    def put(self, trajectory: Trajectory) -> TrajectoryReference: ...
+
+    def get(self, trajectory_id: str) -> Trajectory | None: ...
+
+
+class InMemoryTrajectoryArtifactStore:
+    """Thread-safe local artifact registry for contract tests and development."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, Trajectory] = {}
+        self._lock = RLock()
+
+    def put(self, trajectory: Trajectory) -> TrajectoryReference:
+        if not trajectory.verified:
+            raise ValueError("only verified trajectories may be stored")
+        with self._lock:
+            self._items[trajectory.trajectory_id] = trajectory.model_copy(deep=True)
+        return TrajectoryReference(
+            trajectory_id=trajectory.trajectory_id,
+            task_id=trajectory.task_id,
+            split=trajectory.split,
+            verified=True,
+        )
+
+    def get(self, trajectory_id: str) -> Trajectory | None:
+        with self._lock:
+            trajectory = self._items.get(trajectory_id)
+            return trajectory.model_copy(deep=True) if trajectory is not None else None
 
 
 class ObjectiveService:
@@ -41,16 +77,20 @@ class ObjectiveService:
         engine: ServiceRecoveryEngine,
         auth_token: str,
         execution_adapter: BenchmarkExecutionAdapter | Any | None = None,
+        artifact_store: TrajectoryArtifactStore | None = None,
     ) -> None:
         if not auth_token:
             raise ValueError("auth_token is required")
         self.engine = engine
         self.auth_token = auth_token
         self.execution_adapter = execution_adapter
+        self.artifact_store = artifact_store
 
     def benchmark(self, request: BenchmarkRequest) -> BenchmarkResponse:
         if self.execution_adapter is None:
             raise ObjectiveWorkerUnavailable("benchmark execution adapter is required")
+        if self.artifact_store is None:
+            raise ObjectiveWorkerUnavailable("trajectory artifact store is required")
         target = getattr(self.execution_adapter, "execute_benchmark", None)
         if target is None and callable(self.execution_adapter):
             target = self.execution_adapter
@@ -62,35 +102,39 @@ class ObjectiveService:
         )
         try:
             try:
-                raw_trajectories = target(request, request_engine)
+                raw_result = target(request, request_engine)
             except TypeError:
-                raw_trajectories = target(request)
+                raw_result = target(request)
         except Exception as exc:
             raise ObjectiveWorkerUnavailable(
                 f"benchmark execution failed: {type(exc).__name__}"
             ) from exc
-        if not isinstance(raw_trajectories, (tuple, list)):
-            raise ObjectiveWorkerUnavailable("benchmark adapter must return trajectories")
+        if not isinstance(raw_result, BenchmarkExecutionResult):
+            raise ObjectiveWorkerUnavailable("benchmark adapter must return typed execution result")
+        raw_trajectories = raw_result.trajectories
+        if len(raw_trajectories) != len(request.task_ids):
+            raise ObjectiveWorkerUnavailable(
+                "benchmark adapter returned incomplete task cardinality"
+            )
+        actual_task_ids = tuple(item.task_id for item in raw_trajectories)
+        if actual_task_ids != request.task_ids:
+            raise ObjectiveWorkerUnavailable("benchmark adapter task IDs do not match request")
         references: list[TrajectoryReference] = []
         successes = 0
         for trajectory in raw_trajectories:
-            if not hasattr(trajectory, "trajectory_id") or not hasattr(trajectory, "split"):
-                raise ObjectiveWorkerUnavailable(
-                    "benchmark adapter returned an invalid trajectory"
-                )
             if trajectory.split is not request.split:
                 raise ObjectiveWorkerUnavailable(
                     "benchmark trajectory split does not match request"
                 )
-            successes += int(trajectory.success)
-            references.append(
-                TrajectoryReference(
-                    trajectory_id=trajectory.trajectory_id,
-                    task_id=trajectory.task_id,
-                    split=trajectory.split,
-                    verified=False,
-                )
-            )
+            try:
+                confirmed = self.engine.verify(trajectory).trajectory
+                reference = self.artifact_store.put(confirmed)
+            except Exception as exc:
+                raise ObjectiveWorkerUnavailable(
+                    f"benchmark trajectory failed verification or storage: {type(exc).__name__}"
+                ) from exc
+            successes += int(confirmed.success)
+            references.append(reference)
         benchmark_id = (
             "benchmark-"
             + hashlib.sha256(
@@ -109,8 +153,27 @@ class ObjectiveService:
         )
 
     def verify_curation(self, request: CurationRequest) -> CurationResponse:
+        source_trajectories = list(request.trajectories)
+        if request.trajectory_references:
+            if self.artifact_store is None:
+                raise HTTPException(status_code=422, detail="trajectory artifact store is required")
+            for reference in request.trajectory_references:
+                if not reference.verified:
+                    raise HTTPException(
+                        status_code=422, detail="trajectory reference is not verified"
+                    )
+                trajectory = self.artifact_store.get(reference.trajectory_id)
+                if trajectory is None:
+                    raise HTTPException(
+                        status_code=422, detail="trajectory reference is not resolvable"
+                    )
+                source_trajectories.append(trajectory)
         confirmed = []
-        for trajectory in request.trajectories:
+        for trajectory in source_trajectories:
+            if trajectory.split is not request.split:
+                raise HTTPException(
+                    status_code=422, detail="trajectory split does not match replay scope"
+                )
             try:
                 result = self.engine.verify(trajectory)
             except ValueError as exc:
@@ -149,10 +212,13 @@ def create_objective_app(
     *,
     auth_token: str,
     execution_adapter: BenchmarkExecutionAdapter | Any | None = None,
+    artifact_store: TrajectoryArtifactStore | None = None,
 ) -> FastAPI:
     """Create the isolated objective worker application for local or ECS use."""
 
-    service = ObjectiveService(engine or ServiceRecoveryEngine(), auth_token, execution_adapter)
+    service = ObjectiveService(
+        engine or ServiceRecoveryEngine(), auth_token, execution_adapter, artifact_store
+    )
     app = FastAPI(title="service-recovery-objective-worker")
     auth = _auth_dependency(auth_token)
 

@@ -3,6 +3,7 @@
 from .engine import ENGINE_VERSION, ServiceRecoveryEngine, TrajectoryNotAdmissible
 from .models import (
     ALLOWED_TOOLS,
+    BenchmarkExecutionResult,
     BenchmarkRequest,
     BenchmarkResponse,
     CurationRequest,
@@ -21,11 +22,16 @@ from .models import (
     Trajectory,
     TrajectoryStep,
 )
-from .service import ObjectiveService, create_objective_app
+from .service import (
+    InMemoryTrajectoryArtifactStore,
+    ObjectiveService,
+    create_objective_app,
+)
 
 __all__ = [
     "ALLOWED_TOOLS",
     "ENGINE_VERSION",
+    "BenchmarkExecutionResult",
     "BenchmarkRequest",
     "BenchmarkResponse",
     "CurationRequest",
@@ -33,6 +39,7 @@ __all__ = [
     "Dataset",
     "DatasetManifest",
     "DatasetRow",
+    "InMemoryTrajectoryArtifactStore",
     "ObjectiveService",
     "ObjectiveSplit",
     "ReplayResult",
