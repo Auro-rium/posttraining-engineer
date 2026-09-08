@@ -1,8 +1,36 @@
-# Autonomous Post-Training Engineer
+# Autonomous Post-Training Engineer for AWS Agents for Humans Hackathon
 
-A backend-only hackathon demonstration of an observable agent team that turns FunctionGemma failures into verified SFT data, bounded QLoRA experiments, and deterministic checkpoint decisions.
+**Professional Agents Track** - An autonomous agent system that performs end-to-end post-training optimization for Gemma models using AWS Strands Agents (mandatory) with optional Amazon AgentCore integration for enhanced Technical Implementation scoring.
 
-This repository intentionally does **not** contain a visualizer or production SaaS features. The supported target is `google/functiongemma-270m-it`; the supported environment is AgentGym WebShop; one run may launch at most two candidates.
+This system transforms the manual post-training experimentation loop that AI/ML engineers perform into an autonomous workflow:
+
+**Manual Process:**
+```
+Run model → Inspect failures → Figure out why it sucks → Collect/repair data →
+Choose training recipe → Fine-tune → Run evals → Discover regression →
+Change experiment → Train again
+```
+
+**Autonomous Process:**
+```
+Gemma + Environment + Evals
+             ↓
+          OPTIMIZE (via 8 specialized Strands agents)
+             ↓
+      Better Gemma Adapter with verified improvement
+```
+
+The system implements eight specialized Strands agents that work together to:
+1. Benchmark Gemma performance in AgentGym service recovery environment
+2. Analyze failure patterns
+3. Generate research hypotheses
+4. Curate verified post-training datasets
+5. Design optimal QLoRA configurations
+6. Execute training jobs
+7. Evaluate checkpoints for improvement/regression
+8. Make deterministic promotion decisions
+
+Built for the AWS Agents for Humans Hackathon (deadline: September 14, 2026, 5:00 PM PDT).
 
 ## What is implemented
 
@@ -14,27 +42,49 @@ The Python backend provides eight logical roles behind three service modes:
 | `research` | Failure Analyst, Research Agent, Data Curator, Training Designer | Grounds a hypothesis with RAG, proposes replay-verifiable data, and selects a bounded QLoRA configuration. |
 | `execution` | Benchmark Runner, Training Executor, Evaluation Agent, Champion Manager | Produces trajectories, launches training, evaluates identical task sets, and applies deterministic gates. |
 
-The same immutable container runs all modes through `SERVICE_ROLE`. The deployment selects Firestore, Cloud Storage, Vertex AI, Secret Manager, Cloud Trace, and Cloud Logging. Memory, filesystem, and `EXPLANATION` adapters exist only for credential-free contract tests; their output is not a hackathon result.
+The same immutable container runs all modes through `SERVICE_ROLE`. The AWS submission path is Strands-first and is designed to use Amazon Bedrock, S3, DynamoDB, SageMaker, and optional AgentCore/CloudWatch integrations. The current repository run uses in-memory state and explicit `EXPLANATION` adapters; those outputs are not a hackathon result.
 
-Each specialist has an explicit safety contract: Benchmark Runner accepts train-side evidence only; Failure Analyst must ground clusters in trajectory IDs; Research Agent must return a falsifiable hypothesis with canonical RAG citations; Data Curator may propose but never verify repairs; Training Designer must stay inside the QLoRA whitelist; Training Executor may report only Vertex-backed artifacts; Evaluation Agent returns objective evidence without deciding promotion; and Champion Manager explains but cannot override the deterministic gate.
+Each specialist has an explicit safety contract: Benchmark Runner accepts train-side evidence only; Failure Analyst must ground clusters in trajectory IDs; Research Agent must return a falsifiable hypothesis; Data Curator may propose but never verify repairs; Training Designer must stay inside the QLoRA whitelist; Training Executor may report only provider-backed artifacts; Evaluation Agent returns objective evidence without deciding promotion; and Champion Manager explains but cannot override the deterministic gate.
 
-In cloud mode, the coordinator fails fast unless authenticated research/execution A2A destinations are configured. Team services accept only their role's typed operations and call a mandatory external objective-evidence worker for all FunctionGemma, AgentGym, replay, metric, and artifact-producing work.
+In a live AWS deployment, the coordinator must fail fast unless its authenticated service and artifact destinations are configured. The local path is intentionally a credential-free demonstration and does not silently promote simulated evidence.
 
 The API is intentionally small:
 
 - `POST /api/runs`
 - `GET /api/runs/{run_id}`
-- `GET /api/runs/{run_id}/events`
+- `GET /api/runs/{run_id}/experiments`
 - `POST /api/runs/{run_id}/step`
 - `POST /api/runs/{run_id}/auto`
 - `POST /api/runs/{run_id}/cancel`
-- `GET /api/runs/{run_id}/experiments`
-- `POST /api/demo/verify`
+- `POST /api/demo/reset-environment`
 - `GET /health`
 
-`POST /api/runs/{run_id}/auto` uses an in-process background task. The deployment keeps one coordinator instance warm with CPU allocated, but Cloud Run may still restart or replace it; therefore `auto` is best-effort, not a durable workflow engine. Use explicit `/step` calls for the judge path and keep each operation within the configured 55-minute request budget. Firestore preserves completed phase transitions, but the current implementation does not persist an in-flight Vertex polling handle and cannot resume that poll after process loss.
+`POST /api/runs/{run_id}/auto` runs the bounded local demonstration in the current process. A production AWS adapter must replace `active_runs` with DynamoDB and persist provider job IDs before polling. Use explicit `/step` calls for the repeatable local walkthrough.
 
 See [Flow.md](Flow.md) for control flow and [Decisions.md](Decisions.md) for the reasons behind the architecture.
+
+## Capability and evidence matrix
+
+The labels below are deliberate submission boundaries. `LOCAL_DEMO` describes
+what this checkout can run without credentials. `LIVE_AWS` describes the
+capability that must be connected and artifact-verified before it can be
+claimed; no `LIVE_AWS` run is included in this repository state.
+
+| Capability | `LOCAL_DEMO` (current checkout) | `LIVE_AWS` (claim requires evidence) |
+| --- | --- | --- |
+| Strands specialist workflow | Eight role contracts initialize and execute a bounded local workflow. | Bedrock-backed agent decisions and authenticated service boundaries. |
+| Run control | In-memory `OptimizationRun`; `/step` advances one phase and `/auto` runs the remaining phases in-process. | Durable run ownership, idempotent commands, and restart-safe orchestration. |
+| Benchmark and trajectories | Service-recovery fixture returns explanatory trajectories and simulated metrics. | Objective environment worker produces immutable S3 artifacts with hashes and provider/run IDs. |
+| Curation and QLoRA design | Agents return structured demonstration outputs and bounded configurations. | Replay-verified training rows and a recorded, budget-compliant training specification. |
+| Training execution | Simulated submission/status and placeholder artifact references; not model evidence. | SageMaker job submission, polling, logs, and an immutable checkpoint manifest. |
+| Evaluation and promotion | Deterministic gate code is exercised locally, but local metrics are simulated and cannot prove improvement. | Independent evaluation on identical sealed inputs, with artifact-backed metrics and a deterministic promotion decision. |
+| Continuous trigger and event ingestion | `TraceEvent` validation, duplicate suppression, ordered in-memory storage, and deterministic per-run threshold triggering are covered locally; they are not wired to the FastAPI run routes. | EventBridge/SQS delivery into durable event storage, idempotent cycle creation, and a worker that starts the post-training run. |
+| State, artifacts, and run API | Process memory and local response payloads; no durable run/event log or event-stream endpoint. | DynamoDB run/event records, S3 artifacts, and a resumable ordered event stream. |
+
+The evidence labels used in outputs are `LIVE` (verified by the current AWS
+request), `PRIOR_VERIFIED_RUN` (a prior run with provider IDs and hashes), and
+`EXPLANATION` (fixture or simulation). The current checkout produces only
+`EXPLANATION` workflow evidence.
 
 ## Evidence boundary
 
@@ -44,7 +94,7 @@ Every externally shown artifact has one of three labels:
 - `PRIOR_VERIFIED_RUN`: produced by a real earlier run with hashes and provider job identifiers.
 - `EXPLANATION`: fixture or explanatory content that is never presented as measured output.
 
-Gemini may analyze failures and propose hypotheses, repairs, and configurations. It may not grade its own repairs or candidates. Deterministic code enforces replay admission, the two-candidate budget, identical evaluation inputs, and checkpoint promotion. Held-out tasks are excluded from RAG, prompts, repairs, training data, and telemetry.
+Strands model calls may analyze failures and propose hypotheses, repairs, and configurations. They may not grade their own repairs or candidates. Deterministic code enforces replay admission, the two-candidate budget, identical evaluation inputs, and checkpoint promotion. Held-out tasks are excluded from prompts, repairs, training data, and telemetry.
 
 ## Credential-free contract verification
 
@@ -59,7 +109,25 @@ uv run ruff check app tests scripts
 uv run mypy app
 ```
 
-These tests validate schemas, leakage barriers, deterministic orchestration, promotion gates, API behavior, and cloud adapter contracts without calling Gemini, AgentGym, A2A peers, or Google Cloud. Passing them is not evidence that a cloud research run occurred.
+These tests validate schemas, leakage barriers, deterministic orchestration, promotion gates, and API contracts without calling Bedrock, SageMaker, AgentCore, or AWS. Passing them is not evidence that a live AWS run occurred.
+
+For a non-destructive live smoke test against an existing AWS account and S3 bucket:
+
+```bash
+cd backend
+uv run --extra cloud python scripts/live_smoke.py \\
+  --bucket YOUR_EXISTING_BUCKET \\
+  --region us-east-1
+```
+
+The smoke test verifies STS identity, one Strands/Bedrock response, and one
+S3 put/get/delete round trip. It creates no tables, instances, training jobs,
+or persistent infrastructure. To exercise all eight specialist prompts live
+without creating resources:
+
+```bash
+uv run --extra cloud python scripts/live_agentic_test.py
+```
 
 Docker Compose is retained only as a three-role image and healthcheck smoke harness:
 
@@ -70,7 +138,7 @@ curl --fail http://localhost:8001/health
 curl --fail http://localhost:8002/health
 ```
 
-Coordinator, research, and execution listen on ports 8000, 8001, and 8002 respectively. Responses from this harness use local `EXPLANATION` fixtures and must never be shown as model improvement, A2A, or training evidence. The submission flow is the Google Cloud deployment below.
+Coordinator, research, and execution listen on ports 8000, 8001, and 8002 respectively. Responses from this harness use local `EXPLANATION` fixtures and must never be shown as model improvement, A2A, or training evidence.
 
 Run repository and infrastructure checks from the repository root:
 
@@ -79,38 +147,16 @@ cd backend
 uv run pytest tests -q
 cd ..
 backend/.venv/bin/python backend/scripts/check_docs_sync.py
-terraform -chdir=infra/terraform fmt -check -recursive
+docker compose config --quiet
 ```
 
-## Google Cloud deployment
+## AWS deployment status
 
-The Terraform configuration is a deployment skeleton, not proof that a cloud run has occurred. It creates the required APIs, runtime service account, versioned artifact bucket, native Firestore database, empty Secret Manager secret, and three Cloud Run services. Deployed ADK roles use Vertex AI through workload identity (`GOOGLE_GENAI_USE_VERTEXAI=TRUE`); no Gemini API key is stored or injected.
+The AWS/Strands implementation is currently a local, credential-free demonstration. It does not yet provision or call Bedrock, SageMaker, DynamoDB, S3, AgentCore, or CloudWatch. Do not describe the placeholder S3 URIs, randomized metrics, or local state as live AWS evidence.
 
-1. Build immutable backend and QLoRA worker images and copy the example variables:
+For a live submission path, wire the existing role contracts to AWS adapters in this order: Bedrock model invocation for agent decisions; S3 for immutable trajectories, datasets, and checkpoints; DynamoDB for `OptimizationRun` and events; SageMaker for QLoRA execution; and optional AgentCore hosting plus CloudWatch traces. Record the exact AWS resource IDs and artifact hashes in the run before showing a metric.
 
-   ```bash
-   gcloud builds submit backend --tag REGION-docker.pkg.dev/PROJECT/REPOSITORY/backend:GIT_SHA
-   gcloud builds submit TRAINER_CONTEXT --tag REGION-docker.pkg.dev/PROJECT/REPOSITORY/trainer:GIT_SHA
-   cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
-   ```
-
-2. Set `project_id`, `region`, `container_image`, `training_container_image`, `objective_execution_url`, and `rag_corpus_uri`, then apply. The objective URL is a hard prerequisite: it points to a separately deployed, sandboxed FunctionGemma plus AgentGym evidence worker exposing `POST /v1/benchmark`, `/v1/verify-curation`, `/v1/evaluate`, and `/v1/training-evidence`. This Terraform configuration does not provision that worker. Its deployment must grant the runtime service account permission to invoke it.
-
-   The RAG URI is also a hard prerequisite and must reference a readable GCS JSON corpus of allowed `KnowledgeDocument` records. Upload documentation, train-side knowledge, and prior experiment summaries only; held-out and regression scopes fail ingestion. Pin `rag_corpus_sha256` for immutable demo evidence. Terraform does not create or populate this corpus and an external bucket must grant the runtime service account object-read permission.
-
-   ```bash
-   terraform -chdir=infra/terraform init
-   terraform -chdir=infra/terraform plan -out=deployment.tfplan
-   terraform -chdir=infra/terraform apply deployment.tfplan
-   ```
-
-3. Terraform creates the research and execution services first, then injects their computed URIs into the coordinator in the same apply. An optional second pass may set `research_service_url` and `execution_service_url` so each team's published A2A Agent Card contains its exact external self URL; coordinator routing does not depend on that pass.
-
-4. If FunctionGemma access requires a Hugging Face token, add it directly to the created Secret Manager resource using stdin or the Cloud Console. Do not place the value in Terraform, `.env`, shell history, logs, or chat. Cloud Run and the Vertex worker receive only `HF_SECRET_ID`; the runtime service account is authorized to read the value.
-
-5. Cloud Run is authenticated by default. Set `allow_unauthenticated = true` only for an intentionally public judge environment; the variable is not a substitute for application authorization.
-
-If the project already has a `(default)` Firestore database, import it into Terraform state rather than attempting to recreate or delete it. Never destroy the database to resolve an ownership conflict.
+No infrastructure-as-code stack is included yet. An AWS-native deployment stack can be added after the local workflow is made live; no cloud provider is implied by the current demo.
 
 ## Living documentation
 
@@ -118,8 +164,9 @@ All contributors and agents must follow [AGENTS.md](AGENTS.md): read the living 
 
 ## Current limitations
 
-- No cloud deployment, Vertex training job, AgentGym run, checkpoint improvement, or model metric is claimed until its real artifact is recorded.
-- Credential-free adapters test orchestration contracts only; they are not a replacement for the deployed WebShop, ADK/A2A, and Vertex integration run.
-- The sandboxed objective-evidence worker and the GCS RAG corpus are hard deployment prerequisites maintained outside this Terraform configuration.
-- A Vertex job handle is not persisted before the coordinator begins polling. A restart during training cannot resume that poll safely, so inspect the provider job before retrying and treat `/auto` as best-effort.
+- No AWS deployment, Bedrock invocation, SageMaker training job, checkpoint improvement, or model metric is claimed until its real artifact is recorded.
+- Evaluation is explicitly requested as AgentGym AgentEval (`agent-eval-v1`); live reports must include the immutable AgentEval manifest SHA-256 and are accepted only when champion and candidate use the same suite/version.
+- Credential-free adapters execute only the local service-recovery explanation fixture; live environments require configured AWS workers and model access.
+- S3/DynamoDB/SageMaker/AgentCore integrations are deployment prerequisites and are not provisioned by this repository yet.
+- A process restart currently loses in-memory runs; durable AWS persistence and provider job reconciliation remain required before claiming recoverability.
 - Authentication, multi-tenancy, billing, continuous training, multiple target models, and a frontend are out of scope.

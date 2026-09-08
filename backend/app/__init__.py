@@ -1,4 +1,4 @@
-"""Autonomous Post-Training Engineer backend."""
-
-__version__ = "0.1.0"
-
+"""
+Autonomous Post-Training Engineer Package
+AWS Agents for Humans Hackathon Edition
+"""

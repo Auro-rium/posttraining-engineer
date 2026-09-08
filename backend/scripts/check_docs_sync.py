@@ -28,7 +28,6 @@ TRACKED_PREFIXES = (
     ".github/workflows/",
     "backend/app/",
     "backend/tests/",
-    "infra/terraform/",
 )
 TRACKED_FILES = {
     ".env.example",

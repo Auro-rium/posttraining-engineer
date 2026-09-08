@@ -145,3 +145,132 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** A generated snapshot must be copied into the canonical documents deliberately if it contains information worth preserving.
 - **Affected components:** Repository hygiene and documentation maintenance.
 - **Validation:** Git status remains clean when either generated snapshot directory is present; canonical living documents remain trackable.
+
+## DEC-013 — Expand fine-tuning schema without inventing WebShop actions
+
+- **Date / run:** 2026-08-15 Asia/Kolkata / `CHANGE-2026-08-15-003`
+- **Status:** Accepted
+- **Context:** FunctionGemma fine-tuning needs an explicit, useful tools section, but native AgentGym WebShop exposes only `search` and `click` actions. Adding checkout-specific functions would create training labels the evaluator cannot execute.
+- **Decision:** Ship canonical JSON function schemas for `search(keywords)` and `click(item)`, with richer descriptions and strict required arguments, and inject them into training rows when a row omits its tools field.
+- **Alternatives:** Add synthetic `add_to_cart`/`checkout` functions; keep tools omitted from rows; replace WebShop with a custom commerce environment.
+- **Reason:** This increases the quality and consistency of the fine-tuning signal while preserving environment compatibility and deterministic replay.
+- **Trade-offs:** The model still has two native action names; broader tool coverage requires a separately scoped environment adapter and benchmark.
+- **Affected components:** `backend/app/webshop_tools.py`, training renderer, WebShop tests, and living documentation.
+- **Validation:** Schema tests assert both functions, required arguments, full test suite, Ruff, mypy, and documentation sync.
+
+## DEC-014 — Revert the optional fine-tuning tool-schema expansion
+
+- **Date / run:** 2026-08-15 Asia/Kolkata / `REVERT-2026-08-15-001`
+- **Status:** Supersedes DEC-013
+- **Context:** The requested tool-schema expansion was not part of the desired implementation step.
+- **Decision:** Restore the prior training renderer and WebShop contract; retain only the native environment action handling already present.
+- **Reason:** Keep the backend scoped to the previously approved behavior.
+- **Affected components:** Training renderer, WebShop tests, and flow documentation.
+- **Validation:** Full backend tests, Ruff, mypy, and documentation sync after the revert.
+
+## DEC-015 — Add Wordle, BabyAI, and Movie environment contracts
+
+- **Date / run:** 2026-08-15 Asia/Kolkata / `CHANGE-2026-08-15-004`
+- **Status:** Accepted
+- **Context:** The hackathon now needs broader AgentGym coverage than WebShop while retaining one shared post-training loop.
+- **Decision:** Accept `AgentGym/WebShop`, `AgentGym/Wordle`, `AgentGym/BabyAI`, and `AgentGym/Movie` at the API boundary. Route action discovery and deterministic replay through the selected external objective worker; keep the local explanation provider WebShop-only.
+- **Alternatives:** Implement separate local simulators; accept arbitrary environment strings; keep WebShop-only.
+- **Reason:** Typed allow-listing prevents unsupported or misspelled environments while avoiding fabricated local metrics and keeping environment-specific action schemas inside their authoritative workers.
+- **Trade-offs:** New environments can be created through the API but require deployed objective-worker support before a live run; the local fixture cannot execute them.
+- **Affected components:** Environment registry, run API, ADK prompts, cloud objective-worker contract, tests, README, and Flow.
+- **Validation:** API acceptance tests for all three environments plus full tests, Ruff, mypy, and documentation sync.
+
+## DEC-016 — Compile explicit role prompts and tool allow-lists
+
+- **Date / run:** 2026-08-21 Asia/Kolkata / `CHANGE-2026-08-21-001`
+- **Status:** Accepted
+- **Context:** Eight long-horizon agents need predictable boundaries and a concrete sharing protocol instead of relying on implicit swarm memory.
+- **Decision:** Compile every role prompt with an explicit allowed-tool list, typed handoff target, resumability rules, retry policy, and shared-state protocol. Tools represent server-side capabilities; agents cannot call peers directly or mutate arbitrary state.
+- **Alternatives:** Give every agent the same broad tool set; rely on prose-only role descriptions; use an untyped shared message bus.
+- **Reason:** Least-privilege tool access and typed A2A/Firestore/GCS handoffs make failures auditable, resumable, and testable across long runs.
+- **Trade-offs:** Adding a new capability requires updating the role allow-list and contract tests; prompts are longer but more deterministic.
+- **Affected components:** ADK prompt compilation, role tests, A2A handoffs, Firestore state, GCS artifacts, telemetry, and Flow documentation.
+- **Validation:** Prompt tests assert every role has allowed tools, a handoff, safety clauses, and the common resumability protocol.
+
+## DEC-017 — Make AgentEval the explicit sealed evaluation suite
+
+- **Date / run:** 2026-08-21 Asia/Kolkata / `CHANGE-2026-08-21-002`
+- **Status:** Accepted
+- **Context:** The evaluation path was sealed and objective but did not identify which AgentGym benchmark produced its metrics.
+- **Decision:** Set `AgentGym/AgentEval` (`agent-eval-v1`) as the typed evaluation suite. Require live evaluation reports to include a lowercase SHA-256 hash of the immutable AgentEval manifest and reject reports whose suite/version does not match the request.
+- **Alternatives:** Keep the suite implicit; allow each worker to choose an arbitrary held-out set; expose task contents to the coordinator.
+- **Reason:** Explicit suite provenance makes champion/candidate comparisons reproducible without leaking evaluation tasks.
+- **Trade-offs:** The external objective worker must pin and return the AgentEval manifest hash before a candidate can be promoted.
+- **Affected components:** Evaluation request/report schemas, cloud provider validation, objective-worker contract, tests, and deployment documentation.
+- **Validation:** Contract tests cover live manifest requirements and the full test, type, lint, and documentation suites.
+
+## DEC-018 — Persist and reconcile in-flight training work
+
+- **Date / run:** 2026-08-21 Asia/Kolkata / `CHANGE-2026-08-21-003`
+- **Status:** Accepted
+- **Context:** A process restart during Vertex polling previously lost the in-memory job handle and could cause an unsafe duplicate submission.
+- **Decision:** Persist a `PENDING`/`RUNNING` `TrainingResult.job_id` before polling, use a deterministic Vertex display name to reconcile a submission after a crash, and resume all non-terminal Firestore runs on service startup.
+- **Alternatives:** Keep `/auto` process-local; ask an operator to inspect every restart; introduce a new workflow engine during the hackathon.
+- **Reason:** Durable state plus provider-side idempotent lookup makes the existing coordinator recoverable without adding another platform dependency.
+- **Trade-offs:** Recovery still depends on Vertex listing permissions and the external objective worker; a provider outage remains a real blocker and fails closed.
+- **Affected components:** Orchestrator, coordinator startup, Vertex launcher, cloud provider, tests, README, and Flow.
+- **Validation:** Recovery tests cover persisted job reconciliation; full tests, Ruff, mypy, documentation sync, and diff checks pass.
+
+## DEC-019 — Strands Agents as the AWS hackathon runtime
+
+- **Date / run:** 2026-09-06 / `AWS-STRANDS-HACKATHON-001`
+- **Status:** Accepted; supersedes the AWS-facing runtime choice only
+- **Context:** The AWS Agents for Humans hackathon requires Strands Agents and evaluates real professional workflow execution; a frontend is not required for the backend submission.
+- **Decision:** Add a Strands-native specialist package and retain the state-driven eight-role workflow. Keep the scientific record in explicit run state and artifacts rather than agent memory. AgentCore remains an optional deployment target, not a source of truth.
+- **Alternatives:** Keep Google ADK as the primary runtime; replace the workflow with one general-purpose agent; build a frontend before validating the backend loop.
+- **Reason:** Strands satisfies the mandatory platform requirement while preserving role specialization and deterministic evaluation/promotion boundaries.
+- **Trade-offs:** The migration currently coexists with legacy Google-specific modules; live Bedrock/SageMaker/AgentCore execution still requires AWS deployment configuration.
+- **Affected components:** Strands agent package, orchestrator, service-recovery environment, API bootstrap, backend packaging, and architecture documentation.
+- **Validation:** Compilation, specialist initialization, full local workflow, and API smoke tests pass; no live AWS training or model improvement is claimed.
+
+## DEC-020 — Remove legacy Google implementation from AWS submission
+
+- **Date / run:** 2026-09-06 / `AWS-STRANDS-HACKATHON-002`
+- **Status:** Accepted
+- **Context:** The repository is being submitted to the AWS Agents for Humans hackathon; retaining the earlier Google ADK/Vertex/Firestore/GCS path made the runtime, dependencies, tests, and deployment instructions contradictory.
+- **Decision:** Remove the legacy Google source modules, Google-only tests and training worker, and Google Terraform stack. Keep the AWS Strands workflow and retain only concise historical notes in this append-only file and `ChangeLog.md`.
+- **Alternatives:** Keep both runtimes; move the Google implementation to a separate branch; silently leave the mixed documentation.
+- **Reason:** One authoritative AWS path is easier for judges to install, inspect, and run, and avoids presenting stale Google infrastructure as part of the submission.
+- **Trade-offs:** Historical Google implementation is no longer runnable from this checkout; live AWS integrations remain to be implemented and verified.
+- **Affected components:** `backend/app`, `backend/tests`, `backend/training`, `infra/terraform`, `.env.example`, Docker/CI configuration, and living documentation.
+- **Validation:** AWS-only import/compile and smoke checks must pass; no live AWS capability is claimed by this cleanup.
+
+## DEC-021 — Isolate deterministic continuous post-training domain logic
+
+- **Date / run:** 2026-09-06 / `POSTTRAINING-DOMAIN-001`
+- **Status:** Accepted
+- **Context:** Continuous cycles need an auditable record of immutable artifacts, objective evidence, promotion decisions, and rollback history without relying on Strands agent output or wall-clock/random state.
+- **Decision:** Add an independent `app.posttraining` package with content-addressed artifact models, provenance-bearing evidence models, a fail-closed promotion gate, explicit approval/rejection/rollback transitions, and fixed-seed callback-based benchmark utilities.
+- **Alternatives:** Extend the agent classes directly; use untyped dictionaries; let the Champion Manager decide from generated text; use process-global randomness for benchmark ordering.
+- **Reason:** Keeping these rules as typed, deterministic domain primitives makes the continuous path testable and prevents simulated or incompatible evidence from being promoted.
+- **Trade-offs:** Callers must provide lowercase SHA-256 digests and compatible verified evaluation manifests; benchmarks still need an objective predictor adapter to run live model evaluations.
+- **Affected components:** `backend/app/posttraining`, focused post-training tests, and the backend test discovery configuration.
+- **Validation:** Focused pytest, Ruff, mypy, and diff checks pass; no live AWS or model evaluation was performed.
+
+## DEC-022 — Keep continuous post-training HTTP control plane independently injectable
+
+- **Date / run:** 2026-09-06 / `POSTTRAINING-API-001`
+- **Status:** Accepted
+- **Context:** Trace intake and operator cycle decisions need a typed HTTP boundary, while the existing AWS Strands coordinator bootstrap and local domain primitives are changing independently.
+- **Decision:** Add an isolated FastAPI router under `backend/app/api/continuous_post_training.py` with repository and service protocols, app-state dependency resolution, and a lock-protected in-memory repository for local tests. Do not import or mutate `app.main`.
+- **Alternatives:** Add routes directly to `main.py`; use a module-global mutable store; couple the API to a concrete AWS or training provider.
+- **Reason:** Explicit inclusion and dependency overrides make the contract testable and allow a durable adapter to be introduced without changing handlers. Approval records intent and queues work; it does not claim that training or artifacts exist.
+- **Trade-offs:** The default repository is process-local and the router does not provide authentication, background execution, or durable artifact storage until the host application supplies those integrations.
+- **Affected components:** `backend/app/api/continuous_post_training.py`, API tests, and integration documentation.
+- **Validation:** Focused API pytest, Ruff, mypy, Python compilation, documentation sync, and diff checks pass; no live AWS or model training run was performed.
+
+## DEC-023 — Add a fail-closed AWS deployment foundation
+
+- **Date / run:** 2026-09-06 / `AWS-DEPLOYMENT-FOUNDATION-001`
+- **Status:** Accepted
+- **Context:** The Strands local workflow needed explicit AWS configuration, role discovery, and deployable storage/runtime foundations without adding a frontend.
+- **Decision:** Add typed runtime settings, wire the continuous control-plane router into the app, publish role Agent Cards, and provision S3, DynamoDB, ECR, ECS, IAM, VPC, and CloudWatch foundations with CDK. Keep live AWS orchestration disabled until provider-backed state, artifacts, training, and evaluation are connected.
+- **Reason:** Explicit fail-closed boundaries prevent the local simulation from being presented as live evidence while making the next deployment step reproducible.
+- **Trade-offs:** CDK infrastructure is not sufficient for a live model-improvement claim; the current workflow remains local until provider wiring is completed.
+- **Affected components:** `backend/app/runtime_config.py`, `backend/app/main.py`, `infra/cdk/`, and deployment documentation.
+- **Validation:** Pytest, compilation, CDK synthesis, documentation sync, and diff checks pass.

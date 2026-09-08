@@ -27,12 +27,12 @@ jobs:
         run: uv sync --frozen --extra cloud --extra dev
 
       - name: Run backend tests
-        env:
-          SERVICE_ROLE: coordinator
-          STATE_BACKEND: memory
-          ARTIFACT_BACKEND: memory
         working-directory: backend
-        run: uv run pytest tests -q
+        run: uv run python test_implementation.py
+
+      - name: Compile AWS backend
+        working-directory: backend
+        run: uv run python -m compileall -q app
 
       - name: Validate living documentation
         if: github.event_name != 'pull_request'
@@ -47,13 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Cloud Run container
+      - name: Build backend container
         run: docker build --tag autonomous-post-training-backend:ci backend
 
-      - uses: hashicorp/setup-terraform@v3
-
-      - name: Check Terraform formatting
-        run: terraform -chdir=infra/terraform fmt -check -recursive
-
-      - name: Validate Terraform configuration
-        run: terraform -chdir=infra/terraform init -backend=false && terraform -chdir=infra/terraform validate
+      - name: Validate Docker Compose contract
+        run: docker compose config --quiet

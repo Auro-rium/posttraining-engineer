@@ -1,2 +1,0 @@
-"""Vertex training worker package."""
-
