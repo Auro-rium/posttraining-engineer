@@ -14,6 +14,26 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import uuid4
 
+from app.posttraining.run_history import (
+    MAX_RUNS,
+    RunHistoryRecord,
+    RunLimitExceeded,
+)
+
+__all__ = [
+    "ConcurrentUpdateError",
+    "DynamoDBRunRepository",
+    "DynamoDBStateRepository",
+    "OptionalDependencyError",
+    "RepositoryError",
+    "RunAlreadyExistsError",
+    "RunEvent",
+    "RunHistoryRecord",
+    "RunLimitExceeded",
+    "RunRecord",
+    "RunRepository",
+]
+
 
 class OptionalDependencyError(RuntimeError):
     """Raised when an AWS-backed adapter is used without its optional SDK."""
@@ -89,6 +109,9 @@ class DynamoDBRunRepository:
     """
 
     STATE_SK = "STATE"
+    HISTORY_PK = "HISTORY"
+    HISTORY_COUNTER_SK = "COUNTER"
+    HISTORY_RUN_SK_PREFIX = "RUN#"
 
     def __init__(
         self,
@@ -97,6 +120,7 @@ class DynamoDBRunRepository:
         table: Any | None = None,
         region_name: str | None = None,
         resource: Any | None = None,
+        client: Any | None = None,
     ) -> None:
         if table is None and not table_name:
             raise ValueError("table_name is required when table is not supplied")
@@ -104,6 +128,7 @@ class DynamoDBRunRepository:
         self.region_name = region_name
         self._table = table
         self._resource = resource
+        self._client = client
 
     def _table_or_create(self) -> Any:
         if self._table is not None:
@@ -122,6 +147,71 @@ class DynamoDBRunRepository:
         if not run_id.strip():
             raise ValueError("run_id must not be empty")
         return f"RUN#{run_id}"
+
+    @classmethod
+    def _history_key(cls, run_id: str) -> dict[str, str]:
+        if not run_id.strip():
+            raise ValueError("run_id must not be empty")
+        return {"pk": cls.HISTORY_PK, "sk": f"{cls.HISTORY_RUN_SK_PREFIX}{run_id}"}
+
+    @classmethod
+    def _history_counter_key(cls) -> dict[str, str]:
+        return {"pk": cls.HISTORY_PK, "sk": cls.HISTORY_COUNTER_SK}
+
+    def _transaction_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        table = self._table_or_create()
+        metadata = getattr(table, "meta", None)
+        client = getattr(metadata, "client", None)
+        if client is None and self._resource is not None:
+            resource_metadata = getattr(self._resource, "meta", None)
+            client = getattr(resource_metadata, "client", None)
+        if client is None:
+            raise RepositoryError(
+                "DynamoDBRunRepository requires a DynamoDB client for history transactions"
+            )
+        self._client = client
+        return client
+
+    @staticmethod
+    def _client_value(value: Any) -> dict[str, str | bool]:
+        """Encode the scalar values used by the low-level DynamoDB client."""
+
+        if isinstance(value, bool):
+            return {"BOOL": value}
+        if isinstance(value, int):
+            return {"N": str(value)}
+        if isinstance(value, float):
+            return {"N": str(value)}
+        return {"S": str(value)}
+
+    @classmethod
+    def _history_item(cls, record: RunHistoryRecord) -> dict[str, Any]:
+        serialized = record.model_dump(mode="json")
+        item: dict[str, Any] = {
+            "pk": {"S": cls.HISTORY_PK},
+            "sk": {"S": f"{cls.HISTORY_RUN_SK_PREFIX}{record.run_id}"},
+            "entity": {"S": "run_history"},
+            "run_id": {"S": record.run_id},
+            "run_number": {"N": str(record.run_number)},
+            "payload": {"S": _json(serialized)},
+            "created_at": {"S": serialized["created_at"]},
+            "updated_at": {"S": serialized["updated_at"]},
+        }
+        return item
+
+    @staticmethod
+    def _history_counter_count(item: Mapping[str, Any] | None) -> int:
+        if not isinstance(item, Mapping):
+            return 0
+        value = item.get("run_count", 0)
+        if isinstance(value, Mapping) and "N" in value:
+            value = value["N"]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
     def _run_item(self, run: RunRecord) -> dict[str, Any]:
         return {
@@ -166,6 +256,128 @@ class DynamoDBRunRepository:
             updated_at=str(item.get("updated_at", "")),
         )
 
+    @staticmethod
+    def _decode_history(item: Mapping[str, Any]) -> RunHistoryRecord:
+        payload = item.get("payload", "{}")
+        if isinstance(payload, str):
+            parsed: Any = json.loads(payload)
+        elif isinstance(payload, Mapping):
+            parsed = dict(payload)
+        else:
+            parsed = {}
+        return RunHistoryRecord.model_validate(parsed)
+
+    def _get_state_run(self, run_id: str) -> RunRecord | None:
+        response = self._table_or_create().get_item(
+            Key={"pk": self._pk(run_id), "sk": self.STATE_SK},
+            ConsistentRead=True,
+        )
+        item = response.get("Item")
+        return self._decode_run(item) if isinstance(item, Mapping) else None
+
+    def _get_history_item(self, run_id: str) -> Mapping[str, Any] | None:
+        response = self._table_or_create().get_item(
+            Key=self._history_key(run_id),
+            ConsistentRead=True,
+        )
+        item = response.get("Item")
+        return item if isinstance(item, Mapping) else None
+
+    def _get_history_counter(self) -> Mapping[str, Any] | None:
+        response = self._table_or_create().get_item(
+            Key=self._history_counter_key(),
+            ConsistentRead=True,
+        )
+        item = response.get("Item")
+        return item if isinstance(item, Mapping) else None
+
+    @staticmethod
+    def _transaction_failure_reason(exc: BaseException) -> str | None:
+        response = getattr(exc, "response", None)
+        if not isinstance(response, Mapping):
+            return None
+        reasons = response.get("CancellationReasons")
+        if not isinstance(reasons, list):
+            return None
+        if reasons and isinstance(reasons[0], Mapping):
+            if reasons[0].get("Code") == "ConditionalCheckFailed":
+                return "limit"
+        if len(reasons) > 1 and isinstance(reasons[1], Mapping):
+            if reasons[1].get("Code") == "ConditionalCheckFailed":
+                return "duplicate"
+        return None
+
+    def reserve_run(
+        self, record: RunHistoryRecord, *, max_runs: int = MAX_RUNS
+    ) -> RunHistoryRecord:
+        """Atomically reserve one history slot and persist its immutable record.
+
+        The counter update and record put share one DynamoDB transaction.  The
+        counter condition is evaluated by DynamoDB, so two coordinators cannot
+        both observe the final available slot and create a sixth run.
+        """
+
+        if not 1 <= max_runs <= MAX_RUNS:
+            raise ValueError(f"max_runs must be between 1 and {MAX_RUNS}")
+        if record.run_number > max_runs:
+            raise RunLimitExceeded(f"maximum of {max_runs} runs reached")
+
+        table_name = self.table_name or getattr(self._table_or_create(), "name", "")
+        counter_key = self._history_counter_key()
+        operations: list[dict[str, Any]] = [
+            {
+                "Update": {
+                    "TableName": table_name,
+                    "Key": {
+                        "pk": self._client_value(counter_key["pk"]),
+                        "sk": self._client_value(counter_key["sk"]),
+                    },
+                    "UpdateExpression": (
+                        "SET #entity = :entity, #run_count = "
+                        "if_not_exists(#run_count, :zero) + :one"
+                    ),
+                    "ConditionExpression": (
+                        "attribute_not_exists(#run_count) OR #run_count < :max_runs"
+                    ),
+                    "ExpressionAttributeNames": {"#entity": "entity", "#run_count": "run_count"},
+                    "ExpressionAttributeValues": {
+                        ":entity": self._client_value("run_history_counter"),
+                        ":zero": self._client_value(0),
+                        ":one": self._client_value(1),
+                        ":max_runs": self._client_value(max_runs),
+                    },
+                }
+            },
+            {
+                "Put": {
+                    "TableName": table_name,
+                    "Item": self._history_item(record),
+                    "ConditionExpression": (
+                        "attribute_not_exists(#pk) AND attribute_not_exists(#sk)"
+                    ),
+                    "ExpressionAttributeNames": {"#pk": "pk", "#sk": "sk"},
+                }
+            },
+        ]
+        try:
+            self._transaction_client().transact_write_items(TransactItems=operations)
+        except Exception as exc:
+            reason = self._transaction_failure_reason(exc)
+            if reason == "limit":
+                raise RunLimitExceeded(f"maximum of {max_runs} runs reached") from exc
+            if reason == "duplicate":
+                raise RunAlreadyExistsError(f"Run already exists: {record.run_id}") from exc
+
+            # Some test doubles and older botocore versions omit cancellation
+            # reasons.  These reads only classify the failed transaction; they
+            # do not participate in the reservation itself.
+            if self._get_history_item(record.run_id) is not None:
+                raise RunAlreadyExistsError(f"Run already exists: {record.run_id}") from exc
+            if self._history_counter_count(self._get_history_counter()) >= max_runs:
+                raise RunLimitExceeded(f"maximum of {max_runs} runs reached") from exc
+            raise
+        return record
+
     def create_run(self, run: RunRecord) -> RunRecord:
         if not run.run_id.strip():
             raise ValueError("run_id must not be empty")
@@ -181,13 +393,11 @@ class DynamoDBRunRepository:
             raise
         return run
 
-    def get_run(self, run_id: str) -> RunRecord | None:
-        response = self._table_or_create().get_item(
-            Key={"pk": self._pk(run_id), "sk": self.STATE_SK},
-            ConsistentRead=True,
-        )
-        item = response.get("Item")
-        return self._decode_run(item) if isinstance(item, Mapping) else None
+    def get_run(self, run_id: str) -> RunRecord | RunHistoryRecord | None:
+        history_item = self._get_history_item(run_id)
+        if history_item is not None:
+            return self._decode_history(history_item)
+        return self._get_state_run(run_id)
 
     def update_run(
         self,
@@ -198,7 +408,7 @@ class DynamoDBRunRepository:
         status: str | None = None,
         phase: str | None = None,
     ) -> RunRecord:
-        current = self.get_run(run_id)
+        current = self._get_state_run(run_id)
         if current is None:
             raise RepositoryError(f"Run does not exist: {run_id}")
         if current.state_version != expected_state_version:
@@ -245,7 +455,7 @@ class DynamoDBRunRepository:
         attributes = response.get("Attributes")
         if isinstance(attributes, Mapping):
             return self._decode_run(attributes)
-        refreshed = self.get_run(run_id)
+        refreshed = self._get_state_run(run_id)
         if refreshed is None:  # pragma: no cover - a provider consistency failure
             raise RepositoryError(f"Run disappeared after update: {run_id}")
         return refreshed
@@ -307,6 +517,40 @@ class DynamoDBRunRepository:
             for item in items
             if isinstance(item, Mapping) and item.get("entity") == "event"
         ]
+
+    def list_runs(self, *, limit: int = MAX_RUNS) -> list[RunHistoryRecord]:
+        """Return the newest persisted history records in run-number order."""
+
+        if not 1 <= limit <= MAX_RUNS:
+            raise ValueError(f"limit must be between 1 and {MAX_RUNS}")
+        table = self._table_or_create()
+        items: list[Mapping[str, Any]] = []
+        query_kwargs: dict[str, Any] = {
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :prefix)",
+            "ExpressionAttributeNames": {"#pk": "pk", "#sk": "sk"},
+            "ExpressionAttributeValues": {
+                ":pk": self.HISTORY_PK,
+                ":prefix": self.HISTORY_RUN_SK_PREFIX,
+            },
+            "ScanIndexForward": True,
+        }
+        while True:
+            response = table.query(**query_kwargs)
+            page = response.get("Items", [])
+            if isinstance(page, list):
+                items.extend(item for item in page if isinstance(item, Mapping))
+            last_key = response.get("LastEvaluatedKey")
+            if not isinstance(last_key, Mapping):
+                break
+            query_kwargs["ExclusiveStartKey"] = dict(last_key)
+
+        records = [
+            self._decode_history(item)
+            for item in items
+            if item.get("entity") == "run_history"
+        ]
+        records.sort(key=lambda record: (record.run_number, record.created_at, record.run_id))
+        return records[-limit:]
 
 
 # Stable descriptive alias for the durable state boundary.

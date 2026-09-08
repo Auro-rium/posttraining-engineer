@@ -6,12 +6,16 @@ from typing import ClassVar
 
 import pytest
 
+from app.posttraining.models import Artifact, ArtifactKind
+from app.posttraining.run_history import RunDecision, RunHistoryRecord, RunStatus
 from app.providers.artifacts import ArtifactRef, S3ArtifactStore
 from app.providers.bedrock import BedrockStrandsModel
 from app.providers.repository import (
     ConcurrentUpdateError,
     DynamoDBRunRepository,
+    RunAlreadyExistsError,
     RunEvent,
+    RunLimitExceeded,
     RunRecord,
 )
 from app.providers.sagemaker import (
@@ -111,6 +115,136 @@ class ConditionalError(Exception):
     response: ClassVar[dict[str, dict[str, str]]] = {
         "Error": {"Code": "ConditionalCheckFailedException"}
     }
+
+
+class FakeTransactionClient:
+    def __init__(self, table: FakeTransactionalTable) -> None:
+        self.table = table
+        self.calls: list[dict[str, object]] = []
+
+    def transact_write_items(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(kwargs)
+        operations = kwargs["TransactItems"]
+        assert isinstance(operations, list)
+        update = operations[0]["Update"]
+        put = operations[1]["Put"]
+        assert isinstance(update, dict)
+        assert isinstance(put, dict)
+        counter_key = (
+            str(update["Key"]["pk"]["S"]),
+            str(update["Key"]["sk"]["S"]),
+        )
+        history_item = {
+            key: self._decode(value)
+            for key, value in put["Item"].items()
+        }
+        assert isinstance(history_item, dict)
+        history_key = (str(history_item["pk"]), str(history_item["sk"]))
+        counter = self.table.items.get(counter_key)
+        count = int(counter.get("run_count", 0)) if counter else 0
+        maximum = int(update["ExpressionAttributeValues"][":max_runs"]["N"])
+        if count >= maximum:
+            raise TransactionLimitError()
+        if history_key in self.table.items:
+            raise TransactionDuplicateError()
+        self.table.items[counter_key] = {
+            "pk": counter_key[0],
+            "sk": counter_key[1],
+            "entity": "run_history_counter",
+            "run_count": count + 1,
+        }
+        self.table.items[history_key] = dict(history_item)
+        return {}
+
+    @staticmethod
+    def _decode(value: object) -> object:
+        assert isinstance(value, dict)
+        if "S" in value:
+            return value["S"]
+        if "N" in value:
+            return int(value["N"])
+        return value
+
+
+class FakeTransactionalTable(FakeTable):
+    def __init__(self) -> None:
+        super().__init__()
+        self.meta = type("Meta", (), {"client": FakeTransactionClient(self)})()
+
+
+class TransactionLimitError(Exception):
+    response: ClassVar[dict[str, object]] = {
+        "Error": {"Code": "TransactionCanceledException"},
+        "CancellationReasons": [{"Code": "ConditionalCheckFailed"}, {}],
+    }
+
+
+class TransactionDuplicateError(Exception):
+    response: ClassVar[dict[str, object]] = {
+        "Error": {"Code": "TransactionCanceledException"},
+        "CancellationReasons": [{"Code": "None"}, {"Code": "ConditionalCheckFailed"}],
+    }
+
+
+def history_record(number: int, run_id: str | None = None) -> RunHistoryRecord:
+    return RunHistoryRecord(
+        run_id=run_id or f"run-{number:03d}",
+        run_number=number,
+        status=RunStatus.COMPLETED,
+        decision=RunDecision.PROMOTE,
+        manifest_sha256="a" * 64,
+        champion_run_id="champion" if number > 1 else None,
+        champion_artifact_id="champion-checkpoint",
+        candidate_artifact_id=f"candidate-{number:03d}",
+        baseline_metrics={"aggregate": 0.40, "per_environment": {"WebShop": 0.40}},
+        candidate_metrics={"aggregate": 0.50, "per_environment": {"WebShop": 0.50}},
+        artifact_refs=(
+            Artifact(
+                artifact_id=f"candidate-{number:03d}",
+                kind=ArtifactKind.CHECKPOINT,
+                uri=f"s3://artifacts/candidate-{number:03d}",
+                sha256="b" * 64,
+            ),
+        ),
+    )
+
+
+def test_dynamodb_history_round_trips_links_metrics_manifest_and_artifacts() -> None:
+    table = FakeTransactionalTable()
+    repository = DynamoDBRunRepository(table=table)
+    expected = history_record(1)
+
+    assert repository.reserve_run(expected) == expected
+    assert repository.get_run(expected.run_id) == expected
+    assert repository.list_runs() == [expected]
+    item = table.items[("HISTORY", "RUN#run-001")]
+    payload = json.loads(str(item["payload"]))
+    assert payload["champion_run_id"] is None
+    assert payload["manifest_sha256"] == "a" * 64
+    assert payload["baseline_metrics"]["per_environment"] == {"WebShop": 0.4}
+    assert payload["artifact_refs"][0]["sha256"] == "b" * 64
+
+
+def test_dynamodb_history_reservation_enforces_cap_and_duplicate_ids_atomically() -> None:
+    table = FakeTransactionalTable()
+    repository = DynamoDBRunRepository(table=table)
+    for number in range(1, 6):
+        repository.reserve_run(history_record(number))
+
+    with pytest.raises(RunLimitExceeded, match="maximum of 5"):
+        repository.reserve_run(history_record(5, "run-overflow"))
+
+    duplicate_table = FakeTransactionalTable()
+    duplicate_repository = DynamoDBRunRepository(table=duplicate_table)
+    duplicate_repository.reserve_run(history_record(1))
+    with pytest.raises(RunAlreadyExistsError, match="run-001"):
+        duplicate_repository.reserve_run(history_record(1))
+
+    transaction = table.meta.client.calls[0]
+    assert len(transaction["TransactItems"]) == 2
+    assert "#run_count < :max_runs" in str(
+        transaction["TransactItems"][0]["Update"]["ConditionExpression"]
+    )
 
 
 def test_dynamodb_updates_require_expected_state_version() -> None:
