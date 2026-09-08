@@ -529,7 +529,12 @@ class S3ObjectiveArtifactStore:
             raise ObjectiveArtifactIntegrityError(
                 "stored dataset crosses the sealed evaluation boundary"
             )
-        return dataset
+        # Rehydrate the manifest with the exact immutable locator recovered
+        # from the durable index so a restarted trainer never falls back to a
+        # mutable unversioned S3 URI.
+        return dataset.model_copy(
+            update={"manifest": dataset.manifest.model_copy(update={"s3_uri": ref.version_ref})}
+        )
 
     def get_dataset_for_curation(self, dataset_id: str) -> Dataset | None:
         """Curation-facing alias that can never retrieve validation/hidden data."""
@@ -540,3 +545,5 @@ class S3ObjectiveArtifactStore:
 # Short aliases make dependency injection readable without weakening the
 # explicit S3 implementation name in operational code.
 ObjectiveArtifactStore = S3ObjectiveArtifactStore
+S3TrajectoryArtifactStore = S3ObjectiveArtifactStore
+ObjectiveTrajectoryArtifactStore = S3ObjectiveArtifactStore

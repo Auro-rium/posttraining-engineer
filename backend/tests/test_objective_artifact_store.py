@@ -220,6 +220,7 @@ def test_dataset_store_excludes_validation_and_hidden_rows_and_returns_exact_uri
 
     assert restored is not None
     assert restored.manifest.dataset_id == dataset.manifest.dataset_id
+    assert "versionId=" in restored.manifest.s3_uri
     assert manifest.s3_uri.startswith("s3://objective-artifacts/objective/datasets/")
     assert "versionId=" not in dataset.manifest.s3_uri
     assert "versionId=" in manifest.s3_uri

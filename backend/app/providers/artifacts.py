@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from re import fullmatch
 from typing import Any, Protocol
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 class OptionalDependencyError(RuntimeError):
@@ -67,7 +67,7 @@ class ArtifactRef:
     def version_ref(self) -> str:
         """Return a stable, serializable S3 reference including version id."""
         if self.version_id:
-            return f"{self.uri}?versionId={self.version_id}"
+            return f"{self.uri}?versionId={quote(self.version_id, safe='')}"
         return self.uri
 
     def to_dict(self) -> dict[str, Any]:

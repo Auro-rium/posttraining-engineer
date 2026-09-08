@@ -1812,17 +1812,24 @@ class AutonomousRunController:
     def _artifact_from_job(self, job: JobResult, kind: ArtifactKind) -> ArtifactReference:
         if not job.artifact_uri or not job.provider_job_id:
             raise LiveExecutionFailed("provider returned no artifact URI or job ID")
-        try:
-            # The source URI must already identify one immutable output version.
-            # SageMaker's mutable output path and its metadata are not evidence.
-            ArtifactRef.from_live_uri(
-                job.artifact_uri,
-                sha256="0" * 64,
-                size_bytes=0,
-            )
-        except (ArtifactIntegrityError, ValueError) as exc:
+        parsed = urlparse(job.artifact_uri)
+        version_values = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
+        if len(version_values) > 1 or (
+            version_values
+            and (not version_values[0] or version_values[0].lower() == "null")
+        ):
             raise LiveExecutionFailed(
                 "provider artifact must be an immutable versioned S3 URI"
+            )
+        try:
+            # Versioned output is parsed strictly.  A normal SageMaker output
+            # may omit VersionId, but only the scoped canonicalizer below may
+            # resolve that mutable path to one exact source version.
+            if version_values:
+                ArtifactRef.from_live_uri(job.artifact_uri, sha256="0" * 64, size_bytes=0)
+        except (ArtifactIntegrityError, ValueError) as exc:
+            raise LiveExecutionFailed(
+                "provider artifact must be a valid S3 output URI"
             ) from exc
 
         canonicalize = getattr(self.artifact_store, "canonicalize_sagemaker_output", None)

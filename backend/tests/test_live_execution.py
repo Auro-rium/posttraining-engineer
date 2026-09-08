@@ -267,11 +267,12 @@ def _training_artifact_job(uri: str) -> JobResult:
 @pytest.mark.parametrize(
     "uri",
     [
-        "s3://demo-bucket/post-training/run-1/model.tar.gz",
         "s3://demo-bucket/post-training/run-1/model.tar.gz?versionId=source-v1&versionId=source-v2",
+        "s3://demo-bucket/post-training/run-1/model.tar.gz?versionId=",
+        "s3://demo-bucket/post-training/run-1/model.tar.gz?versionId=null",
     ],
 )
-def test_live_artifact_path_rejects_versionless_or_duplicate_version_uri(
+def test_live_artifact_path_rejects_duplicate_blank_or_null_version_uri(
     uri: str,
 ) -> None:
     client = _LiveArtifactS3(b"checkpoint bytes")
@@ -280,6 +281,20 @@ def test_live_artifact_path_rejects_versionless_or_duplicate_version_uri(
     with pytest.raises(LiveExecutionFailed, match=r"immutable.*versioned"):
         controller._artifact_from_job(_training_artifact_job(uri), ArtifactKind.CHECKPOINT)
     assert client.calls == []
+
+
+def test_live_artifact_path_allows_scoped_versionless_output_at_canonicalization_boundary() -> None:
+    data = b"checkpoint bytes"
+    client = _LiveArtifactS3(data)
+    controller = _artifact_controller(client)
+
+    artifact = controller._artifact_from_job(
+        _training_artifact_job("s3://demo-bucket/post-training/run-1/model.tar.gz"),
+        ArtifactKind.CHECKPOINT,
+    )
+
+    assert artifact.uri.startswith("s3://demo-bucket/post-training/checkpoints/")
+    assert "versionId=retained-v1" in artifact.uri
 
 
 def test_live_artifact_path_downloads_exact_bytes_and_returns_retained_reference() -> None:

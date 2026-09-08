@@ -341,6 +341,42 @@ def test_live_uri_parser_requires_one_nonblank_version_id() -> None:
             )
 
 
+def test_version_ref_round_trips_opaque_version_id() -> None:
+    data = b"archive"
+    version_id = "opaque+value &percent%"
+    ref = ArtifactRef(
+        bucket="artifacts",
+        key="checkpoints/model.tar.gz",
+        sha256=hashlib.sha256(data).hexdigest(),
+        size_bytes=len(data),
+        version_id=version_id,
+    )
+
+    assert "%2B" in ref.version_ref
+    assert "%26" in ref.version_ref
+    assert "%25" in ref.version_ref
+    parsed = ArtifactRef.from_live_uri(
+        ref.version_ref,
+        sha256=ref.sha256,
+        size_bytes=ref.size_bytes,
+    )
+    assert parsed.version_id == version_id
+
+
+def test_canonicalize_rejects_source_policy_before_any_s3_read() -> None:
+    client = _VersionedS3()
+    store = S3ArtifactStore("artifacts", client=client, prefix="retained")
+
+    with pytest.raises(ArtifactIntegrityError, match="allowed source bucket"):
+        store.canonicalize_sagemaker_output(
+            "s3://other/jobs/run-1/model.tar.gz",
+            retained_prefix="checkpoints/run-1",
+            allowed_source_bucket="artifacts",
+            allowed_source_prefix="jobs/run-1",
+        )
+    assert client.calls == []
+
+
 @pytest.mark.parametrize("value", ["runs/../model", "runs//model", "runs/./model", "runs/model\n"])
 def test_artifact_paths_reject_dot_empty_and_control_segments(value: str) -> None:
     store = S3ArtifactStore("artifacts", client=_VersionedS3())
