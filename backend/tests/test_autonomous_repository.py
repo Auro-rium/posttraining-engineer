@@ -444,6 +444,61 @@ def test_event_contract_rejects_raw_content_and_nested_contracts_are_immutable()
         state.metadata["raw"] = "trajectory text"
 
 
+def test_event_reason_accepts_safe_lifecycle_phrases() -> None:
+    for reason in (
+        "provider request timed out",
+        "safe stop requested",
+        "run completed",
+        "provider job failed",
+    ):
+        event = RunEventRecord(
+            run_id="run-1",
+            sequence=1,
+            event_type="x",
+            to_status=AutonomousRunStatus.QUEUED,
+            to_phase=RunPhase.QUEUED,
+            reason=reason,
+        )
+        assert event.reason == reason
+
+
+def test_event_metadata_requires_finite_numbers_and_allows_opaque_artifact_paths() -> None:
+    event = RunEventRecord(
+        run_id="run-1",
+        sequence=1,
+        event_type="x",
+        to_status=AutonomousRunStatus.QUEUED,
+        to_phase=RunPhase.QUEUED,
+        reason="queued",
+        metadata={
+            "artifact_id": "s3://bucket/trajectory-123",
+            "cost_usd": "1.25",
+            "latency_ms": "10",
+        },
+    )
+    assert event.metadata["artifact_id"] == "s3://bucket/trajectory-123"
+    for key, value in (("cost_usd", "NaN"), ("latency_ms", "Infinity")):
+        with pytest.raises(ValueError):
+            RunEventRecord(
+                run_id="run-1",
+                sequence=1,
+                event_type="x",
+                to_status=AutonomousRunStatus.QUEUED,
+                to_phase=RunPhase.QUEUED,
+                reason="queued",
+                metadata={key: value},
+            )
+
+
+def test_recovery_final_page_does_not_advertise_spurious_cursor() -> None:
+    table = StubDynamoTable()
+    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_run()))
+    repository = DynamoDBAutonomousRunRepository(table=table)
+    page = repository.scan_recoverable(limit=1)
+    assert len(page.items) == 1
+    assert page.next_cursor is None
+
+
 def test_recovery_scan_rejects_zero_limit_and_returns_cursor_for_physical_pages() -> None:
     table = StubDynamoTable()
     for index in range(3):

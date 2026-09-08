@@ -19,14 +19,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-fA-F]{40}$")
 _UNSAFE_CONTENT = re.compile(
-    r"(?:raw\s+prompt|raw\s+content|full\s+text|trajectory\b|hidden\b|secret\b|task\s+content)",
+    r"(?:raw\s+prompt|raw\s+content|full\s+text|trajectory\b|hidden\b|secret\b|"
+    r"task\s+content|private\b|answer\b|response\b|completion\b)",
     re.IGNORECASE,
 )
-_SAFE_REASON_WORDS = frozenset(
-    "approval packet consumed stale worker started queued tick baseline failure analysis research "
-    "curation training checkpoint validation evaluation promotion promoted rejected succeeded "
-    "failed blocked cancelled cancel safe stop lease claimed renewed released operation submitted "
-    "provider experiment phase transition request completed available unavailable".split()
+_CONTROL_REASON_WORDS = frozenset(
+    "approval packet stale worker queued baseline failure analysis research curation training "
+    "checkpoint validation evaluation promotion promoted rejected succeeded failed blocked "
+    "cancelled cancel safe stop lease claimed renewed released operation submitted provider "
+    "experiment phase transition request completed available unavailable run job timed out "
+    "started requested tick".split()
 )
 _OPAQUE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/#@+\-]{0,511}$")
 
@@ -93,7 +95,7 @@ def _validate_event_metadata(value: dict[str, str]) -> FrozenDict:
         if (
             not item.strip()
             or len(item) > 512
-            or _UNSAFE_CONTENT.search(item)
+            or (_UNSAFE_CONTENT.search(item) and key != "artifact_id")
             or not _OPAQUE_VALUE.fullmatch(item)
         ):
             raise ValueError("event metadata must contain only safe opaque references")
@@ -103,15 +105,15 @@ def _validate_event_metadata(value: dict[str, str]) -> FrozenDict:
             raise ValueError("event status metadata must use a known run status")
         if key == "phase" and item not in {phase.value for phase in RunPhase}:
             raise ValueError("event phase metadata must use a known run phase")
-        if key == "evidence_label" and item not in {
-            "LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"
-        }:
+        if key == "evidence_label" and item not in {"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"}:
             raise ValueError("event evidence label metadata is invalid")
         if key in {"cost_usd", "latency_ms"}:
             try:
-                float(item)
+                numeric = float(item)
             except ValueError as exc:
                 raise ValueError(f"event metadata {key!r} must be numeric") from exc
+            if not isfinite(numeric):
+                raise ValueError(f"event metadata {key!r} must be finite")
     return FrozenDict(value)
 
 
@@ -288,8 +290,8 @@ class RunEventRecord(ContractModel):
     @classmethod
     def reject_unsafe_reason(cls, value: str) -> str:
         words = re.findall(r"[a-z0-9]+", value.lower())
-        if _UNSAFE_CONTENT.search(value) or any(
-            word not in _SAFE_REASON_WORDS and not word.isdigit() for word in words
+        if _UNSAFE_CONTENT.search(value) or not any(
+            word in _CONTROL_REASON_WORDS for word in words
         ):
             raise ValueError("event reason may not contain raw or sealed content")
         return value

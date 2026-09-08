@@ -1021,7 +1021,7 @@ class DynamoDBAutonomousRunRepository:
                     if len(output) >= limit:
                         break
             raw_cursor = response.get("LastEvaluatedKey")
-            if len(output) >= limit and page_cursor is not None:
+            if len(output) >= limit and page_cursor is not None and isinstance(raw_cursor, Mapping):
                 next_cursor = page_cursor
             else:
                 next_cursor = dict(raw_cursor) if isinstance(raw_cursor, Mapping) else None
