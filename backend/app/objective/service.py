@@ -254,6 +254,11 @@ def create_objective_app(
     def verify_curation(request: CurationRequest) -> CurationResponse:
         return service.verify_curation(request)
 
+    @app.get("/v1/auth-probe", dependencies=[Depends(auth)])
+    def auth_probe() -> dict[str, str]:
+        """Return a stable, metadata-only response after auth succeeds."""
+        return {"status": "authenticated", "service": "objective-worker"}
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "healthy", "service": "objective-worker"}

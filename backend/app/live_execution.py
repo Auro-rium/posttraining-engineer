@@ -22,7 +22,6 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from math import isfinite
 from typing import Any, Protocol
-from urllib.error import HTTPError
 from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -49,7 +48,12 @@ from app.posttraining.run_history import (
     RunHistoryRecord,
     RunStatus,
 )
-from app.providers.artifacts import ArtifactRef, ArtifactStore, S3ArtifactStore
+from app.providers.artifacts import (
+    ArtifactIntegrityError,
+    ArtifactRef,
+    ArtifactStore,
+    S3ArtifactStore,
+)
 from app.providers.repository import DynamoDBRunRepository
 from app.providers.sagemaker import (
     EvaluationJobRequest,
@@ -962,41 +966,19 @@ def _verify_objective_worker_auth(
     timeout: float,
     headers: Mapping[str, str],
 ) -> None:
-    """Prove the worker accepted auth using a validation-only protected call.
+    """Prove worker auth with its dedicated read-only probe endpoint."""
 
-    The worker's health route is intentionally lightweight and may be exposed
-    without authentication.  A malformed curation request reaches the auth
-    dependency before body validation: HTTP 422 therefore proves the supplied
-    credentials were accepted, while HTTP 401 proves they were rejected.  No
-    curation or artifact operation runs for this probe.
-    """
-
-    try:
-        _http_json(
-            urljoin(base_url, "v1/verify-curation"),
-            method="POST",
-            timeout=timeout,
-            headers=headers,
-            payload={
-                "run_id": "preflight-auth-probe",
-                "experiment_id": "preflight-auth-probe",
-                "split": "invalid",
-                "trajectories": [],
-            },
-        )
-    except HTTPError as exc:
-        if exc.code == 422:
-            return
-        if exc.code == 401:
-            raise LiveExecutionBlocked(
-                "objective worker authentication was rejected",
-                classification=PreflightClassification.BLOCKED_CONFIGURATION,
-            ) from None
-        raise
-    raise LiveExecutionBlocked(
-        "objective worker protected endpoint did not enforce authentication",
-        classification=PreflightClassification.BLOCKED_CONFIGURATION,
+    response = _http_json(
+        urljoin(base_url, "v1/auth-probe"),
+        method="GET",
+        timeout=timeout,
+        headers=headers,
     )
+    if response != {"status": "authenticated", "service": "objective-worker"}:
+        raise LiveExecutionBlocked(
+            "objective worker authentication probe returned an unexpected response",
+            classification=PreflightClassification.BLOCKED_CONFIGURATION,
+        )
 
 
 class ObjectiveWorkerClient:
@@ -1830,22 +1812,54 @@ class AutonomousRunController:
     def _artifact_from_job(self, job: JobResult, kind: ArtifactKind) -> ArtifactReference:
         if not job.artifact_uri or not job.provider_job_id:
             raise LiveExecutionFailed("provider returned no artifact URI or job ID")
-        parsed = urlparse(job.artifact_uri)
-        if parsed.scheme != "s3":
-            raise LiveExecutionFailed("provider artifact is not an S3 URI")
-        head = getattr(self.artifact_store, "head", None)
-        if not callable(head):
-            raise LiveExecutionFailed("artifact store cannot verify provider artifact metadata")
-        ref = ArtifactRef.from_uri(job.artifact_uri, sha256="0" * 64)
-        metadata = head(ref).get("Metadata", {})
-        digest = str(metadata.get("sha256", "")) if isinstance(metadata, Mapping) else ""
-        if not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise LiveExecutionFailed("provider artifact has no verified SHA-256 metadata")
+        try:
+            # The source URI must already identify one immutable output version.
+            # SageMaker's mutable output path and its metadata are not evidence.
+            ArtifactRef.from_live_uri(
+                job.artifact_uri,
+                sha256="0" * 64,
+                size_bytes=0,
+            )
+        except (ArtifactIntegrityError, ValueError) as exc:
+            raise LiveExecutionFailed(
+                "provider artifact must be an immutable versioned S3 URI"
+            ) from exc
+
+        canonicalize = getattr(self.artifact_store, "canonicalize_sagemaker_output", None)
+        verify = getattr(self.artifact_store, "verify_immutable", None)
+        if not callable(canonicalize) or not callable(verify):
+            raise LiveExecutionFailed(
+                "artifact store cannot verify and retain provider artifacts"
+            )
+        try:
+            retained = canonicalize(
+                job.artifact_uri,
+                retained_prefix="checkpoints",
+                allowed_source_bucket=self.config.artifact_bucket,
+                allowed_source_prefix=self.config.artifact_prefix,
+            )
+            verified = verify(
+                retained,
+                expected_sha256=retained.sha256,
+                expected_size_bytes=retained.size_bytes,
+                allowed_bucket=self.config.artifact_bucket,
+                allowed_prefix=self.config.artifact_prefix,
+            )
+            ArtifactRef.from_live_uri(
+                verified.version_ref,
+                sha256=verified.sha256,
+                size_bytes=verified.size_bytes,
+            )
+        except (ArtifactIntegrityError, ValueError, TypeError, AttributeError) as exc:
+            raise LiveExecutionFailed(
+                "provider artifact failed immutable integrity verification"
+            ) from exc
         return ArtifactReference(
-            artifact_id=hashlib.sha256(job.artifact_uri.encode()).hexdigest()[:24],
+            artifact_id=hashlib.sha256(verified.version_ref.encode()).hexdigest()[:24],
             kind=kind,
-            uri=job.artifact_uri,
-            sha256=digest,
+            uri=verified.version_ref,
+            sha256=verified.sha256,
+            size_bytes=verified.size_bytes,
             metadata={"provider_job_id": str(job.provider_job_id)},
         )
 

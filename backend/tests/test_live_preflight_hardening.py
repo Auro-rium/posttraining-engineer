@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from email.message import Message
 from typing import Any
-from urllib.error import HTTPError
 
 import pytest
 
@@ -106,8 +104,8 @@ def test_objective_worker_health_requires_bearer_auth_without_exposing_token(
 
     def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
         requests.append({"url": url, **kwargs})
-        if url.endswith("v1/verify-curation"):
-            raise HTTPError(url, 422, "invalid probe body", Message(), None)
+        if url.endswith("v1/auth-probe"):
+            return {"status": "authenticated", "service": "objective-worker"}
         return {"status": "healthy"}
 
     monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
@@ -132,8 +130,8 @@ def test_preflight_proves_worker_token_with_protected_non_mutating_endpoint(
 
     def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
         requests.append({"url": url, **kwargs})
-        if url.endswith("v1/verify-curation"):
-            raise HTTPError(url, 422, "invalid probe body", Message(), None)
+        if url.endswith("v1/auth-probe"):
+            return {"status": "authenticated", "service": "objective-worker"}
         return {"status": "healthy"}
 
     monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
@@ -148,8 +146,8 @@ def test_preflight_rejects_worker_token_when_protected_probe_returns_unauthorize
 ) -> None:
     def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
         del kwargs
-        if url.endswith("v1/verify-curation"):
-            raise HTTPError(url, 401, "unauthorized", Message(), None)
+        if url.endswith("v1/auth-probe"):
+            return {"status": "unauthorized", "service": "objective-worker"}
         return {"status": "healthy"}
 
     monkeypatch.setattr(live_execution, "_http_json", fake_http_json)

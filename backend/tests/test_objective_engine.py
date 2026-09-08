@@ -224,6 +224,19 @@ def test_objective_service_requires_auth_and_rejects_hidden_split() -> None:
     assert "adapter" in response.text
 
 
+def test_objective_auth_probe_requires_token_and_returns_stable_read_only_response() -> None:
+    client = TestClient(create_objective_app(ServiceRecoveryEngine(seed=1), auth_token="secret"))
+
+    missing = client.get("/v1/auth-probe")
+    wrong = client.get("/v1/auth-probe", headers={"authorization": "Bearer wrong"})
+    valid = client.get("/v1/auth-probe", headers={"authorization": "Bearer secret"})
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert valid.status_code == 200
+    assert valid.json() == {"status": "authenticated", "service": "objective-worker"}
+
+
 def test_benchmark_requires_an_injected_execution_adapter() -> None:
     class Adapter:
         def execute_benchmark(

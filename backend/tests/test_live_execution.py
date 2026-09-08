@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from base64 import urlsafe_b64decode, urlsafe_b64encode
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -27,6 +29,7 @@ from app.observability import TelemetryRecorder
 from app.posttraining.models import ArtifactKind, ArtifactReference, EvidenceLabel
 from app.posttraining.objective_workflow import ObjectiveBenchmarkRequest, ObjectiveBenchmarkResult
 from app.posttraining.run_history import BenchmarkMetrics, RunHistoryRecord
+from app.providers.artifacts import S3ArtifactStore
 from app.providers.sagemaker import JobResult, JobStatus
 
 
@@ -175,6 +178,145 @@ def _controller(**overrides: object) -> AutonomousRunController:
         artifact_store=cast(Any, object()),
         slots=cast(Any, object()),
     )
+
+
+class _LiveBody:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def read(self) -> bytes:
+        return self.data
+
+
+class _LiveArtifactS3:
+    def __init__(self, source: bytes, *, source_digest: str | None = None) -> None:
+        self.source = source
+        self.source_digest = source_digest or hashlib.sha256(source).hexdigest()
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.retained: tuple[bytes, dict[str, str]] | None = None
+        self.tamper_retained = False
+
+    def head_object(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("head_object", kwargs))
+        if str(kwargs["Key"]).startswith("post-training/checkpoints/"):
+            if self.retained is None:
+                raise KeyError("retained object not written")
+            data, metadata = self.retained
+            return {
+                "Metadata": metadata,
+                "ContentLength": len(data),
+                "VersionId": "retained-v1",
+                "ContentType": "application/gzip",
+            }
+        return {
+            "Metadata": {"sha256": self.source_digest},
+            "ContentLength": len(self.source),
+            "VersionId": "source-v1",
+            "ContentType": "application/gzip",
+        }
+
+    def get_object(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("get_object", kwargs))
+        if str(kwargs["Key"]).startswith("post-training/checkpoints/"):
+            if self.retained is None:
+                raise KeyError("retained object not written")
+            data, metadata = self.retained
+            if self.tamper_retained:
+                data = b"tampered retained bytes"
+            return {
+                "Body": _LiveBody(data),
+                "Metadata": metadata,
+                "ContentLength": len(data),
+                "VersionId": "retained-v1",
+            }
+        return {
+            "Body": _LiveBody(self.source),
+            "Metadata": {"sha256": self.source_digest},
+            "ContentLength": len(self.source),
+            "VersionId": "source-v1",
+        }
+
+    def put_object(self, **kwargs: object) -> dict[str, str]:
+        self.calls.append(("put_object", kwargs))
+        self.retained = (
+            bytes(cast(bytes, kwargs["Body"])),
+            dict(cast(Mapping[str, str], kwargs["Metadata"])),
+        )
+        return {"VersionId": "retained-v1", "ETag": '"retained"'}
+
+
+def _artifact_controller(client: _LiveArtifactS3) -> AutonomousRunController:
+    return AutonomousRunController(
+        config=_config(artifact_prefix="post-training"),
+        objective_worker=object(),
+        provider=cast(Any, object()),
+        artifact_store=S3ArtifactStore("demo-bucket", client=client, prefix="post-training"),
+        slots=cast(Any, object()),
+    )
+
+
+def _training_artifact_job(uri: str) -> JobResult:
+    return JobResult(
+        job_name="train-1",
+        provider_job_id="arn:aws:sagemaker:us-east-1:123:training-job/train-1",
+        status=JobStatus.COMPLETED,
+        artifact_uri=uri,
+    )
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "s3://demo-bucket/post-training/run-1/model.tar.gz",
+        "s3://demo-bucket/post-training/run-1/model.tar.gz?versionId=source-v1&versionId=source-v2",
+    ],
+)
+def test_live_artifact_path_rejects_versionless_or_duplicate_version_uri(
+    uri: str,
+) -> None:
+    client = _LiveArtifactS3(b"checkpoint bytes")
+    controller = _artifact_controller(client)
+
+    with pytest.raises(LiveExecutionFailed, match=r"immutable.*versioned"):
+        controller._artifact_from_job(_training_artifact_job(uri), ArtifactKind.CHECKPOINT)
+    assert client.calls == []
+
+
+def test_live_artifact_path_downloads_exact_bytes_and_returns_retained_reference() -> None:
+    data = b"checkpoint bytes"
+    client = _LiveArtifactS3(data)
+    controller = _artifact_controller(client)
+
+    artifact = controller._artifact_from_job(
+        _training_artifact_job(
+            "s3://demo-bucket/post-training/run-1/model.tar.gz?versionId=source-v1"
+        ),
+        ArtifactKind.CHECKPOINT,
+    )
+
+    digest = hashlib.sha256(data).hexdigest()
+    assert artifact.uri.startswith("s3://demo-bucket/post-training/checkpoints/")
+    assert "versionId=retained-v1" in artifact.uri
+    assert artifact.sha256 == digest
+    assert artifact.size_bytes == len(data)
+    assert any(name == "put_object" for name, _ in client.calls)
+    get_calls = [kwargs for name, kwargs in client.calls if name == "get_object"]
+    assert get_calls
+    assert all(call["VersionId"] in {"source-v1", "retained-v1"} for call in get_calls)
+
+
+def test_live_artifact_path_fails_on_retained_byte_hash_mismatch() -> None:
+    client = _LiveArtifactS3(b"checkpoint bytes")
+    client.tamper_retained = True
+    controller = _artifact_controller(client)
+
+    with pytest.raises(LiveExecutionFailed, match="integrity"):
+        controller._artifact_from_job(
+            _training_artifact_job(
+                "s3://demo-bucket/post-training/run-1/model.tar.gz?versionId=source-v1"
+            ),
+            ArtifactKind.CHECKPOINT,
+        )
 
 
 def _champion_record(*, kind: ArtifactKind = ArtifactKind.CHECKPOINT) -> RunHistoryRecord:
