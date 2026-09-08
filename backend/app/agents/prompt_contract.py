@@ -10,6 +10,7 @@ different model or from emitting an untraceable system prompt.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -146,6 +147,23 @@ HANDOFF DISCIPLINE
 Use stable IDs supplied by the coordinator. Keep numerical precision from provider results. State what you
 observed, what you inferred, and what remains unknown. A safe BLOCKED result is better than a plausible story.
 """
+
+    def render_handoff(self, payload: Mapping[str, Any]) -> str:
+        """Render the contract together with a JSON-only typed handoff.
+
+        Agent adapters use this method for the user message sent to Nemotron.
+        Keeping the context as canonical JSON makes prior experiment evidence
+        visible to the model while preventing a caller from accidentally
+        switching to an unstructured, unreviewable prompt.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("handoff payload must be a mapping")
+        try:
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("handoff payload must contain JSON-serializable values") from exc
+        return f"{self.render()}\nHANDOFF INPUT (JSON)\n{encoded}\n"
 
     @property
     def prompt(self) -> str:
