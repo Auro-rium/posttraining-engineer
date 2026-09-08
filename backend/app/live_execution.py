@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from math import isfinite
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -61,7 +61,11 @@ from app.providers.sagemaker import (
 NEMOTRON_MODEL_ID = "nvidia.nemotron-super-3-120b"
 _SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ECR_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_ECR_REGISTRY = re.compile(
+    r"^(?P<account>[0-9]{12})\.dkr\.ecr\.(?P<region>[a-z0-9-]+)\.amazonaws\.com$"
+)
 
 
 class LiveExecutionBlocked(RuntimeError):
@@ -250,6 +254,7 @@ class LiveExecutionConfig(BaseModel):
     training_image: str
     evaluation_image: str
     objective_worker_url: str
+    objective_worker_auth_token: str | None = Field(default=None, repr=False)
     hf_repo_id: str
     hf_revision: str
     target_model: str = "google/functiongemma-270m-it"
@@ -451,7 +456,20 @@ class PreflightRunner:
             import boto3  # type: ignore[import-untyped]
         except ImportError as exc:  # pragma: no cover
             raise LiveExecutionBlocked("boto3 is required for AWS preflight") from exc
-        client = boto3.client(name, region_name=self.config.aws_region)
+        kwargs: dict[str, Any] = {"region_name": self.config.aws_region}
+        if name in {"bedrock", "bedrock-runtime"}:
+            try:
+                from botocore.config import Config  # type: ignore[import-untyped]
+            except ImportError as exc:  # pragma: no cover
+                raise LiveExecutionBlocked(
+                    "botocore is required for SigV4 Bedrock preflight",
+                    classification=PreflightClassification.BLOCKED_PROVIDER,
+                ) from exc
+            # Explicitly select IAM/SigV4 for both catalog and runtime clients.
+            # This remains deterministic if AWS_BEARER_TOKEN_BEDROCK is set to
+            # a stale or otherwise contaminated value in the process environment.
+            kwargs["config"] = Config(signature_version="v4")
+        client = boto3.client(name, **kwargs)
         self.clients[name] = client
         return client
 
@@ -544,6 +562,11 @@ class PreflightRunner:
                     f"of ${self.config.max_cost_usd:.2f}"
                 ),
                 metadata={"currency": "USD"},
+                classification=(
+                    None
+                    if self.config.estimated_worst_case_cost_usd <= self.config.max_cost_usd
+                    else PreflightClassification.BLOCKED_CONFIGURATION
+                ),
             )
         )
         blocked_classifications = tuple(
@@ -598,10 +621,40 @@ class PreflightRunner:
     def _check_s3_readiness(self) -> Mapping[str, Any]:
         client = self._client("s3")
         client.head_bucket(Bucket=self.config.artifact_bucket)
+        location = client.get_bucket_location(Bucket=self.config.artifact_bucket).get(
+            "LocationConstraint"
+        )
+        bucket_region = "us-east-1" if location in (None, "", "EU") else str(location)
+        if bucket_region != self.config.aws_region:
+            raise LiveExecutionBlocked(
+                "S3 artifact bucket region does not match AWS_REGION",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        encryption = client.get_bucket_encryption(Bucket=self.config.artifact_bucket)
+        rules = encryption.get("ServerSideEncryptionConfiguration", {}).get("Rules", [])
+        algorithms = {
+            str(rule.get("ApplyServerSideEncryptionByDefault", {}).get("SSEAlgorithm", ""))
+            for rule in rules
+            if isinstance(rule, Mapping)
+        }
+        supported_encryption = algorithms.intersection({"AES256", "aws:kms"})
+        if not supported_encryption:
+            raise LiveExecutionBlocked(
+                "S3 artifact bucket encryption is not SSE-S3 or SSE-KMS",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
         versioning = client.get_bucket_versioning(Bucket=self.config.artifact_bucket)
         if versioning.get("Status") != "Enabled":
-            raise ValueError("S3 bucket versioning is not enabled")
-        return {"bucket": self.config.artifact_bucket, "versioning": "Enabled"}
+            raise LiveExecutionBlocked(
+                "S3 bucket versioning is not enabled",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        return {
+            "bucket": self.config.artifact_bucket,
+            "region": bucket_region,
+            "encryption": sorted(supported_encryption)[0],
+            "versioning": "Enabled",
+        }
 
     def _check_checkpoint_readiness(self) -> Mapping[str, Any]:
         uri = self.config.checkpoint_s3_uri
@@ -617,9 +670,17 @@ class PreflightRunner:
                 "checkpoint_s3_uri must be an s3:// URI",
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
+        version_values = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
+        if len(version_values) != 1 or not version_values[0] or version_values[0] == "null":
+            raise LiveExecutionBlocked(
+                "checkpoint_s3_uri must include one immutable versionId",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        version_id = version_values[0]
         response = self._client("s3").head_object(
             Bucket=parsed.netloc,
             Key=parsed.path.lstrip("/"),
+            VersionId=version_id,
         )
         metadata = response.get("Metadata", {})
         observed = str(metadata.get("sha256", "")) if isinstance(metadata, Mapping) else ""
@@ -628,26 +689,36 @@ class PreflightRunner:
                 "checkpoint S3 metadata digest does not match CHECKPOINT_SHA256",
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
-        version_id = response.get("VersionId")
-        if not version_id:
+        observed_version_id = response.get("VersionId")
+        if not observed_version_id or str(observed_version_id) != version_id:
             raise LiveExecutionBlocked(
-                "checkpoint artifact has no S3 version id",
+                "checkpoint artifact version identity could not be verified",
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
         return {
             "checkpoint": "verified",
-            "version_id": str(version_id),
+            "version_id": version_id,
         }
 
     def _check_bedrock_readiness(self) -> Mapping[str, Any]:
         response = self._client("bedrock").get_foundation_model(
             modelIdentifier=NEMOTRON_MODEL_ID
         )
+        if not isinstance(response, Mapping):
+            raise ValueError("Bedrock catalog returned an invalid response")
         summary = response.get("modelDetails", {})
+        runtime_response = self._client("bedrock-runtime").converse(
+            modelId=NEMOTRON_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": "Reply with OK."}]}],
+            inferenceConfig={"maxTokens": 1, "temperature": 0.0},
+        )
+        if not isinstance(runtime_response, Mapping) or not runtime_response.get("output"):
+            raise ValueError("Bedrock Nemotron runtime probe returned no output")
         return {
             "model_id": NEMOTRON_MODEL_ID,
             "region": self.config.aws_region,
             "provider": str(summary.get("providerName", "unknown")),
+            "invocation": "verified",
         }
 
     def _check_dynamodb_readiness(self) -> Mapping[str, Any]:
@@ -658,14 +729,81 @@ class PreflightRunner:
         return {"table": self.config.dynamodb_table, "status": str(table.get("TableStatus"))}
 
     def _check_sagemaker_readiness(self) -> Mapping[str, Any]:
+        identity = self._client("sts").get_caller_identity()
+        account_id = str(identity.get("Account", ""))
+        if not re.fullmatch(r"[0-9]{12}", account_id):
+            raise LiveExecutionBlocked(
+                "AWS identity did not return an account id",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        role_match = re.match(
+            r"^arn:aws:iam::(?P<account>[0-9]{12}):role/.+$", self.config.training_role_arn
+        )
+        if role_match is None or role_match.group("account") != account_id:
+            raise LiveExecutionBlocked(
+                "SageMaker training role is not owned by the active AWS account",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
         self._client("iam").get_role(RoleName=self.config.training_role_arn.rsplit("/", 1)[-1])
         ecr = self._client("ecr")
         for image in (self.config.training_image, self.config.evaluation_image):
-            parsed = image.split("/", 1)
-            if len(parsed) != 2:
-                raise ValueError("image URI must include an ECR registry and repository")
-            repository, tag = parsed[1].split(":", 1) if ":" in parsed[1] else (parsed[1], "latest")
-            ecr.describe_images(repositoryName=repository, imageIds=[{"imageTag": tag}])
+            image_match = re.match(
+                r"^(?P<registry>[^/]+)/(?P<repository>[^@]+)@"
+                r"(?P<digest>sha256:[0-9a-f]{64})$",
+                image,
+            )
+            if image_match is None or not _ECR_DIGEST.fullmatch(image_match.group("digest")):
+                raise LiveExecutionBlocked(
+                    "SageMaker images must be digest-pinned ECR images",
+                    classification=PreflightClassification.BLOCKED_CONFIGURATION,
+                )
+            registry = image_match.group("registry")
+            registry_match = _ECR_REGISTRY.fullmatch(registry)
+            if registry_match is None:
+                raise LiveExecutionBlocked(
+                    "SageMaker image registry is not an AWS ECR registry",
+                    classification=PreflightClassification.BLOCKED_CONFIGURATION,
+                )
+            if registry_match.group("account") != account_id:
+                raise LiveExecutionBlocked(
+                    "SageMaker image ECR account is not owned by the active AWS account",
+                    classification=PreflightClassification.BLOCKED_CONFIGURATION,
+                )
+            if registry_match.group("region") != self.config.aws_region:
+                raise LiveExecutionBlocked(
+                    "SageMaker image ECR region does not match AWS_REGION",
+                    classification=PreflightClassification.BLOCKED_CONFIGURATION,
+                )
+            repository = image_match.group("repository")
+            digest = image_match.group("digest")
+            result = ecr.describe_images(
+                repositoryName=repository,
+                imageIds=[{"imageDigest": digest}],
+            )
+            details = result.get("imageDetails", [])
+            if not isinstance(details, list) or not details:
+                raise LiveExecutionBlocked(
+                    "digest-pinned ECR image was not found",
+                    classification=PreflightClassification.BLOCKED_CONFIGURATION,
+                )
+            detail = details[0]
+            if not isinstance(detail, Mapping):
+                raise ValueError("ECR image metadata is invalid")
+            if str(detail.get("imageDigest", "")) != digest:
+                raise LiveExecutionBlocked(
+                    "ECR image digest identity did not match the requested digest",
+                    classification=PreflightClassification.BLOCKED_CONFIGURATION,
+                )
+            if str(detail.get("repositoryName", "")) != repository:
+                raise LiveExecutionBlocked(
+                    "ECR image repository identity did not match the requested repository",
+                    classification=PreflightClassification.BLOCKED_CONFIGURATION,
+                )
+            if str(detail.get("registryId", "")) != account_id:
+                raise LiveExecutionBlocked(
+                    "ECR image registry ownership could not be verified",
+                    classification=PreflightClassification.BLOCKED_CONFIGURATION,
+                )
         # There is no read-only SageMaker API that reserves on-demand
         # capacity.  GPU allowlist/quota checks below provide the safe,
         # non-mutating readiness signal; create_training_job remains the final
@@ -754,10 +892,17 @@ class PreflightRunner:
         )
 
     def _check_worker_readiness(self) -> Mapping[str, Any]:
+        token = self.config.objective_worker_auth_token
+        if not token:
+            raise LiveExecutionBlocked(
+                "objective worker authentication token is required",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
         response = _http_json(
             urljoin(self.config.objective_worker_url, "health"),
             method="GET",
             timeout=self.config.preflight_timeout_seconds,
+            headers={"Authorization": f"Bearer {token}"},
         )
         if not isinstance(response, Mapping) or str(response.get("status", "")).lower() not in {
             "ok",
@@ -774,13 +919,16 @@ def _http_json(
     method: str,
     payload: Mapping[str, Any] | None = None,
     timeout: float,
+    headers: Mapping[str, str] | None = None,
 ) -> Any:
     data = None
-    headers = {"Accept": "application/json"}
+    request_headers = {"Accept": "application/json"}
+    if headers is not None:
+        request_headers.update(headers)
     if payload is not None:
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = Request(url, data=data, headers=headers, method=method)
+        request_headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=request_headers, method=method)
     with urlopen(request, timeout=timeout) as response:
         body = response.read()
     if not body:
@@ -791,18 +939,49 @@ def _http_json(
 class ObjectiveWorkerClient:
     """HTTP adapter for the isolated objective worker; no local fallback."""
 
-    def __init__(self, base_url: str, *, timeout_seconds: float = 120.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        auth_token: str | None = None,
+        timeout_seconds: float = 120.0,
+    ) -> None:
         parsed = urlparse(base_url)
         if parsed.scheme != "https" or not parsed.netloc:
             raise ValueError("objective worker URL must be HTTPS")
         self.base_url = base_url.rstrip("/") + "/"
+        if auth_token is not None and not auth_token.strip():
+            raise ValueError("objective worker auth token must not be empty")
+        self._auth_token = auth_token
         self.timeout_seconds = timeout_seconds
+
+    def _headers(self) -> dict[str, str]:
+        if not self._auth_token:
+            raise LiveExecutionBlocked(
+                "objective worker authentication token is required",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        return {"Authorization": f"Bearer {self._auth_token}"}
+
+    def health(self) -> Mapping[str, Any]:
+        response = _http_json(
+            urljoin(self.base_url, "health"),
+            method="GET",
+            timeout=self.timeout_seconds,
+            headers=self._headers(),
+        )
+        if not isinstance(response, Mapping):
+            raise LiveExecutionFailed("objective worker returned a non-object health response")
+        if str(response.get("status", "")).lower() not in {"ok", "ready", "healthy"}:
+            raise LiveExecutionFailed("objective worker did not report ready")
+        return response
 
     def execute_benchmark(self, request: ObjectiveBenchmarkRequest) -> ObjectiveBenchmarkResult:
         response = _http_json(
             urljoin(self.base_url, "v1/benchmark"),
             method="POST",
             timeout=self.timeout_seconds,
+            headers=self._headers(),
             payload=request.model_dump(mode="json"),
         )
         if not isinstance(response, Mapping):
@@ -825,6 +1004,7 @@ class ObjectiveWorkerClient:
             urljoin(self.base_url, "v1/evaluate"),
             method="POST",
             timeout=self.timeout_seconds,
+            headers=self._headers(),
             payload={
                 "run_id": run_id,
                 "model_uri": model_uri,
@@ -1710,6 +1890,9 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> LiveExe
     values.update(
         {
             "aws_region": env.get("AWS_REGION", "us-east-1"),
+            "objective_worker_auth_token": (
+                env.get("OBJECTIVE_WORKER_AUTH_TOKEN") or env.get("OBJECTIVE_WORKER_TOKEN")
+            ),
             "target_model": env.get("TARGET_MODEL", "google/functiongemma-270m-it"),
             "objective_suite": env.get("OBJECTIVE_SUITE", "AgentGym/AgentEval"),
             "objective_suite_version": env.get("OBJECTIVE_SUITE_VERSION", "agent-eval-v1"),
@@ -1770,7 +1953,10 @@ def create_aws_controller(config: LiveExecutionConfig) -> AutonomousRunControlle
 
     return AutonomousRunController(
         config=config,
-        objective_worker=ObjectiveWorkerClient(config.objective_worker_url),
+        objective_worker=ObjectiveWorkerClient(
+            config.objective_worker_url,
+            auth_token=config.objective_worker_auth_token,
+        ),
         provider=SageMakerProvider(region_name=config.aws_region),
         artifact_store=store,
         slots=_RegistrySlotStore(repository),

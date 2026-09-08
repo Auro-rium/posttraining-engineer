@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import hashlib
+from typing import Any
+
+import pytest
+
+import app.live_execution as live_execution
+from app.live_execution import (
+    LiveExecutionBlocked,
+    ObjectiveWorkerClient,
+    PreflightRunner,
+)
+
+
+def _config(**overrides: object) -> Any:
+    values: dict[str, object] = {
+        "artifact_bucket": "demo-bucket",
+        "dynamodb_table": "demo-history",
+        "training_role_arn": "arn:aws:iam::123456789012:role/train",
+        "training_image": (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/train@sha256:"
+            + "a" * 64
+        ),
+        "evaluation_image": (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/eval@sha256:"
+            + "b" * 64
+        ),
+        "objective_worker_url": "https://worker.example.com",
+        "objective_worker_auth_token": "worker-secret",
+        "hf_repo_id": "google/functiongemma-270m-it",
+        "hf_revision": "c" * 40,
+        "training_input_s3_uri": "s3://demo-bucket/input/checkpoint",
+        "evaluation_input_s3_uri": "s3://demo-bucket/input/held-out",
+        "checkpoint_s3_uri": "s3://demo-bucket/checkpoints/base.tar.gz?versionId=v1",
+        "checkpoint_sha256": "d" * 64,
+        "sagemaker_gpu_quota_code": "L-0123456789abcdef0",
+        "max_runtime_seconds": 3600,
+    }
+    values.update(overrides)
+    from app.live_execution import LiveExecutionConfig
+
+    return LiveExecutionConfig.model_validate(values)
+
+
+class _BedrockCatalog:
+    def get_foundation_model(self, **kwargs: object) -> dict[str, object]:
+        assert kwargs == {"modelIdentifier": "nvidia.nemotron-super-3-120b"}
+        return {"modelDetails": {"providerName": "NVIDIA"}}
+
+
+class _BedrockRuntime:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def converse(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(kwargs)
+        return {"output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}}}
+
+
+def test_bedrock_preflight_requires_a_minimal_nemotron_runtime_probe() -> None:
+    runtime = _BedrockRuntime()
+    runner = PreflightRunner(
+        _config(), clients={"bedrock": _BedrockCatalog(), "bedrock-runtime": runtime}
+    )
+
+    metadata = runner._check_bedrock_readiness()
+
+    assert metadata["invocation"] == "verified"
+    assert runtime.calls == [
+        {
+            "modelId": "nvidia.nemotron-super-3-120b",
+            "messages": [
+                {"role": "user", "content": [{"text": "Reply with OK."}]}
+            ],
+            "inferenceConfig": {"maxTokens": 1, "temperature": 0.0},
+        }
+    ]
+
+
+def test_bedrock_client_factory_forces_sigv4(monkeypatch: pytest.MonkeyPatch) -> None:
+    import boto3  # type: ignore[import-untyped]
+
+    calls: list[dict[str, object]] = []
+
+    def fake_client(name: str, **kwargs: object) -> object:
+        calls.append({"name": name, **kwargs})
+        return object()
+
+    monkeypatch.setattr(boto3, "client", fake_client)
+    runner = PreflightRunner(_config())
+
+    runner._client("bedrock-runtime")
+
+    assert calls[0]["name"] == "bedrock-runtime"
+    client_config = calls[0]["config"]
+    assert getattr(client_config, "signature_version", None) == "v4"
+
+
+def test_objective_worker_health_requires_bearer_auth_without_exposing_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
+        requests.append({"url": url, **kwargs})
+        return {"status": "healthy"}
+
+    monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
+    client = ObjectiveWorkerClient("https://worker.example.com", auth_token="worker-secret")
+
+    assert client.health()["status"] == "healthy"
+    assert requests[0]["headers"] == {"Authorization": "Bearer worker-secret"}
+    assert "worker-secret" not in repr(client)
+
+
+def test_objective_worker_without_auth_token_fails_closed() -> None:
+    client = ObjectiveWorkerClient("https://worker.example.com")
+
+    with pytest.raises(LiveExecutionBlocked, match="authentication"):
+        client.health()
+
+
+class _ReadOnlyS3:
+    def __init__(self, *, checkpoint_digest: str) -> None:
+        self.checkpoint_digest = checkpoint_digest
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def head_bucket(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("head_bucket", kwargs))
+        return {}
+
+    def get_bucket_location(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("get_bucket_location", kwargs))
+        return {"LocationConstraint": "us-east-1"}
+
+    def get_bucket_encryption(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("get_bucket_encryption", kwargs))
+        return {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [
+                    {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}
+                ]
+            }
+        }
+
+    def get_bucket_versioning(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("get_bucket_versioning", kwargs))
+        return {"Status": "Enabled"}
+
+    def head_object(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("head_object", kwargs))
+        return {"Metadata": {"sha256": self.checkpoint_digest}, "VersionId": "v1"}
+
+    def __getattr__(self, name: str) -> object:
+        if name.startswith(("put", "create", "delete", "update", "start", "stop")):
+            raise AssertionError(f"preflight attempted mutating S3 operation: {name}")
+        raise AttributeError(name)
+
+
+def test_s3_preflight_requires_region_encryption_and_versioned_checkpoint() -> None:
+    digest = hashlib.sha256(b"checkpoint").hexdigest()
+    s3 = _ReadOnlyS3(checkpoint_digest=digest)
+    config = _config(checkpoint_sha256=digest)
+    runner = PreflightRunner(config, clients={"s3": s3})
+
+    bucket = runner._check_s3_readiness()
+    checkpoint = runner._check_checkpoint_readiness()
+
+    assert bucket["region"] == "us-east-1"
+    assert bucket["encryption"] == "AES256"
+    assert checkpoint["version_id"] == "v1"
+    assert (
+        "head_object",
+        {"Bucket": "demo-bucket", "Key": "checkpoints/base.tar.gz", "VersionId": "v1"},
+    ) in s3.calls
+
+
+def test_checkpoint_preflight_rejects_unversioned_uri() -> None:
+    config = _config(checkpoint_s3_uri="s3://demo-bucket/checkpoints/base.tar.gz")
+    runner = PreflightRunner(config, clients={"s3": _ReadOnlyS3(checkpoint_digest="d" * 64)})
+
+    with pytest.raises(LiveExecutionBlocked, match="versionId"):
+        runner._check_checkpoint_readiness()
+
+
+class _ReadOnlyIdentity:
+    def get_caller_identity(self) -> dict[str, str]:
+        return {"Account": "123456789012"}
+
+
+class _ReadOnlyIam:
+    def get_role(self, **kwargs: object) -> dict[str, object]:
+        assert kwargs == {"RoleName": "train"}
+        return {"Role": {"RoleName": "train"}}
+
+
+class _ReadOnlyEcr:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def describe_images(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(kwargs)
+        image_id = kwargs["imageIds"]
+        assert isinstance(image_id, list)
+        digest = str(image_id[0]["imageDigest"])
+        return {
+            "imageDetails": [
+                {
+                    "imageDigest": digest,
+                    "repositoryName": str(kwargs["repositoryName"]),
+                    "registryId": "123456789012",
+                }
+            ]
+        }
+
+    def __getattr__(self, name: str) -> object:
+        if name.startswith(("put", "create", "delete", "update", "start", "stop")):
+            raise AssertionError(f"preflight attempted mutating ECR operation: {name}")
+        raise AttributeError(name)
+
+
+def test_ecr_preflight_requires_owned_digest_pinned_images() -> None:
+    ecr = _ReadOnlyEcr()
+    runner = PreflightRunner(
+        _config(), clients={"ecr": ecr, "sts": _ReadOnlyIdentity(), "iam": _ReadOnlyIam()}
+    )
+
+    metadata = runner._check_sagemaker_readiness()
+
+    assert metadata["images"] == "available"
+    for call in ecr.calls:
+        image_ids = call["imageIds"]
+        assert isinstance(image_ids, list)
+        assert isinstance(image_ids[0], dict)
+        assert "imageDigest" in image_ids[0]
+
+
+def test_ecr_preflight_rejects_tag_and_cross_region_images() -> None:
+    config = _config(
+        training_image="999999999999.dkr.ecr.eu-west-1.amazonaws.com/train:latest"
+    )
+    runner = PreflightRunner(
+        config,
+        clients={"ecr": _ReadOnlyEcr(), "sts": _ReadOnlyIdentity(), "iam": _ReadOnlyIam()},
+    )
+
+    with pytest.raises(LiveExecutionBlocked, match="digest-pinned"):
+        runner._check_sagemaker_readiness()
