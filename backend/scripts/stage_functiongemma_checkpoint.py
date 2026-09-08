@@ -137,11 +137,14 @@ def validate_immutable_revision(revision: str) -> str:
 
 
 def _relative_files(root: Path) -> list[Path]:
+    if root.is_symlink():
+        raise CheckpointStagingError(f"checkpoint root must not be a symlink: {root}")
     if not root.exists() or not root.is_dir():
         raise CheckpointStagingError(f"checkpoint directory does not exist: {root}")
     paths: list[Path] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
         relative = path.relative_to(root)
+        parts = tuple(part.lower() for part in relative.parts)
         name = path.name.lower()
         if path.is_symlink():
             raise CheckpointStagingError(f"checkpoint contains unsupported symlink: {relative}")
@@ -155,8 +158,10 @@ def _relative_files(root: Path) -> list[Path]:
             raise CheckpointStagingError(
                 f"checkpoint contains cache lock/partial input: {relative}"
             )
-        if relative.parts and relative.parts[0] == "refs":
+        if "refs" in parts:
             raise CheckpointStagingError(f"checkpoint contains mutable cache reference: {relative}")
+        if any(part in {".locks", "locks"} or part.startswith(".lock") for part in parts):
+            raise CheckpointStagingError(f"checkpoint contains cache lock directory: {relative}")
         if path.is_file():
             paths.append(path)
         elif not path.is_dir():
@@ -192,6 +197,17 @@ def _validate_required_files(paths: list[Path], root: Path) -> None:
             "checkpoint is incomplete; missing required file(s): " + ", ".join(missing)
         )
 
+    for filename in sorted(required):
+        path = root / filename
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CheckpointStagingError(
+                f"required checkpoint JSON is invalid: {filename}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise CheckpointStagingError(f"required checkpoint JSON must be an object: {filename}")
+
     weights = [
         path
         for path in paths
@@ -224,10 +240,47 @@ def _validate_required_files(paths: list[Path], root: Path) -> None:
             raise CheckpointStagingError(
                 f"weight index has no weight_map: {index_path.relative_to(root)}"
             )
-        missing_shards = sorted({str(value) for value in weight_map.values()} - names)
+        expected_suffix = ".safetensors" if index_path.name.startswith("model.") else ".bin"
+        mapped_shards: set[str] = set()
+        for value in weight_map.values():
+            if not isinstance(value, str) or not value:
+                raise CheckpointStagingError(
+                    f"weight index contains a non-string shard: {index_path.relative_to(root)}"
+                )
+            shard = PurePosixPath(value)
+            if (
+                shard.name != value
+                or not value.endswith(expected_suffix)
+                or not (
+                    value.startswith("model-")
+                    if expected_suffix == ".safetensors"
+                    else value.startswith("pytorch_model-")
+                )
+            ):
+                raise CheckpointStagingError(
+                    f"weight index contains an invalid shard name: {value}"
+                )
+            mapped_shards.add(value)
+        available_shards = {
+            path.name
+            for path in paths
+            if (
+                path.name.startswith("model-")
+                and path.name.endswith(".safetensors")
+                if expected_suffix == ".safetensors"
+                else path.name.startswith("pytorch_model-")
+                and path.name.endswith(".bin")
+            )
+        }
+        missing_shards = sorted(mapped_shards - names)
         if missing_shards:
             raise CheckpointStagingError(
                 "checkpoint is incomplete; missing weight shard(s): " + ", ".join(missing_shards)
+            )
+        if available_shards != mapped_shards:
+            raise CheckpointStagingError(
+                "weight index does not match available model shards: "
+                f"expected {sorted(mapped_shards)}, found {sorted(available_shards)}"
             )
 
 
@@ -365,8 +418,13 @@ def stage_checkpoint(
             "S3 checkpoint upload failed; artifact was not verified"
         ) from exc
     version_id = response.get("VersionId") if isinstance(response, dict) else None
-    if not version_id:
+    if (
+        not isinstance(version_id, str)
+        or not version_id.strip()
+        or version_id.strip().lower() == "null"
+    ):
         raise CheckpointStagingError("S3 upload did not return a version id")
+    version_id = version_id.strip()
     return StagedCheckpoint(
         model_id=bundle.model_id,
         revision=bundle.revision,

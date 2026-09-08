@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ from scripts.stage_functiongemma_checkpoint import (
     TARGET_MODEL_ID,
     CheckpointStagingError,
     build_deterministic_bundle,
+    main,
     stage_checkpoint,
     validate_checkpoint_directory,
 )
@@ -36,6 +38,17 @@ def test_revision_is_required_to_be_an_immutable_commit(tmp_path: Path) -> None:
         validate_checkpoint_directory(checkpoint, revision="main")
 
 
+def test_only_functiongemma_target_model_can_be_staged(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+
+    with pytest.raises(CheckpointStagingError, match=r"only.*target model"):
+        validate_checkpoint_directory(
+            checkpoint,
+            revision=REVISION,
+            model_id="google/gemma-3-4b-it",
+        )
+
+
 def test_missing_required_checkpoint_file_fails_closed(tmp_path: Path) -> None:
     checkpoint = _checkpoint(tmp_path / "checkpoint", include_weights=False)
 
@@ -60,6 +73,56 @@ def test_gated_incomplete_and_cache_lock_inputs_are_rejected(tmp_path: Path) -> 
         validate_checkpoint_directory(checkpoint, revision=REVISION)
 
 
+def test_nested_cache_refs_locks_and_symlink_roots_are_rejected(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "cache" / "refs").mkdir(parents=True)
+    (checkpoint / "cache" / "refs" / "main").write_text(REVISION, encoding="utf-8")
+    with pytest.raises(CheckpointStagingError, match="mutable cache"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+    (checkpoint / "cache").rename(checkpoint / "cache-removed")
+    (checkpoint / ".locks").mkdir()
+    with pytest.raises(CheckpointStagingError, match="lock"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+    symlink_root = tmp_path / "checkpoint-link"
+    symlink_root.symlink_to(checkpoint, target_is_directory=True)
+    with pytest.raises(CheckpointStagingError, match=r"root.*symlink"):
+        validate_checkpoint_directory(symlink_root, revision=REVISION)
+
+    descendant = _checkpoint(tmp_path / "descendant")
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    (descendant / "linked.bin").symlink_to(outside)
+    with pytest.raises(CheckpointStagingError, match="unsupported symlink"):
+        validate_checkpoint_directory(descendant, revision=REVISION)
+
+
+@pytest.mark.parametrize("filename", ["config.json", "tokenizer.json", "tokenizer_config.json"])
+def test_required_json_files_must_be_objects(tmp_path: Path, filename: str) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / filename).write_text("not-json", encoding="utf-8")
+
+    with pytest.raises(CheckpointStagingError, match="JSON"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+@pytest.mark.parametrize("mapped_value", ["tokenizer.json", 17])
+def test_indexed_weights_require_supported_shard_map(
+    tmp_path: Path, mapped_value: object
+) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "model-00001-of-00001.safetensors").write_bytes(b"shard")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight": mapped_value}}), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        CheckpointStagingError, match=r"(invalid shard name|non-string shard)"
+    ):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
 def test_bundle_bytes_and_hash_are_deterministic(tmp_path: Path) -> None:
     first = _checkpoint(tmp_path / "first")
     second = _checkpoint(tmp_path / "second")
@@ -81,7 +144,7 @@ class _VersionedS3:
         assert kwargs == {"Bucket": "artifacts"}
         return {"Status": "Enabled"}
 
-    def put_object(self, **kwargs: object) -> dict[str, str]:
+    def put_object(self, **kwargs: object) -> dict[str, object]:
         self.put_calls.append(kwargs)
         return {"VersionId": "version-17", "ETag": '"etag"'}
 
@@ -120,3 +183,47 @@ def test_staging_rejects_unversioned_bucket_without_upload(tmp_path: Path) -> No
     with pytest.raises(CheckpointStagingError, match="versioning"):
         stage_checkpoint(checkpoint, bucket="artifacts", revision=REVISION, s3_client=client)
     assert client.put_calls == []
+
+
+@pytest.mark.parametrize("version_id", [None, "", "null", "NULL", 17])
+def test_staging_rejects_invalid_s3_version_ids(tmp_path: Path, version_id: object) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+
+    class InvalidVersion(_VersionedS3):
+        def put_object(self, **kwargs: object) -> dict[str, object]:
+            self.put_calls.append(kwargs)
+            return {"VersionId": version_id}
+
+    with pytest.raises(CheckpointStagingError, match="version id"):
+        stage_checkpoint(
+            checkpoint,
+            bucket="artifacts",
+            revision=REVISION,
+            s3_client=InvalidVersion(),
+        )
+
+
+def test_dry_run_does_not_import_or_construct_boto3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    real_import = builtins.__import__
+
+    def reject_boto3(name: str, *args: object, **kwargs: object) -> object:
+        if name == "boto3":
+            raise AssertionError("dry-run attempted to import boto3")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_boto3)
+    assert (
+        main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--revision",
+                REVISION,
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
