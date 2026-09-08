@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from email.message import Message
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 
@@ -104,6 +106,8 @@ def test_objective_worker_health_requires_bearer_auth_without_exposing_token(
 
     def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
         requests.append({"url": url, **kwargs})
+        if url.endswith("v1/verify-curation"):
+            raise HTTPError(url, 422, "invalid probe body", Message(), None)
         return {"status": "healthy"}
 
     monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
@@ -121,9 +125,44 @@ def test_objective_worker_without_auth_token_fails_closed() -> None:
         client.health()
 
 
+def test_preflight_proves_worker_token_with_protected_non_mutating_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
+        requests.append({"url": url, **kwargs})
+        if url.endswith("v1/verify-curation"):
+            raise HTTPError(url, 422, "invalid probe body", Message(), None)
+        return {"status": "healthy"}
+
+    monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
+    runner = live_execution.PreflightRunner(_config())
+
+    assert runner._check_worker_readiness()["status"] == "ready"
+    assert requests[1]["headers"] == {"Authorization": "Bearer worker-secret"}
+
+
+def test_preflight_rejects_worker_token_when_protected_probe_returns_unauthorized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
+        del kwargs
+        if url.endswith("v1/verify-curation"):
+            raise HTTPError(url, 401, "unauthorized", Message(), None)
+        return {"status": "healthy"}
+
+    monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
+    runner = live_execution.PreflightRunner(_config())
+
+    with pytest.raises(LiveExecutionBlocked, match="authentication"):
+        runner._check_worker_readiness()
+
+
 class _ReadOnlyS3:
-    def __init__(self, *, checkpoint_digest: str) -> None:
+    def __init__(self, *, checkpoint_digest: str, location: str | None = "us-east-1") -> None:
         self.checkpoint_digest = checkpoint_digest
+        self.location = location
         self.calls: list[tuple[str, dict[str, object]]] = []
 
     def head_bucket(self, **kwargs: object) -> dict[str, object]:
@@ -132,7 +171,7 @@ class _ReadOnlyS3:
 
     def get_bucket_location(self, **kwargs: object) -> dict[str, object]:
         self.calls.append(("get_bucket_location", kwargs))
-        return {"LocationConstraint": "us-east-1"}
+        return {"LocationConstraint": self.location}
 
     def get_bucket_encryption(self, **kwargs: object) -> dict[str, object]:
         self.calls.append(("get_bucket_encryption", kwargs))
@@ -184,14 +223,44 @@ def test_checkpoint_preflight_rejects_unversioned_uri() -> None:
         runner._check_checkpoint_readiness()
 
 
+def test_checkpoint_preflight_rejects_a_different_bucket() -> None:
+    config = _config(
+        checkpoint_s3_uri="s3://other-bucket/checkpoints/base.tar.gz?versionId=v1"
+    )
+    runner = PreflightRunner(config, clients={"s3": _ReadOnlyS3(checkpoint_digest="d" * 64)})
+
+    with pytest.raises(LiveExecutionBlocked, match="artifact bucket"):
+        runner._check_checkpoint_readiness()
+
+
+def test_s3_legacy_eu_location_is_eu_west_1() -> None:
+    s3 = _ReadOnlyS3(checkpoint_digest="d" * 64, location="EU")
+    config = _config(aws_region="eu-west-1")
+
+    assert PreflightRunner(config, clients={"s3": s3})._check_s3_readiness()["region"] == (
+        "eu-west-1"
+    )
+
+
+def test_live_config_serialization_excludes_objective_worker_token() -> None:
+    config = _config()
+
+    assert "worker-secret" not in repr(config)
+    assert "objective_worker_auth_token" not in config.model_dump()
+    assert "worker-secret" not in config.model_dump_json()
+
+
 class _ReadOnlyIdentity:
     def get_caller_identity(self) -> dict[str, str]:
         return {"Account": "123456789012"}
 
 
 class _ReadOnlyIam:
+    def __init__(self, expected_role_name: str = "train") -> None:
+        self.expected_role_name = expected_role_name
+
     def get_role(self, **kwargs: object) -> dict[str, object]:
-        assert kwargs == {"RoleName": "train"}
+        assert kwargs == {"RoleName": self.expected_role_name}
         return {"Role": {"RoleName": "train"}}
 
 
@@ -247,3 +316,14 @@ def test_ecr_preflight_rejects_tag_and_cross_region_images() -> None:
 
     with pytest.raises(LiveExecutionBlocked, match="digest-pinned"):
         runner._check_sagemaker_readiness()
+
+
+def test_sagemaker_preflight_preserves_iam_role_path() -> None:
+    config = _config(training_role_arn="arn:aws:iam::123456789012:role/service/train")
+    iam = _ReadOnlyIam(expected_role_name="service/train")
+    runner = PreflightRunner(
+        config,
+        clients={"ecr": _ReadOnlyEcr(), "sts": _ReadOnlyIdentity(), "iam": iam},
+    )
+
+    runner._check_sagemaker_readiness()

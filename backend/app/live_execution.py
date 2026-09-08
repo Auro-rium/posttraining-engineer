@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from math import isfinite
 from typing import Any, Protocol
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -254,7 +255,9 @@ class LiveExecutionConfig(BaseModel):
     training_image: str
     evaluation_image: str
     objective_worker_url: str
-    objective_worker_auth_token: str | None = Field(default=None, repr=False)
+    objective_worker_auth_token: str | None = Field(
+        default=None, repr=False, exclude=True
+    )
     hf_repo_id: str
     hf_revision: str
     target_model: str = "google/functiongemma-270m-it"
@@ -624,7 +627,13 @@ class PreflightRunner:
         location = client.get_bucket_location(Bucket=self.config.artifact_bucket).get(
             "LocationConstraint"
         )
-        bucket_region = "us-east-1" if location in (None, "", "EU") else str(location)
+        bucket_region = (
+            "us-east-1"
+            if location in (None, "")
+            else "eu-west-1"
+            if location == "EU"
+            else str(location)
+        )
         if bucket_region != self.config.aws_region:
             raise LiveExecutionBlocked(
                 "S3 artifact bucket region does not match AWS_REGION",
@@ -668,6 +677,11 @@ class PreflightRunner:
         if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
             raise LiveExecutionBlocked(
                 "checkpoint_s3_uri must be an s3:// URI",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        if parsed.netloc != self.config.artifact_bucket:
+            raise LiveExecutionBlocked(
+                "checkpoint artifact bucket must match the validated artifact bucket",
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
         version_values = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
@@ -744,7 +758,8 @@ class PreflightRunner:
                 "SageMaker training role is not owned by the active AWS account",
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
-        self._client("iam").get_role(RoleName=self.config.training_role_arn.rsplit("/", 1)[-1])
+        role_name = self.config.training_role_arn.split(":role/", 1)[1]
+        self._client("iam").get_role(RoleName=role_name)
         ecr = self._client("ecr")
         for image in (self.config.training_image, self.config.evaluation_image):
             image_match = re.match(
@@ -910,6 +925,11 @@ class PreflightRunner:
             "healthy",
         }:
             raise ValueError("objective worker did not report ready")
+        _verify_objective_worker_auth(
+            self.config.objective_worker_url,
+            timeout=self.config.preflight_timeout_seconds,
+            headers={"Authorization": f"Bearer {token}"},
+        )
         return {"endpoint": "configured", "status": "ready"}
 
 
@@ -934,6 +954,49 @@ def _http_json(
     if not body:
         return {}
     return json.loads(body.decode("utf-8"))
+
+
+def _verify_objective_worker_auth(
+    base_url: str,
+    *,
+    timeout: float,
+    headers: Mapping[str, str],
+) -> None:
+    """Prove the worker accepted auth using a validation-only protected call.
+
+    The worker's health route is intentionally lightweight and may be exposed
+    without authentication.  A malformed curation request reaches the auth
+    dependency before body validation: HTTP 422 therefore proves the supplied
+    credentials were accepted, while HTTP 401 proves they were rejected.  No
+    curation or artifact operation runs for this probe.
+    """
+
+    try:
+        _http_json(
+            urljoin(base_url, "v1/verify-curation"),
+            method="POST",
+            timeout=timeout,
+            headers=headers,
+            payload={
+                "run_id": "preflight-auth-probe",
+                "experiment_id": "preflight-auth-probe",
+                "split": "invalid",
+                "trajectories": [],
+            },
+        )
+    except HTTPError as exc:
+        if exc.code == 422:
+            return
+        if exc.code == 401:
+            raise LiveExecutionBlocked(
+                "objective worker authentication was rejected",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            ) from None
+        raise
+    raise LiveExecutionBlocked(
+        "objective worker protected endpoint did not enforce authentication",
+        classification=PreflightClassification.BLOCKED_CONFIGURATION,
+    )
 
 
 class ObjectiveWorkerClient:
@@ -974,7 +1037,15 @@ class ObjectiveWorkerClient:
             raise LiveExecutionFailed("objective worker returned a non-object health response")
         if str(response.get("status", "")).lower() not in {"ok", "ready", "healthy"}:
             raise LiveExecutionFailed("objective worker did not report ready")
+        self._require_auth_probe()
         return response
+
+    def _require_auth_probe(self) -> None:
+        _verify_objective_worker_auth(
+            self.base_url,
+            timeout=self.timeout_seconds,
+            headers=self._headers(),
+        )
 
     def execute_benchmark(self, request: ObjectiveBenchmarkRequest) -> ObjectiveBenchmarkResult:
         response = _http_json(
