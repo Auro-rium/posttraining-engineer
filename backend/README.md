@@ -38,6 +38,19 @@ the hard budget. Missing checkpoint revisions, objective-worker artifacts,
 SageMaker images/roles, provider IDs, or verified measurements produce
 `BLOCKED`/`FAILED`; no fallback metrics are generated.
 
+Before the first job, configure `CHECKPOINT_SHA256`,
+`SAGEMAKER_GPU_QUOTA_CODE`, `GPU_INSTANCE_ALLOWLIST`, and a secret in
+`LIVE_APPROVAL_SECRET`. The scripts print a metadata-only approval packet when
+no token is supplied. An operator signs that packet with
+`issue_approval_token(packet, secret)` and reruns with the resulting token.
+For the included signer: `LIVE_APPROVAL_SECRET=... uv run python
+scripts/issue_approval_token.py packet.json`.
+Service Quotas confirms account allowance; it is not a placement reservation,
+so SageMaker remains the final capacity decision after approval. Only the
+current run's training/processing jobs are stopped during cleanup; S3,
+DynamoDB, IAM, ECR, and networking resources are reused and never deleted by
+the controller.
+
 All agent prompts are versioned contracts. They include explicit schemas,
 evidence rules, sealed held-out-data boundaries, and bounded creative latitude.
 Prompt hashes and the Nemotron model ID are safe manifest/telemetry metadata;

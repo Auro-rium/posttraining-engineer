@@ -41,6 +41,20 @@ def main() -> int:
             safe_json_print({"status": "BLOCKED", "reason": "preflight is BLOCKED"})
             return 2
         controller = create_aws_controller(config)
+        if not args.approval_token:
+            packet = controller.build_approval_packet(run_number=args.run_number)
+            safe_json_print(
+                {
+                    "status": "WAITING_APPROVAL",
+                    "approval_packet": packet.model_dump(mode="json"),
+                    "packet_sha256": packet.digest,
+                    "instruction": (
+                        "Sign this packet with the configured approval service, then rerun "
+                        "with --approval-token"
+                    ),
+                }
+            )
+            return 2
         summary = controller.run_once(
             run_number=args.run_number,
             approval_token=args.approval_token,

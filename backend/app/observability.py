@@ -44,6 +44,8 @@ class EventType(StrEnum):
     JOB_COMPLETED = "job.completed"
     JOB_FAILED = "job.failed"
     PROMOTION_DECIDED = "promotion.decided"
+    CLEANUP_COMPLETED = "cleanup.completed"
+    CLEANUP_FAILED = "cleanup.failed"
 
 
 class EventExporter(Protocol):

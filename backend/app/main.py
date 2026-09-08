@@ -15,6 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.api.continuous_post_training import install_post_training_api
+from app.api.live_readiness import install_live_readiness_api
 from app.api.run_comparison import install_run_comparison_api
 from app.core.environment import create_service_recovery_environment
 from app.core.orchestrator import create_orchestrator
@@ -136,6 +137,7 @@ app = FastAPI(
     version="0.1.0",
 )
 install_post_training_api(app)
+install_live_readiness_api(app)
 app.state.run_registry = _create_run_registry(settings)
 app.state.telemetry = TelemetryRecorder()
 app.state.run_numbers = {}

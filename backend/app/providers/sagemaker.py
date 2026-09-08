@@ -50,6 +50,7 @@ class EvaluationJobRequest:
     input_s3_uri: str
     output_s3_uri: str
     instance_type: str
+    model_s3_uri: str | None = None
     instance_count: int = 1
     volume_size_gb: int = 30
     max_runtime_seconds: int = 3600
@@ -156,6 +157,8 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
             (request.instance_type, "instance_type"),
         ):
             _require(value, name)
+        if request.model_s3_uri is not None:
+            _require(request.model_s3_uri, "model_s3_uri")
         if (
             request.instance_count < 1
             or request.volume_size_gb < 1
@@ -247,22 +250,36 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         app_spec: dict[str, Any] = {"ImageUri": request.image_uri}
         if request.command:
             app_spec["ContainerEntrypoint"] = request.command
-        response = self._client_or_create().create_processing_job(
-            ProcessingJobName=request.job_name,
-            RoleArn=request.role_arn,
-            AppSpecification=app_spec,
-            ProcessingInputs=[
+        processing_inputs = [
+            {
+                "InputName": "evaluation",
+                "S3Input": {
+                    "S3Uri": request.input_s3_uri,
+                    "LocalPath": "/opt/ml/processing/input",
+                    "S3DataType": "S3Prefix",
+                    "S3InputMode": "File",
+                    "S3CompressionType": "None",
+                },
+            }
+        ]
+        if request.model_s3_uri:
+            processing_inputs.append(
                 {
-                    "InputName": "evaluation",
+                    "InputName": "model",
                     "S3Input": {
-                        "S3Uri": request.input_s3_uri,
-                        "LocalPath": "/opt/ml/processing/input",
+                        "S3Uri": request.model_s3_uri,
+                        "LocalPath": "/opt/ml/processing/model",
                         "S3DataType": "S3Prefix",
                         "S3InputMode": "File",
                         "S3CompressionType": "None",
                     },
                 }
-            ],
+            )
+        response = self._client_or_create().create_processing_job(
+            ProcessingJobName=request.job_name,
+            RoleArn=request.role_arn,
+            AppSpecification=app_spec,
+            ProcessingInputs=processing_inputs,
             ProcessingOutputConfig={
                 "Outputs": [
                     {

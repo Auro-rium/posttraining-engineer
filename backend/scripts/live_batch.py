@@ -51,6 +51,15 @@ def main() -> int:
             elif args.approval_token:
                 raise LiveExecutionBlocked("one approval token is required for each run")
             else:
+                packet = controller.build_approval_packet(run_number=run_number)
+                safe_json_print(
+                    {
+                        "status": "WAITING_APPROVAL",
+                        "run_number": run_number,
+                        "approval_packet": packet.model_dump(mode="json"),
+                        "packet_sha256": packet.digest,
+                    }
+                )
                 token = getpass.getpass(f"Approval token for run {run_number}: ")
             summary = controller.run_once(run_number=run_number, approval_token=token)
             summaries.append(summary.safe_dict())
