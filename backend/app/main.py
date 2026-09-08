@@ -54,6 +54,11 @@ class _LocalRunHistoryRepository:
                 raise ValueError(f"run already exists: {record.run_id}")
             if len(self._records) >= max_runs:
                 raise RunLimitExceeded(f"maximum of {max_runs} runs reached")
+            expected_number = len(self._records) + 1
+            if record.run_number != expected_number:
+                raise ValueError(
+                    f"expected next run number {expected_number}, got {record.run_number}"
+                )
             self._records[record.run_id] = record
         return record
 
@@ -61,12 +66,18 @@ class _LocalRunHistoryRepository:
         with self._lock:
             return self._records.get(run_id)
 
+    def get_history_run(self, run_id: str) -> RunHistoryRecord | None:
+        return self.get_run(run_id)
+
     def list_runs(self, *, limit: int = MAX_RUNS) -> Sequence[RunHistoryRecord]:
         if not 1 <= limit <= MAX_RUNS:
             raise ValueError(f"limit must be between 1 and {MAX_RUNS}")
         with self._lock:
             records = sorted(self._records.values(), key=lambda item: item.run_number)
             return tuple(records[-limit:])
+
+    def list_history_runs(self, *, limit: int = MAX_RUNS) -> Sequence[RunHistoryRecord]:
+        return self.list_runs(limit=limit)
 
 
 def _create_run_registry(config: Any) -> RunRegistry:

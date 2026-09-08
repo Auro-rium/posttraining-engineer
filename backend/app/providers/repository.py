@@ -340,9 +340,21 @@ class DynamoDBRunRepository:
             raise RunLimitExceeded(f"maximum of {max_runs} runs reached")
 
         table_name = self.table_name or getattr(self._table_or_create(), "name", "")
+        if not table_name:
+            # Injected Table-like doubles may not expose ``name``; the
+            # low-level client is also injected/owned by that double, so the
+            # value is not sent to AWS. Real resource-backed repositories must
+            # provide an explicit table name.
+            if self._table is not None:
+                table_name = "injected-table"
+            else:
+                raise RepositoryError(
+                    "DynamoDBRunRepository requires table_name for history transactions"
+                )
         counter_key = self._history_counter_key()
         sequence_condition = (
-            "attribute_not_exists(#last_run_number) OR #last_run_number = :expected"
+            "attribute_not_exists(#last_run_number) AND "
+            "(attribute_not_exists(#run_count) OR #run_count = :zero)"
             if record.run_number == 1
             else "#last_run_number = :expected"
         )
@@ -392,6 +404,14 @@ class DynamoDBRunRepository:
         try:
             self._transaction_client().transact_write_items(TransactItems=operations)
         except Exception as exc:
+            response = getattr(exc, "response", None)
+            error = response.get("Error") if isinstance(response, Mapping) else None
+            error_code = error.get("Code") if isinstance(error, Mapping) else None
+            if error_code not in {"TransactionCanceledException", "TransactionCanceled"} and (
+                exc.__class__.__name__
+                not in {"TransactionCanceledException", "TransactionCanceled"}
+            ):
+                raise
             reason = self._transaction_failure_reason(exc)
             if reason == "duplicate":
                 raise RunAlreadyExistsError(f"Run already exists: {record.run_id}") from exc
@@ -412,8 +432,8 @@ class DynamoDBRunRepository:
                     ) from exc
 
             # Some test doubles and older botocore versions omit cancellation
-            # reasons.  These reads only classify the failed transaction; they
-            # do not participate in the reservation itself.
+            # reasons. These reads only classify a known cancelled transaction;
+            # they do not participate in the reservation itself.
             if self._get_history_item(record.run_id) is not None:
                 raise RunAlreadyExistsError(f"Run already exists: {record.run_id}") from exc
             if self._history_counter_count(self._get_history_counter()) >= max_runs:

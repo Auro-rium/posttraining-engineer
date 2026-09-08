@@ -434,9 +434,9 @@ class RunHistoryRepository(Protocol):
         self, record: RunHistoryRecord, *, max_runs: int = MAX_RUNS
     ) -> RunHistoryRecord: ...
 
-    def get_run(self, run_id: str) -> RunHistoryRecord | None: ...
+    def get_history_run(self, run_id: str) -> RunHistoryRecord | None: ...
 
-    def list_runs(self, *, limit: int = MAX_RUNS) -> Sequence[RunHistoryRecord]: ...
+    def list_history_runs(self, *, limit: int = MAX_RUNS) -> Sequence[RunHistoryRecord]: ...
 
 
 class RunRegistry:
@@ -457,7 +457,7 @@ class RunRegistry:
 
         if record.run_number > self._max_runs:
             raise RunLimitExceeded(f"maximum of {self._max_runs} runs reached")
-        existing = tuple(self._repository.list_runs(limit=self._max_runs))
+        existing = tuple(self._repository.list_history_runs(limit=self._max_runs))
         if len(existing) >= self._max_runs:
             raise RunLimitExceeded(f"maximum of {self._max_runs} runs reached")
         expected_number = max((item.run_number for item in existing), default=0) + 1
@@ -469,12 +469,12 @@ class RunRegistry:
         if record.run_number > 1:
             assert record.parent_run_id is not None
             assert record.champion_run_id is not None
-            parent = self._repository.get_run(record.parent_run_id)
+            parent = self._repository.get_history_run(record.parent_run_id)
             if parent is None:
                 raise ValueError(f"parent_run_id {record.parent_run_id!r} does not exist")
             if parent.run_number != record.run_number - 1:
                 raise ValueError("parent_run_id must reference the previous run")
-            champion = self._repository.get_run(record.champion_run_id)
+            champion = self._repository.get_history_run(record.champion_run_id)
             if champion is None:
                 raise ValueError(f"champion_run_id {record.champion_run_id!r} does not exist")
             if champion.run_number >= record.run_number:
@@ -482,7 +482,7 @@ class RunRegistry:
         return self._repository.reserve_run(record, max_runs=self._max_runs)
 
     def get(self, run_id: str) -> RunHistoryRecord:
-        record = self._repository.get_run(run_id)
+        record = self._repository.get_history_run(run_id)
         if record is None:
             raise KeyError(run_id)
         return record
@@ -491,7 +491,7 @@ class RunRegistry:
         requested = self._max_runs if limit is None else limit
         if not 1 <= requested <= self._max_runs:
             raise ValueError(f"limit must be between 1 and {self._max_runs}")
-        records = self._repository.list_runs(limit=requested)
+        records = self._repository.list_history_runs(limit=requested)
         return tuple(sorted(records, key=lambda record: record.run_number))
 
     def compare(self, run_ids: Iterable[str] | None = None) -> ComparisonDTO:

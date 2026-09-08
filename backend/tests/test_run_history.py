@@ -105,8 +105,14 @@ class MemoryRunHistory:
     def get_run(self, run_id: str) -> RunHistoryRecord | None:
         return self.records.get(run_id)
 
+    def get_history_run(self, run_id: str) -> RunHistoryRecord | None:
+        return self.records.get(run_id)
+
     def list_runs(self, *, limit: int = MAX_RUNS) -> tuple[RunHistoryRecord, ...]:
         return tuple(sorted(self.records.values(), key=lambda record: record.run_number)[-limit:])
+
+    def list_history_runs(self, *, limit: int = MAX_RUNS) -> tuple[RunHistoryRecord, ...]:
+        return self.list_runs(limit=limit)
 
 
 def test_run_record_validates_identity_and_metrics() -> None:
