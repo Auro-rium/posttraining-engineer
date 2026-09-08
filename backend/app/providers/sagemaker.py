@@ -28,6 +28,10 @@ class ProviderReconciliationError(ProviderResponseError):
     """Raised when an existing job cannot be safely matched to a request."""
 
 
+class JobUnidentifiableError(ProviderReconciliationError):
+    """Raised when an existing same-name job lacks identity metadata."""
+
+
 class JobNameConflictError(ProviderReconciliationError):
     """Raised when a deterministic job name belongs to another request."""
 
@@ -116,32 +120,30 @@ class JobResult:
 
 
 _JOB_NAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:/.@+_=,-]{0,1999}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_UNSAFE_REASON_PATTERN = re.compile(
-    r"(?:raw\s+prompt|raw\s+content|full\s+text|trajectory\b|hidden\b|secret\b|task\s+content)",
-    re.IGNORECASE,
-)
 _TRANSIENT_ERROR_CODES = frozenset(
     {
         "InternalError",
         "InternalFailure",
         "InternalServerError",
+        "BandwidthLimitExceeded",
+        "EC2ThrottledException",
+        "LimitExceededException",
         "PriorRequestNotComplete",
         "RequestTimeout",
         "RequestTimeoutException",
+        "RequestLimitExceeded",
         "ServiceUnavailable",
         "ServiceUnavailableException",
+        "ServiceQuotaExceededException",
         "SlowDown",
+        "Throttling",
         "ThrottledException",
         "ThrottlingException",
         "TooManyRequestsException",
     }
 )
-_NOT_FOUND_ERROR_CODES = frozenset(
-    {"ResourceNotFound", "ResourceNotFoundException", "ValidationException"}
-)
-
-
 def _canonical(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(key): _canonical(value[key]) for key in sorted(value, key=str)}
@@ -248,7 +250,7 @@ def _validate_job_name(value: str, name: str = "job_name") -> str:
 def _validate_provider_id(value: object) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ProviderResponseError("SageMaker response contained an invalid provider job ID")
-    if len(value) > 2_000 or any(character.isspace() for character in value):
+    if len(value) > 2_000 or _PROVIDER_ID_PATTERN.fullmatch(value) is None:
         raise ProviderResponseError("SageMaker response contained an invalid provider job ID")
     return value
 
@@ -274,6 +276,16 @@ def _error_message(exc: BaseException) -> str:
 def is_transient_describe_error(exc: BaseException) -> bool:
     """Classify only provider read failures safe for bounded supervisor retry."""
 
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    if exc.__class__.__name__ in {
+        "ConnectTimeoutError",
+        "ConnectionClosedError",
+        "EndpointConnectionError",
+        "ReadTimeoutError",
+        "SSLError",
+    }:
+        return True
     if _error_code(exc) in _TRANSIENT_ERROR_CODES:
         return True
     status_code = getattr(exc, "status_code", None)
@@ -319,12 +331,52 @@ def _is_already_exists_error(exc: BaseException) -> bool:
 def _safe_failure_reason(value: object) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str):
-        return "provider reported a failure without a safe reason"
-    normalized = " ".join(value.split())
-    if not normalized or _UNSAFE_REASON_PATTERN.search(normalized):
-        return "provider failure reason redacted"
-    return normalized[:512]
+    # Provider failure text is untrusted and can contain credentials, prompts,
+    # task contents, or container logs. Preserve only a fixed safe message.
+    return "provider reported terminal failure"
+
+
+def _safe_raw_response(response: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
+    """Retain only provider metadata needed by local callers."""
+
+    name_key = "TrainingJobName" if kind == "training" else "ProcessingJobName"
+    arn_key = "TrainingJobArn" if kind == "training" else "ProcessingJobArn"
+    status_key = "TrainingJobStatus" if kind == "training" else "ProcessingJobStatus"
+    safe: dict[str, Any] = {
+        key: response[key]
+        for key in (name_key, arn_key, status_key, "SecondaryStatus")
+        if key in response
+    }
+    if "FailureReason" in response:
+        safe["FailureReason"] = _safe_failure_reason(response.get("FailureReason"))
+    if kind == "training":
+        artifacts = response.get("ModelArtifacts")
+        if isinstance(artifacts, Mapping) and artifacts.get("S3ModelArtifacts"):
+            safe["ModelArtifacts"] = {"S3ModelArtifacts": artifacts["S3ModelArtifacts"]}
+    else:
+        outputs = response.get("ProcessingOutputConfig")
+        if isinstance(outputs, Mapping):
+            listed = outputs.get("Outputs")
+            if isinstance(listed, list):
+                safe_outputs: list[dict[str, Any]] = []
+                for item in listed:
+                    if not isinstance(item, Mapping):
+                        continue
+                    output: dict[str, Any] = {}
+                    if item.get("OutputName"):
+                        output["OutputName"] = item["OutputName"]
+                    s3_output = item.get("S3Output")
+                    if isinstance(s3_output, Mapping):
+                        output["S3Output"] = {
+                            key: s3_output[key]
+                            for key in ("S3Uri", "LocalPath", "S3UploadMode")
+                            if key in s3_output
+                        }
+                    if output:
+                        safe_outputs.append(output)
+                if safe_outputs:
+                    safe["ProcessingOutputConfig"] = {"Outputs": safe_outputs}
+    return safe
 
 
 def _status(value: object) -> JobStatus:
@@ -478,13 +530,13 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
     @staticmethod
     def _response_provider_id(
         response: Mapping[str, Any], *, kind: str, fallback: str | None
-    ) -> str:
+    ) -> str | None:
         key = "TrainingJobArn" if kind == "training" else "ProcessingJobArn"
         if key in response:
             return _validate_provider_id(response.get(key))
         if fallback is not None:
             return _validate_provider_id(fallback)
-        raise ProviderResponseError(f"SageMaker response omitted provider job ID ({key})")
+        return None
 
     def _result(
         self,
@@ -503,8 +555,11 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         provider_job_id = self._response_provider_id(
             response,
             kind=kind,
-            fallback=None if require_provider_id else job_name,
+            fallback=None,
         )
+        if require_provider_id and provider_job_id is None:
+            key = "TrainingJobArn" if kind == "training" else "ProcessingJobArn"
+            raise ProviderResponseError(f"SageMaker response omitted provider job ID ({key})")
         status_key = "TrainingJobStatus" if kind == "training" else "ProcessingJobStatus"
         status = status_override or _status(response.get(status_key))
         artifact_uri: str | None = None
@@ -529,7 +584,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
             status=status,
             artifact_uri=artifact_uri,
             failure_reason=failure_reason,
-            raw_response=response,
+            raw_response=_safe_raw_response(response, kind=kind),
         )
 
     def reconcile_training(self, request: TrainingJobRequest) -> JobResult | None:
@@ -544,12 +599,16 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         if response is None:
             return None
         provider_id = response.get("TrainingJobArn")
-        # Sparse fakes and older clients do not return an ARN; treat those as
-        # unavailable for reconciliation and preserve the existing submit API.
-        if provider_id is None and self._response_fingerprint(response) is None:
-            return None
-        provider_id = self._validate_reconcile_provider_id(provider_id, request.job_name)
+        if provider_id is None:
+            raise JobUnidentifiableError(
+                f"SageMaker training job {request.job_name!r} exists but cannot be reconciled"
+            )
+        provider_id = self._validate_reconcile_provider_id(provider_id)
         fingerprint = self._resource_tags(provider_id, response)
+        if fingerprint is None:
+            raise JobUnidentifiableError(
+                f"SageMaker training job {request.job_name!r} has no request fingerprint"
+            )
         if fingerprint != request.request_fingerprint:
             raise JobNameConflictError(
                 f"SageMaker training job {request.job_name!r} fingerprint does not match request"
@@ -570,10 +629,16 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         if response is None:
             return None
         provider_id = response.get("ProcessingJobArn")
-        if provider_id is None and self._response_fingerprint(response) is None:
-            return None
-        provider_id = self._validate_reconcile_provider_id(provider_id, request.job_name)
+        if provider_id is None:
+            raise JobUnidentifiableError(
+                f"SageMaker processing job {request.job_name!r} exists but cannot be reconciled"
+            )
+        provider_id = self._validate_reconcile_provider_id(provider_id)
         fingerprint = self._resource_tags(provider_id, response)
+        if fingerprint is None:
+            raise JobUnidentifiableError(
+                f"SageMaker processing job {request.job_name!r} has no request fingerprint"
+            )
         if fingerprint != request.request_fingerprint:
             raise JobNameConflictError(
                 f"SageMaker processing job {request.job_name!r} fingerprint does not match request"
@@ -583,8 +648,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         )
 
     @staticmethod
-    def _validate_reconcile_provider_id(value: object, job_name: str) -> str:
-        del job_name
+    def _validate_reconcile_provider_id(value: object) -> str:
         return _validate_provider_id(value)
 
     def submit_training(self, request: TrainingJobRequest) -> JobResult:

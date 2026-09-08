@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import pytest
 
@@ -409,29 +409,58 @@ def test_sigv4_boto_session_does_not_use_bearer_environment_token(monkeypatch) -
 
 
 def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> None:
+    class ResourceNotFoundError(Exception):
+        def __init__(self, job_name: object) -> None:
+            super().__init__(f"job {job_name!r} was not found")
+            self.response: dict[str, object] = {
+                "Error": {
+                    "Code": "ResourceNotFoundException",
+                    "Message": f"job {job_name!r} was not found",
+                }
+            }
+
     class FakeSageMaker:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, object]]] = []
+            self.training: dict[str, object] | None = None
+            self.processing: dict[str, object] | None = None
+            self.tags: dict[str, list[dict[str, str]]] = {}
 
         def create_training_job(self, **kwargs: object) -> dict[str, object]:
             self.calls.append(("training", kwargs))
+            arn = "arn:train"
+            self.training = {
+                "TrainingJobName": kwargs["TrainingJobName"],
+                "TrainingJobArn": arn,
+                "TrainingJobStatus": "Completed",
+            }
+            self.tags[arn] = cast(list[dict[str, str]], kwargs.get("Tags", []))
             return {"TrainingJobArn": "arn:train"}
 
         def create_processing_job(self, **kwargs: object) -> dict[str, object]:
             self.calls.append(("evaluation", kwargs))
+            arn = "arn:eval"
+            self.processing = {
+                "ProcessingJobName": kwargs["ProcessingJobName"],
+                "ProcessingJobArn": arn,
+                "ProcessingJobStatus": "Completed",
+            }
+            self.tags[arn] = cast(list[dict[str, str]], kwargs.get("Tags", []))
             return {"ProcessingJobArn": "arn:eval"}
 
         def describe_training_job(self, **kwargs: object) -> dict[str, object]:
-            return {
-                "TrainingJobName": kwargs["TrainingJobName"],
-                "TrainingJobStatus": "Completed",
-            }
+            if self.training is None:
+                raise ResourceNotFoundError(kwargs["TrainingJobName"])
+            return dict(self.training)
 
         def describe_processing_job(self, **kwargs: object) -> dict[str, object]:
-            return {
-                "ProcessingJobName": kwargs["ProcessingJobName"],
-                "ProcessingJobStatus": "Completed",
-            }
+            if self.processing is None:
+                raise ResourceNotFoundError(kwargs["ProcessingJobName"])
+            return dict(self.processing)
+
+        def list_tags(self, **kwargs: object) -> dict[str, object]:
+            arn = str(kwargs["ResourceArn"])
+            return {"Tags": self.tags[arn]}
 
     client = FakeSageMaker()
     provider = SageMakerProvider(client=client)
@@ -462,3 +491,5 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
     assert provider.get_training_status("train-1").status == "completed"
     assert provider.get_evaluation_status("eval-1").status == "completed"
     assert client.calls[0][1]["HyperParameters"] == {"epochs": "1"}
+    training_tags = cast(list[dict[str, str]], client.calls[0][1]["Tags"])
+    assert training_tags[-1]["Key"] == "request-fingerprint"

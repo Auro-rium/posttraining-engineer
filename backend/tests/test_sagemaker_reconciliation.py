@@ -14,6 +14,7 @@ from app.providers.sagemaker import (
     TrainingJobRequest,
     TransientProviderError,
     deterministic_job_name,
+    is_transient_describe_error,
     request_fingerprint,
 )
 
@@ -132,6 +133,28 @@ def test_processing_submission_rejects_same_name_with_different_fingerprint() ->
     assert client.create_processing_calls == 0
 
 
+def test_unidentifiable_existing_training_job_fails_closed_without_create() -> None:
+    request = _training_request()
+    client = _FakeClient()
+    client.training = {"TrainingJobStatus": "InProgress"}
+
+    with pytest.raises(ProviderResponseError, match="cannot be reconciled"):
+        SageMakerProvider(client=client).submit_training(request)
+
+    assert client.create_training_calls == 0
+
+
+def test_unidentifiable_existing_processing_job_fails_closed_without_create() -> None:
+    request = _evaluation_request()
+    client = _FakeClient()
+    client.processing = {"ProcessingJobStatus": "InProgress"}
+
+    with pytest.raises(ProviderResponseError, match="cannot be reconciled"):
+        SageMakerProvider(client=client).submit_evaluation(request)
+
+    assert client.create_processing_calls == 0
+
+
 def test_request_fingerprint_and_job_name_are_stable_and_bounded() -> None:
     request = _training_request()
 
@@ -197,7 +220,7 @@ class _FingerprintWithoutArn(_FakeClient):
 
 
 def test_reconciliation_requires_provider_id_when_fingerprint_is_present() -> None:
-    with pytest.raises(ProviderResponseError, match="provider job ID"):
+    with pytest.raises(ProviderResponseError, match="cannot be reconciled"):
         SageMakerProvider(client=_FingerprintWithoutArn()).submit_training(_training_request())
 
 
@@ -210,6 +233,13 @@ def test_transient_describe_failure_is_classified_for_supervisor_retry() -> None
 
     assert raised.value.job_name == "apt-run-001-train"
     assert raised.value.operation == "describe_training_job"
+
+
+@pytest.mark.parametrize(
+    "error", [TimeoutError("socket timeout"), ConnectionError("endpoint down")]
+)
+def test_transport_describe_failures_are_classified_as_transient(error: BaseException) -> None:
+    assert is_transient_describe_error(error)
 
 
 def test_terminal_failure_reason_is_bounded_and_redacted() -> None:
@@ -227,6 +257,46 @@ def test_terminal_failure_reason_is_bounded_and_redacted() -> None:
     assert len(result.failure_reason) <= 512
     assert "raw prompt" not in result.failure_reason.lower()
     assert "secret" not in result.failure_reason.lower()
+    assert "x" not in result.failure_reason
+    assert "raw prompt" not in str(result.raw_response).lower()
+
+
+def test_adversarial_terminal_failure_text_is_not_returned_or_retained() -> None:
+    client = _FakeClient()
+    client.training = {
+        "TrainingJobArn": "arn:aws:sagemaker:us-east-1:123:training-job/existing",
+        "TrainingJobStatus": "Failed",
+        "FailureReason": "credentials=AKIA1234567890; user prompt is private",
+        "Credentials": "AKIA1234567890",
+    }
+
+    result = SageMakerProvider(client=client).get_training_status("apt-run-001-train")
+
+    assert result.failure_reason == "provider reported terminal failure"
+    assert "AKIA" not in str(result.raw_response)
+    assert "private" not in str(result.raw_response)
+    assert "Credentials" not in result.raw_response
+
+
+def test_sparse_status_response_does_not_fabricate_provider_id() -> None:
+    client = _FakeClient()
+    client.training = {"TrainingJobStatus": "Completed"}
+
+    result = SageMakerProvider(client=client).get_training_status("apt-run-001-train")
+
+    assert result.provider_job_id is None
+
+
+@pytest.mark.parametrize("provider_id", ["arn:train\x00", "arn:train\n", "'unsafe'"])
+def test_provider_ids_reject_control_characters_and_unsafe_grammar(provider_id: str) -> None:
+    client = _FakeClient()
+    client.training = {
+        "TrainingJobArn": provider_id,
+        "TrainingJobStatus": "Completed",
+    }
+
+    with pytest.raises(ProviderResponseError, match="provider job ID"):
+        SageMakerProvider(client=client).get_training_status("apt-run-001-train")
 
 
 def test_stop_calls_are_idempotent_when_job_is_missing() -> None:
