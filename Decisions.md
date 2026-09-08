@@ -274,3 +274,15 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** CDK infrastructure is not sufficient for a live model-improvement claim; the current workflow remains local until provider wiring is completed.
 - **Affected components:** `backend/app/runtime_config.py`, `backend/app/main.py`, `infra/cdk/`, and deployment documentation.
 - **Validation:** Pytest, compilation, CDK synthesis, documentation sync, and diff checks pass.
+
+## DEC-024 — Bound comparable runs and make observation metadata-only
+
+- **Date / run:** 2026-09-08 / `REAL-POSTTRAINING-RUNS-001`
+- **Status:** Accepted
+- **Context:** The hackathon demo needs repeatable improvement evidence across multiple candidate runs while keeping telemetry safe to inspect.
+- **Decision:** Permit at most five sequential top-level run IDs. Reserve each slot atomically in DynamoDB with a counter and next-run condition; compare only compatible verified evidence. Expose JSON/SVG comparison endpoints. Emit run/phase/job/promotion telemetry with correlation IDs, latency/cost, recursive redaction, immutable attributes, and optional OpenTelemetry.
+- **Alternatives:** Process-local counters; random promotion values; raw prompt/completion logging; graphing incomplete records.
+- **Reason:** The registry and gate make promotion reproducible, while metadata-only observation prevents task or secret leakage.
+- **Trade-offs:** Local mode remains process-local; a live `LIVE` result still requires an external objective worker, pre-existing AWS resources, model checkpoint, and hashed evaluation manifest.
+- **Affected components:** Run history, DynamoDB repository, comparison graph/API, objective benchmark/SageMaker lifecycle boundary, runtime configuration, orchestrator guards, telemetry, and documentation.
+- **Validation:** Full backend pytest passed; focused Ruff and mypy checks passed. No live AWS training, held-out evaluation, checkpoint improvement, or promotion was executed.

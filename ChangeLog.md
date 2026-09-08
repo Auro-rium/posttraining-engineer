@@ -153,3 +153,10 @@ This file is append-only. Entries describe repository changes and the verificati
 - **Goal:** Preserve the requested FunctionGemma-only target scope.
 - **Summary of changes:** Reverted the default target to `google/functiongemma-270m-it`. `nvidia.nemotron-super-3-120b` remains the Strands reasoning model only.
 - **Known limitations:** FunctionGemma is not listed as an active Bedrock foundation model in this account. Real post-training therefore requires the user-supplied FunctionGemma checkpoint or an approved external model artifact; no substitute Gemma target is used.
+
+## 2026-09-08 — `REAL-POSTTRAINING-RUNS-001`
+
+- **Goal:** Add a bounded, evidence-first five-run comparison path with telemetry and guarded AWS execution contracts.
+- **Summary of changes:** Added immutable run-history records and a DynamoDB transaction that enforces unique sequential run numbers and the five-run cap; deterministic promotion evidence checks; JSON/SVG aggregate and per-environment comparison output at `/api/runs/compare` and `/api/runs/graph`; objective benchmark provenance and bounded SageMaker train-then-evaluate polling; removal of random promotion and placeholder artifact fallbacks; and metadata-only telemetry with correlation IDs, latency/cost fields, recursive redaction, immutable attributes, and optional OpenTelemetry.
+- **Verification:** Full backend pytest suite passed; focused Ruff and mypy checks passed for new/changed contracts; documentation and diff checks remain required before integration.
+- **Known limitations:** No live AWS training, held-out evaluation, checkpoint improvement, or promotion was executed. AWS mode constructs adapters for pre-existing configured resources but does not provision them; the objective worker, training/evaluation images, checkpoint, and manifest must be supplied before a `LIVE` result can be recorded. Local history remains process-local and terminal comparison rows require verified artifacts.

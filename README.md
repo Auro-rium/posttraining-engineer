@@ -42,7 +42,7 @@ The Python backend provides eight logical roles behind three service modes:
 | `research` | Failure Analyst, Research Agent, Data Curator, Training Designer | Grounds a hypothesis with RAG, proposes replay-verifiable data, and selects a bounded QLoRA configuration. |
 | `execution` | Benchmark Runner, Training Executor, Evaluation Agent, Champion Manager | Produces trajectories, launches training, evaluates identical task sets, and applies deterministic gates. |
 
-The same immutable container runs all modes through `SERVICE_ROLE`. The AWS submission path is Strands-first and is designed to use Amazon Bedrock, S3, DynamoDB, SageMaker, and optional AgentCore/CloudWatch integrations. The current repository run uses in-memory state and explicit `EXPLANATION` adapters; those outputs are not a hackathon result.
+The same immutable container runs all modes through `SERVICE_ROLE`. The AWS submission path is Strands-first and is designed to use Amazon Bedrock, S3, DynamoDB, SageMaker, and optional AgentCore/CloudWatch integrations. The repository now includes a bounded five-run history/graph contract, guarded objective-worker and SageMaker lifecycle boundaries, and metadata-only telemetry. The current repository run still uses in-memory state and explicit `EXPLANATION` adapters; those outputs are not a hackathon result.
 
 Each specialist has an explicit safety contract: Benchmark Runner accepts train-side evidence only; Failure Analyst must ground clusters in trajectory IDs; Research Agent must return a falsifiable hypothesis; Data Curator may propose but never verify repairs; Training Designer must stay inside the QLoRA whitelist; Training Executor may report only provider-backed artifacts; Evaluation Agent returns objective evidence without deciding promotion; and Champion Manager explains but cannot override the deterministic gate.
 
@@ -56,10 +56,12 @@ The API is intentionally small:
 - `POST /api/runs/{run_id}/step`
 - `POST /api/runs/{run_id}/auto`
 - `POST /api/runs/{run_id}/cancel`
+- `GET /api/runs/compare`
+- `GET /api/runs/graph`
 - `POST /api/demo/reset-environment`
 - `GET /health`
 
-`POST /api/runs/{run_id}/auto` runs the bounded local demonstration in the current process. A production AWS adapter must replace `active_runs` with DynamoDB and persist provider job IDs before polling. Use explicit `/step` calls for the repeatable local walkthrough.
+`POST /api/runs/{run_id}/auto` runs the bounded local workflow in the current process. The comparison endpoints accept one to five run IDs and render only records with measured baseline/candidate metrics. A production AWS adapter must replace `active_runs` with durable state and persist provider job IDs before polling. Use explicit `/step` calls for the repeatable local walkthrough.
 
 See [Flow.md](Flow.md) for control flow and [Decisions.md](Decisions.md) for the reasons behind the architecture.
 
@@ -73,13 +75,19 @@ claimed; no `LIVE_AWS` run is included in this repository state.
 | Capability | `LOCAL_DEMO` (current checkout) | `LIVE_AWS` (claim requires evidence) |
 | --- | --- | --- |
 | Strands specialist workflow | Eight role contracts initialize and execute a bounded local workflow. | Bedrock-backed agent decisions and authenticated service boundaries. |
-| Run control | In-memory `OptimizationRun`; `/step` advances one phase and `/auto` runs the remaining phases in-process. | Durable run ownership, idempotent commands, and restart-safe orchestration. |
+| Run control | In-memory `OptimizationRun` plus a process-local bounded history registry; `/step` advances one phase and `/auto` runs the remaining phases in-process. | Durable run ownership, idempotent commands, and restart-safe orchestration through DynamoDB. |
 | Benchmark and trajectories | Service-recovery fixture returns explanatory trajectories and simulated metrics. | Objective environment worker produces immutable S3 artifacts with hashes and provider/run IDs. |
 | Curation and QLoRA design | Agents return structured demonstration outputs and bounded configurations. | Replay-verified training rows and a recorded, budget-compliant training specification. |
-| Training execution | Simulated submission/status and placeholder artifact references; not model evidence. | SageMaker job submission, polling, logs, and an immutable checkpoint manifest. |
+| Training execution | Missing objective/training adapters fail closed; no checkpoint or job is fabricated. | SageMaker job submission, bounded polling, logs, and an immutable checkpoint manifest. |
 | Evaluation and promotion | Deterministic gate code is exercised locally, but local metrics are simulated and cannot prove improvement. | Independent evaluation on identical sealed inputs, with artifact-backed metrics and a deterministic promotion decision. |
 | Continuous trigger and event ingestion | `TraceEvent` validation, duplicate suppression, ordered in-memory storage, and deterministic per-run threshold triggering are covered locally; they are not wired to the FastAPI run routes. | EventBridge/SQS delivery into durable event storage, idempotent cycle creation, and a worker that starts the post-training run. |
-| State, artifacts, and run API | Process memory and local response payloads; no durable run/event log or event-stream endpoint. | DynamoDB run/event records, S3 artifacts, and a resumable ordered event stream. |
+| State, artifacts, and run API | Process memory plus JSON/SVG comparison responses; no durable local run/event log. | DynamoDB run history/events, S3 artifacts, and a resumable ordered event stream. |
+
+Telemetry/observation is emitted at run, phase, job, and promotion transitions.
+Events correlate `run_id`, run number, experiment, phase, and provider job while
+redacting prompts, outputs, trajectories, held-out data, credentials, and
+unknown free-form strings. Logging is the default sink; OTLP/OpenTelemetry is
+optional and sink failures never change run outcomes.
 
 The evidence labels used in outputs are `LIVE` (verified by the current AWS
 request), `PRIOR_VERIFIED_RUN` (a prior run with provider IDs and hashes), and
@@ -94,7 +102,7 @@ Every externally shown artifact has one of three labels:
 - `PRIOR_VERIFIED_RUN`: produced by a real earlier run with hashes and provider job identifiers.
 - `EXPLANATION`: fixture or explanatory content that is never presented as measured output.
 
-Strands model calls may analyze failures and propose hypotheses, repairs, and configurations. They may not grade their own repairs or candidates. Deterministic code enforces replay admission, the two-candidate budget, identical evaluation inputs, and checkpoint promotion. Held-out tasks are excluded from prompts, repairs, training data, and telemetry.
+Strands model calls may analyze failures and propose hypotheses, repairs, and configurations. They may not grade their own repairs or candidates. Deterministic code enforces replay admission, the five-run budget, identical evaluation inputs, verified evidence provenance, and checkpoint promotion. Held-out tasks are excluded from prompts, repairs, training data, and telemetry.
 
 ## Credential-free contract verification
 
@@ -152,7 +160,7 @@ docker compose config --quiet
 
 ## AWS deployment status
 
-The AWS/Strands implementation is currently a local, credential-free demonstration. It does not yet provision or call Bedrock, SageMaker, DynamoDB, S3, AgentCore, or CloudWatch. Do not describe the placeholder S3 URIs, randomized metrics, or local state as live AWS evidence.
+The AWS/Strands implementation has not been executed as a live post-training run in this checkout. The repository does not provision cloud resources; AWS mode only constructs adapters for pre-existing configured S3, DynamoDB, and SageMaker resources. Do not describe local state or explanatory adapters as live AWS evidence.
 
 For a live submission path, wire the existing role contracts to AWS adapters in this order: Bedrock model invocation for agent decisions; S3 for immutable trajectories, datasets, and checkpoints; DynamoDB for `OptimizationRun` and events; SageMaker for QLoRA execution; and optional AgentCore hosting plus CloudWatch traces. Record the exact AWS resource IDs and artifact hashes in the run before showing a metric.
 
@@ -164,9 +172,9 @@ All contributors and agents must follow [AGENTS.md](AGENTS.md): read the living 
 
 ## Current limitations
 
-- No AWS deployment, Bedrock invocation, SageMaker training job, checkpoint improvement, or model metric is claimed until its real artifact is recorded.
+- No live Gemma inference, SageMaker training job, held-out evaluation, checkpoint improvement, or model metric is claimed until its real artifact, provider job IDs, and manifest digest are recorded.
 - Evaluation is explicitly requested as AgentGym AgentEval (`agent-eval-v1`); live reports must include the immutable AgentEval manifest SHA-256 and are accepted only when champion and candidate use the same suite/version.
 - Credential-free adapters execute only the local service-recovery explanation fixture; live environments require configured AWS workers and model access.
-- S3/DynamoDB/SageMaker/AgentCore integrations are deployment prerequisites and are not provisioned by this repository yet.
+- S3/DynamoDB/SageMaker/AgentCore resources and the sandboxed objective worker are deployment prerequisites and are not provisioned by this repository.
 - A process restart currently loses in-memory runs; durable AWS persistence and provider job reconciliation remain required before claiming recoverability.
 - Authentication, multi-tenancy, billing, continuous training, multiple target models, and a frontend are out of scope.

@@ -26,6 +26,19 @@ Live AWS target (not yet deployed):
   DynamoDB -> durable run state and events
   SageMaker -> QLoRA training
   AgentCore/CloudWatch -> optional hosting and observability
+
+Run history and observation contracts:
+
+```text
+RunRegistry -> DynamoDB transaction (unique run number 1..5)
+           -> ComparisonDTO -> JSON chart data + self-contained SVG
+Run/phase/job transitions -> TelemetryRecorder
+           -> redacted logger/exporter and optional OpenTelemetry spans
+```
+
+Telemetry is operational metadata only. Prompts, raw completions, trajectories,
+held-out tasks, credentials, and secret-like values are redacted and event
+attributes are immutable after emission.
 ```
 
 The current local path uses the same role boundaries but keeps state in memory
@@ -53,6 +66,11 @@ does not create compute or persistent infrastructure.
    a passing candidate can replace the champion.
 7. The run ends after promotion, rejection of the allowed candidates,
    cancellation, or a terminal failure.
+
+The comparison API exposes `GET /api/runs/compare` and
+`GET /api/runs/graph` for one to five persisted run IDs. A graph is only
+rendered when every selected run has measured baseline/candidate metrics;
+pending or explanatory records fail closed rather than becoming a score.
 
 ## Continuous API and event flow
 
@@ -165,6 +183,8 @@ restart.
 - `POST /api/runs/{run_id}/auto`
 - `POST /api/runs/{run_id}/cancel`
 - `POST /api/demo/reset-environment`
+- `GET /api/runs/compare?run_ids=run-001&run_ids=run-002`
+- `GET /api/runs/graph?run_ids=run-001&run_ids=run-002`
 
 The list above is the currently implemented local surface. A live deployment
 may add an authenticated resumable event-stream endpoint once durable event

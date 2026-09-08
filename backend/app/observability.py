@@ -39,6 +39,7 @@ class EventType(StrEnum):
     RUN_FAILED = "run.failed"
     PHASE_STARTED = "phase.started"
     PHASE_COMPLETED = "phase.completed"
+    PHASE_FAILED = "phase.failed"
     JOB_SUBMITTED = "job.submitted"
     JOB_COMPLETED = "job.completed"
     JOB_FAILED = "job.failed"
