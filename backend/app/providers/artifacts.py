@@ -12,6 +12,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from re import fullmatch
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
 
@@ -21,7 +22,7 @@ class OptionalDependencyError(RuntimeError):
 
 
 class ArtifactIntegrityError(ValueError):
-    """Raised when downloaded bytes do not match their recorded digest."""
+    """Raised when an artifact cannot be proven immutable and content-addressed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +202,221 @@ class S3ArtifactStore:
                 f"Artifact hash mismatch for {ref.version_ref}: expected {ref.sha256}, got {actual}"
             )
         return data
+
+    @staticmethod
+    def _required_version(value: object, *, context: str = "artifact") -> str:
+        if not isinstance(value, str) or not value.strip() or value.strip().lower() == "null":
+            raise ArtifactIntegrityError(f"{context} requires an immutable VersionId")
+        return value.strip()
+
+    @staticmethod
+    def _required_digest(value: object, *, context: str = "artifact") -> str:
+        if not isinstance(value, str) or fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ArtifactIntegrityError(f"{context} requires a lowercase SHA-256 digest")
+        return value
+
+    @staticmethod
+    def _required_size(value: object, *, context: str = "artifact") -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ArtifactIntegrityError(f"{context} requires a non-negative expected size")
+        return value
+
+    @staticmethod
+    def _metadata(response: Mapping[str, Any]) -> Mapping[str, Any]:
+        metadata = response.get("Metadata")
+        return metadata if isinstance(metadata, Mapping) else {}
+
+    @staticmethod
+    def _metadata_value(metadata: Mapping[str, Any], name: str) -> object:
+        for key, value in metadata.items():
+            if str(key).lower() == name.lower():
+                return value
+        return None
+
+    @staticmethod
+    def _key_in_prefix(key: str, prefix: str) -> bool:
+        clean_prefix = prefix.strip("/")
+        clean_key = key.strip("/")
+        return (
+            not clean_prefix
+            or clean_key == clean_prefix
+            or clean_key.startswith(f"{clean_prefix}/")
+        )
+
+    def _exact_object(self, ref: ArtifactRef) -> bytes:
+        version_id = self._required_version(ref.version_id)
+        response = self._client_or_create().get_object(
+            Bucket=ref.bucket,
+            Key=ref.key,
+            VersionId=version_id,
+        )
+        response_mapping = dict(response)
+        response_version = self._required_version(
+            response_mapping.get("VersionId"), context="downloaded artifact"
+        )
+        if response_version != version_id:
+            raise ArtifactIntegrityError(
+                "downloaded artifact VersionId does not match the requested immutable version"
+            )
+        body = response_mapping.get("Body")
+        if body is None:
+            raise ArtifactIntegrityError("S3 object response did not contain a body")
+        data = body.read() if hasattr(body, "read") else bytes(body)
+        if not isinstance(data, bytes):
+            data = bytes(data)
+        return data
+
+    def verify_immutable(
+        self,
+        ref: ArtifactRef,
+        *,
+        expected_sha256: str | None = None,
+        expected_size_bytes: int | None = None,
+        allowed_bucket: str | None = None,
+        allowed_prefix: str | None = None,
+    ) -> ArtifactRef:
+        """Verify one exact S3 object version before it enters live evidence.
+
+        Every expected property is checked against both S3 metadata and the
+        downloaded bytes.  The version and location checks happen before any
+        S3 operation so an untrusted reference cannot be used to probe another
+        bucket or mutable current object.
+        """
+
+        version_id = self._required_version(ref.version_id)
+        digest = self._required_digest(
+            ref.sha256 if expected_sha256 is None else expected_sha256
+        )
+        size_bytes = self._required_size(
+            ref.size_bytes if expected_size_bytes is None else expected_size_bytes
+        )
+        bucket = self.bucket if allowed_bucket is None else allowed_bucket
+        if not isinstance(bucket, str) or not bucket.strip() or ref.bucket != bucket:
+            raise ArtifactIntegrityError("artifact is outside the allowed bucket")
+        prefix = self.prefix if allowed_prefix is None else allowed_prefix
+        if not isinstance(prefix, str) or not self._key_in_prefix(ref.key, prefix):
+            raise ArtifactIntegrityError("artifact is outside the allowed prefix")
+
+        head = dict(
+            self._client_or_create().head_object(
+                Bucket=ref.bucket,
+                Key=ref.key,
+                VersionId=version_id,
+            )
+        )
+        head_version = self._required_version(head.get("VersionId"), context="S3 head")
+        if head_version != version_id:
+            raise ArtifactIntegrityError("S3 head VersionId does not match the requested version")
+        metadata = self._metadata(head)
+        metadata_digest = self._metadata_value(metadata, "sha256")
+        if metadata_digest != digest:
+            raise ArtifactIntegrityError("S3 metadata SHA-256 does not match the expected digest")
+        observed_size = head.get("ContentLength")
+        if observed_size != size_bytes:
+            raise ArtifactIntegrityError("S3 metadata size does not match the expected size")
+
+        data = self._exact_object(ref)
+        if len(data) != size_bytes:
+            raise ArtifactIntegrityError("downloaded bytes size does not match the expected size")
+        actual_digest = self.sha256(data)
+        if actual_digest != digest:
+            raise ArtifactIntegrityError(
+                "downloaded bytes SHA-256 does not match the expected digest"
+            )
+        return ArtifactRef(
+            bucket=ref.bucket,
+            key=ref.key,
+            sha256=digest,
+            size_bytes=size_bytes,
+            version_id=version_id,
+            content_type=(
+                str(head.get("ContentType")) if head.get("ContentType") else ref.content_type
+            ),
+            etag=(str(head.get("ETag")) if head.get("ETag") else ref.etag),
+        )
+
+    # Keep a short name for supervisor/provider callers while retaining the
+    # explicit name for code review and audit logs.
+    verify = verify_immutable
+
+    def canonicalize_sagemaker_output(
+        self,
+        output_uri: str,
+        *,
+        retained_prefix: str,
+        expected_sha256: str | None = None,
+        expected_size_bytes: int | None = None,
+    ) -> ArtifactRef:
+        """Copy a SageMaker output archive into a retained content-addressed object.
+
+        SageMaker output paths are mutable and their user metadata is not used
+        as the checkpoint identity.  The current version is pinned, the bytes
+        are downloaded, and a digest-derived key is uploaded to this store.
+        The retained upload must itself be versioned and is verified end-to-end.
+        """
+
+        parsed = urlparse(output_uri)
+        if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+            raise ArtifactIntegrityError(f"Not an S3 output archive URI: {output_uri!r}")
+        source_key = parsed.path.lstrip("/")
+        source_versions = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
+        if len(source_versions) > 1 or (source_versions and not source_versions[0]):
+            raise ArtifactIntegrityError("SageMaker output URI has an invalid VersionId")
+        source_version = source_versions[0] if source_versions else None
+        head_kwargs: dict[str, Any] = {"Bucket": parsed.netloc, "Key": source_key}
+        if source_version:
+            head_kwargs["VersionId"] = self._required_version(source_version, context="output")
+        head = dict(self._client_or_create().head_object(**head_kwargs))
+        resolved_version = self._required_version(head.get("VersionId"), context="SageMaker output")
+        source_ref = ArtifactRef(
+            bucket=parsed.netloc,
+            key=source_key,
+            sha256="0" * 64,
+            size_bytes=(
+                int(head["ContentLength"])
+                if isinstance(head.get("ContentLength"), int)
+                and not isinstance(head.get("ContentLength"), bool)
+                else 0
+            ),
+            version_id=resolved_version,
+        )
+        data = self._exact_object(source_ref)
+        digest = self.sha256(data)
+        if expected_sha256 is not None and digest != self._required_digest(expected_sha256):
+            raise ArtifactIntegrityError(
+                "downloaded output archive SHA-256 does not match expected digest"
+            )
+        if expected_size_bytes is not None and len(data) != self._required_size(
+            expected_size_bytes
+        ):
+            raise ArtifactIntegrityError(
+                "downloaded output archive size does not match expected size"
+            )
+        clean_prefix = retained_prefix.strip("/")
+        if not clean_prefix:
+            raise ArtifactIntegrityError("retained_prefix must not be empty")
+        retained_key = f"{clean_prefix}/{digest}.tar.gz"
+        retained = self.put_bytes(
+            retained_key,
+            data,
+            content_type="application/gzip",
+            metadata={
+                "source-uri": output_uri,
+                "source-version-id": resolved_version,
+                "sha256": digest,
+            },
+        )
+        self._required_version(retained.version_id, context="retained artifact")
+        return self.verify_immutable(
+            retained,
+            expected_sha256=digest,
+            expected_size_bytes=len(data),
+        )
+
+    # Descriptive aliases for supervisor code that calls this operation
+    # retention or output canonicalization.
+    retain_sagemaker_output = canonicalize_sagemaker_output
+    canonicalize_output_archive = canonicalize_sagemaker_output
 
     def get_json(self, ref: ArtifactRef) -> Any:
         return json.loads(self.get_bytes(ref).decode("utf-8"))
