@@ -13,6 +13,7 @@ from app.autonomous.models import (
     RunOperation,
     RunOperationStatus,
     RunPhase,
+    validate_event_reason,
 )
 from app.autonomous.repository import (
     ApprovalAlreadyConsumedError,
@@ -206,7 +207,7 @@ def test_event_and_history_reads_are_paginated() -> None:
             expected_version=index,
             status=AutonomousRunStatus.RUNNING,
             phase=RunPhase.BASELINE,
-            reason=f"tick {index}",
+            reason="queued",
         )
     events = repository.list_events("run-1", after_sequence=1, limit=1)
     assert [event.sequence for event in events.items] == [2]
@@ -460,6 +461,34 @@ def test_event_reason_accepts_safe_lifecycle_phrases() -> None:
             reason=reason,
         )
         assert event.reason == reason
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "provider request timed out",
+        "safe stop requested",
+        "baseline completed",
+        "provider_request_timed_out",
+        "SAFE_STOP_REQUESTED",
+    ],
+)
+def test_event_reason_validator_accepts_exact_lifecycle_phrases_and_codes(reason: str) -> None:
+    assert validate_event_reason(reason) == reason
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "provider said customer Alice",
+        "provider request timed out for customer Alice",
+        "new arbitrary lifecycle reason",
+        "PROVIDER_SAID_CUSTOMER_ALICE",
+    ],
+)
+def test_event_reason_validator_rejects_free_form_or_unallowlisted_reasons(reason: str) -> None:
+    with pytest.raises(ValueError, match="reason"):
+        validate_event_reason(reason)
 
 
 def test_event_metadata_requires_finite_numbers_and_allows_opaque_artifact_paths() -> None:

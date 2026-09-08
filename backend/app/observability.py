@@ -102,6 +102,7 @@ _OPERATIONAL_METADATA_KEYS = frozenset(
         "episode_count",
         "error_code",
         "evaluation_status",
+        "event_id",
         "experiment_id",
         "job_id",
         "job_type",

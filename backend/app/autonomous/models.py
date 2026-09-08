@@ -23,14 +23,142 @@ _UNSAFE_CONTENT = re.compile(
     r"task\s+content|private\b|answer\b|response\b|completion\b)",
     re.IGNORECASE,
 )
-_CONTROL_REASON_WORDS = frozenset(
-    "approval packet stale worker queued baseline failure analysis research curation training "
-    "checkpoint validation evaluation promotion promoted rejected succeeded failed blocked "
-    "cancelled cancel safe stop lease claimed renewed released operation submitted provider "
-    "experiment phase transition request completed available unavailable run job timed out "
-    "started requested tick".split()
-)
 _OPAQUE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/#@+\-]{0,511}$")
+
+# Reasons are control-plane labels, never an open-ended text field.  Keep this
+# allow-list finite so adding a new reason is an intentional protocol change.
+_EVENT_REASON_PHRASES = frozenset(
+    {
+        "approval consumed",
+        "approval packet consumed",
+        "artifact recorded",
+        "baseline completed",
+        "baseline failed",
+        "cancel requested",
+        "checkpoint validation completed",
+        "cleanup completed",
+        "cleanup failed",
+        "completed",
+        "curation completed",
+        "evaluation completed",
+        "experiment completed",
+        "failure analysis completed",
+        "job completed",
+        "job failed",
+        "job submitted",
+        "lease claimed",
+        "lease released",
+        "lease renewed",
+        "operation completed",
+        "operation failed",
+        "operation submitted",
+        "phase completed",
+        "phase failed",
+        "phase started",
+        "phase transition",
+        "promoted",
+        "promotion decided",
+        "provider job failed",
+        "provider request timed out",
+        "queued",
+        "rejected",
+        "requested",
+        "research completed",
+        "run blocked",
+        "run cancelled",
+        "run completed",
+        "run failed",
+        "run queued",
+        "run started",
+        "run stopped",
+        "safe stop requested",
+        "stale worker",
+        "started",
+        "submitted",
+        "training completed",
+        "worker started",
+    }
+)
+_EVENT_REASON_CODES = frozenset(
+    {
+        "approval_consumed",
+        "approval_packet_consumed",
+        "artifact_recorded",
+        "baseline_completed",
+        "baseline_failed",
+        "cancel_requested",
+        "checkpoint_validation_completed",
+        "cleanup_completed",
+        "cleanup_failed",
+        "curation_completed",
+        "evaluation_completed",
+        "experiment_completed",
+        "failure_analysis_completed",
+        "job_completed",
+        "job_failed",
+        "job_submitted",
+        "lease_claimed",
+        "lease_released",
+        "lease_renewed",
+        "operation_completed",
+        "operation_failed",
+        "operation_submitted",
+        "phase_completed",
+        "phase_failed",
+        "phase_started",
+        "phase_transition",
+        "promotion_decided",
+        "provider_job_failed",
+        "provider_request_timed_out",
+        "provider_timeout",
+        "queued",
+        "rejected",
+        "requested",
+        "research_completed",
+        "run_blocked",
+        "run_cancelled",
+        "run_completed",
+        "run_failed",
+        "run_queued",
+        "run_started",
+        "run_stopped",
+        "safe_stop_requested",
+        "started",
+        "submitted",
+        "training_completed",
+        "worker_started",
+    }
+    | {
+        code.upper()
+        for code in {
+            "approval_consumed",
+            "approval_packet_consumed",
+            "cancel_requested",
+            "provider_request_timed_out",
+            "provider_timeout",
+            "run_completed",
+            "safe_stop_requested",
+        }
+    }
+)
+def validate_event_reason(value: str) -> str:
+    """Validate one exact, metadata-only lifecycle reason.
+
+    The telemetry bridge calls this same function before persistence, keeping
+    the observer and repository reason boundaries identical.
+    """
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 2_000
+        or (
+            value not in _EVENT_REASON_PHRASES
+            and value not in _EVENT_REASON_CODES
+        )
+    ):
+        raise ValueError("event reason must be an exact safe lifecycle reason")
+    return value
 
 
 class FrozenDict(dict[str, Any]):
@@ -83,6 +211,7 @@ _EVENT_METADATA_KEYS = frozenset(
         "provider_id",
         "reason_code",
         "run_id",
+        "run_number",
         "status",
     }
 )
@@ -107,6 +236,9 @@ def _validate_event_metadata(value: dict[str, str]) -> FrozenDict:
             raise ValueError("event phase metadata must use a known run phase")
         if key == "evidence_label" and item not in {"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"}:
             raise ValueError("event evidence label metadata is invalid")
+        if key == "run_number":
+            if not item.isdigit() or not 1 <= int(item) <= 5:
+                raise ValueError("event run number metadata must be between 1 and 5")
         if key in {"cost_usd", "latency_ms"}:
             try:
                 numeric = float(item)
@@ -289,12 +421,7 @@ class RunEventRecord(ContractModel):
     @field_validator("reason")
     @classmethod
     def reject_unsafe_reason(cls, value: str) -> str:
-        words = re.findall(r"[a-z0-9]+", value.lower())
-        if _UNSAFE_CONTENT.search(value) or not any(
-            word in _CONTROL_REASON_WORDS for word in words
-        ):
-            raise ValueError("event reason may not contain raw or sealed content")
-        return value
+        return validate_event_reason(value)
 
     @field_validator("metadata", mode="after")
     @classmethod
@@ -424,4 +551,5 @@ __all__ = [
     "RunPhase",
     "copy_for_storage",
     "utc_now",
+    "validate_event_reason",
 ]

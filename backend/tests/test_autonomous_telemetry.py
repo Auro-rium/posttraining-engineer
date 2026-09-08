@@ -9,12 +9,15 @@ from typing import Any, cast
 import pytest
 
 from app.autonomous.models import AutonomousRunState, AutonomousRunStatus, RunEventRecord, RunPhase
+from app.autonomous.repository import InMemoryAutonomousRunRepository
 from app.autonomous.telemetry import (
+    CANONICAL_EVENT_TYPES,
     AutonomousEventType,
     DurableTelemetryBridge,
     DurableTelemetryError,
     validate_safe_metadata,
 )
+from app.observability import TelemetryRecorder
 
 
 class RecordingRepository:
@@ -105,6 +108,7 @@ def test_emit_persists_safe_event_before_forwarding_optional_telemetry() -> None
     assert persisted.event_type == "phase.started"
     assert persisted.metadata["phase"] == "BASELINE"
     assert persisted.metadata["latency_ms"] == "12.5"
+    assert persisted.metadata["run_number"] == "1"
     event_type = sink.calls[0]["event_type"]
     assert getattr(event_type, "value", event_type) == "phase.started"
 
@@ -165,6 +169,143 @@ def test_optional_sink_failure_does_not_change_successful_durable_event() -> Non
 
     assert event is repository.events[0]
     assert len(repository.events) == 1
+
+
+def test_durable_event_id_is_forwarded_to_optional_sink_metadata() -> None:
+    repository = RecordingRepository()
+    sink = RecordingSink()
+    bridge = DurableTelemetryBridge(repository, recorder=sink)
+
+    persisted = bridge.emit(
+        AutonomousEventType.RUN_STARTED,
+        run_id="run-1",
+        run_number=1,
+        experiment_id="exp-1",
+        reason="started",
+    )
+
+    assert sink.calls[0]["attributes"]["event_id"] == persisted.event_id
+
+
+def test_durable_event_id_survives_existing_recorder_sanitization() -> None:
+    repository = RecordingRepository()
+    exported: list[dict[str, object]] = []
+    bridge = DurableTelemetryBridge(
+        repository,
+        recorder=TelemetryRecorder(exporter=exported.append, logger=None, tracer=None),
+    )
+
+    persisted = bridge.emit(
+        AutonomousEventType.RUN_STARTED,
+        run_id="run-1",
+        run_number=1,
+        experiment_id="exp-1",
+        reason="started",
+    )
+
+    attributes = cast(dict[str, object], exported[0]["attributes"])
+    assert attributes["event_id"] == persisted.event_id
+
+
+def test_transition_forwards_the_repository_generated_event_id() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(
+        AutonomousRunState(
+            run_id="run-1",
+            checkpoint_revision="a" * 40,
+            benchmark_manifest_sha256="b" * 64,
+        )
+    )
+    sink = RecordingSink()
+    bridge = DurableTelemetryBridge(repository, recorder=sink)
+
+    bridge.transition(
+        AutonomousEventType.RUN_COMPLETED,
+        run_id="run-1",
+        expected_version=0,
+        status=AutonomousRunStatus.SUCCEEDED,
+        phase=RunPhase.COMPLETED,
+        reason="completed",
+        run_number=1,
+        experiment_id="exp-1",
+    )
+
+    persisted = repository.list_events("run-1")[0]
+    assert sink.calls[0]["attributes"]["event_id"] == persisted.event_id
+
+
+def test_event_specific_correlation_fields_are_required() -> None:
+    repository = RecordingRepository()
+    bridge = DurableTelemetryBridge(repository)
+
+    with pytest.raises(ValueError, match="phase"):
+        bridge.emit(
+            AutonomousEventType.PHASE_STARTED,
+            run_id="run-1",
+            run_number=1,
+            experiment_id="exp-1",
+            reason="started",
+        )
+    with pytest.raises(ValueError, match="job_id"):
+        bridge.emit(
+            AutonomousEventType.JOB_SUBMITTED,
+            run_id="run-1",
+            run_number=1,
+            experiment_id="exp-1",
+            reason="submitted",
+        )
+    with pytest.raises(ValueError, match="operation_key"):
+        bridge.emit(
+            AutonomousEventType.OPERATION_INTENT,
+            run_id="run-1",
+            run_number=1,
+            experiment_id="exp-1",
+            reason="requested",
+        )
+
+
+def test_explicit_repository_style_wrappers_keep_argument_order_unambiguous() -> None:
+    repository = RecordingRepository()
+    bridge = DurableTelemetryBridge(repository)
+
+    emitted = bridge.append_event(
+        "run-1",
+        event_type=AutonomousEventType.RUN_STARTED,
+        run_number=1,
+        experiment_id="exp-1",
+        reason="started",
+    )
+    assert emitted is repository.events[0]
+
+    transitioned = bridge.transition_run(
+        "run-1",
+        event_type=AutonomousEventType.RUN_COMPLETED,
+        expected_version=2,
+        status=AutonomousRunStatus.SUCCEEDED,
+        phase=RunPhase.COMPLETED,
+        reason="completed",
+        run_number=1,
+        experiment_id="exp-1",
+    )
+    assert transitioned is repository.transition_result
+
+
+def test_rejects_unstructured_reason_before_persistence() -> None:
+    repository = RecordingRepository()
+    bridge = DurableTelemetryBridge(repository)
+    with pytest.raises(ValueError, match="reason"):
+        bridge.emit(
+            AutonomousEventType.RUN_STARTED,
+            run_id="run-1",
+            run_number=1,
+            experiment_id="exp-1",
+            reason="something entirely free form",
+        )
+
+
+def test_new_semantic_events_map_to_existing_observer_vocabulary() -> None:
+    assert CANONICAL_EVENT_TYPES[AutonomousEventType.OPERATION_INTENT].value == "job.submitted"
+    assert CANONICAL_EVENT_TYPES[AutonomousEventType.OPERATION_COMPLETED].value == "job.completed"
 
 
 @pytest.mark.parametrize(

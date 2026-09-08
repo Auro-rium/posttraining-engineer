@@ -22,6 +22,7 @@ from .models import (
     AutonomousRunStatus,
     RunEventRecord,
     RunPhase,
+    validate_event_reason,
 )
 
 
@@ -51,6 +52,33 @@ class AutonomousEventType(StrEnum):
     ARTIFACT_RECORDED = "artifact.recorded"
     CLEANUP_COMPLETED = "cleanup.completed"
     CLEANUP_FAILED = "cleanup.failed"
+
+
+CANONICAL_EVENT_TYPES: Final[dict[AutonomousEventType, ObserverEventType]] = {
+    AutonomousEventType.RUN_STARTED: ObserverEventType.RUN_STARTED,
+    AutonomousEventType.RUN_QUEUED: ObserverEventType.RUN_STARTED,
+    AutonomousEventType.RUN_COMPLETED: ObserverEventType.RUN_COMPLETED,
+    AutonomousEventType.RUN_FAILED: ObserverEventType.RUN_FAILED,
+    AutonomousEventType.RUN_CANCEL_REQUESTED: ObserverEventType.RUN_FAILED,
+    AutonomousEventType.RUN_CANCELLED: ObserverEventType.RUN_COMPLETED,
+    AutonomousEventType.RUN_SAFE_STOP_REQUESTED: ObserverEventType.RUN_FAILED,
+    AutonomousEventType.RUN_STOPPED: ObserverEventType.RUN_COMPLETED,
+    AutonomousEventType.APPROVAL_CONSUMED: ObserverEventType.RUN_STARTED,
+    AutonomousEventType.PHASE_STARTED: ObserverEventType.PHASE_STARTED,
+    AutonomousEventType.PHASE_COMPLETED: ObserverEventType.PHASE_COMPLETED,
+    AutonomousEventType.PHASE_FAILED: ObserverEventType.PHASE_FAILED,
+    AutonomousEventType.JOB_SUBMITTED: ObserverEventType.JOB_SUBMITTED,
+    AutonomousEventType.JOB_COMPLETED: ObserverEventType.JOB_COMPLETED,
+    AutonomousEventType.JOB_FAILED: ObserverEventType.JOB_FAILED,
+    AutonomousEventType.OPERATION_INTENT: ObserverEventType.JOB_SUBMITTED,
+    AutonomousEventType.OPERATION_SUBMITTED: ObserverEventType.JOB_SUBMITTED,
+    AutonomousEventType.OPERATION_COMPLETED: ObserverEventType.JOB_COMPLETED,
+    AutonomousEventType.OPERATION_FAILED: ObserverEventType.JOB_FAILED,
+    AutonomousEventType.PROMOTION_DECIDED: ObserverEventType.PROMOTION_DECIDED,
+    AutonomousEventType.ARTIFACT_RECORDED: ObserverEventType.PHASE_COMPLETED,
+    AutonomousEventType.CLEANUP_COMPLETED: ObserverEventType.CLEANUP_COMPLETED,
+    AutonomousEventType.CLEANUP_FAILED: ObserverEventType.CLEANUP_FAILED,
+}
 
 
 # Compatibility names keep the bridge easy to discover for supervisor callers.
@@ -114,6 +142,7 @@ SAFE_METADATA_KEYS: Final[frozenset[str]] = frozenset(
         "provider_id",
         "reason_code",
         "run_id",
+        "run_number",
         "status",
     }
 )
@@ -122,10 +151,57 @@ _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/#@+\-]{0,511}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE = re.compile(
     r"(?:prompt|completion|trajectory|hidden|sealed|secret|credential|password|token|"
-    r"authorization|api[_-]?key|access[_-]?key|private[_-]?key|raw[_-]?output|task[_-]?content)",
+    r"authorization|api[_-]?key|access[_-]?key|private[_-]?key|raw[_-]?output|"
+    r"raw[_-]?content|task[_-]?content|answer|response|private)",
     re.IGNORECASE,
 )
 _ALLOWED_LABELS = frozenset({"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"})
+_REQUIRED_CORRELATION_FIELDS: Final[dict[AutonomousEventType, frozenset[str]]] = {
+    event: frozenset({"phase"})
+    for event in (
+        AutonomousEventType.PHASE_STARTED,
+        AutonomousEventType.PHASE_COMPLETED,
+        AutonomousEventType.PHASE_FAILED,
+    )
+}
+_REQUIRED_CORRELATION_FIELDS.update(
+    {
+        event: frozenset({"job_id"})
+        for event in (
+            AutonomousEventType.JOB_SUBMITTED,
+            AutonomousEventType.JOB_COMPLETED,
+            AutonomousEventType.JOB_FAILED,
+        )
+    }
+)
+_REQUIRED_CORRELATION_FIELDS.update(
+    {
+        event: frozenset({"operation_key"})
+        for event in (
+            AutonomousEventType.OPERATION_INTENT,
+            AutonomousEventType.OPERATION_SUBMITTED,
+            AutonomousEventType.OPERATION_COMPLETED,
+            AutonomousEventType.OPERATION_FAILED,
+        )
+    }
+)
+_REQUIRED_CORRELATION_FIELDS.update(
+    {
+        AutonomousEventType.PROMOTION_DECIDED: frozenset({"evidence_label"}),
+        AutonomousEventType.ARTIFACT_RECORDED: frozenset({"artifact_id"}),
+        AutonomousEventType.APPROVAL_CONSUMED: frozenset({"approval_digest"}),
+    }
+)
+for _terminal_event in (
+    AutonomousEventType.RUN_QUEUED,
+    AutonomousEventType.RUN_COMPLETED,
+    AutonomousEventType.RUN_FAILED,
+    AutonomousEventType.RUN_CANCEL_REQUESTED,
+    AutonomousEventType.RUN_CANCELLED,
+    AutonomousEventType.RUN_SAFE_STOP_REQUESTED,
+    AutonomousEventType.RUN_STOPPED,
+):
+    _REQUIRED_CORRELATION_FIELDS[_terminal_event] = frozenset({"status"})
 
 
 def _safe_token(name: str, value: str) -> str:
@@ -171,6 +247,14 @@ def validate_safe_metadata(
                 raise ValueError(f"{key} must be finite and non-negative")
             normalized[key] = _safe_measurement(key, raw_value)
             continue
+        if key == "run_number":
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, str)):
+                raise ValueError("run_number must be between 1 and 5")
+            number = int(raw_value) if isinstance(raw_value, int) else int(raw_value.strip())
+            if str(number) != str(raw_value).strip() or not 1 <= number <= 5:
+                raise ValueError("run_number must be between 1 and 5")
+            normalized[key] = number
+            continue
         if not isinstance(raw_value, str):
             raise ValueError(f"metadata value for {key} must be a safe string")
         value = _safe_token(key, raw_value)
@@ -196,10 +280,14 @@ def _durable_metadata(
     metadata: Mapping[str, SafeMetadataValue] | None,
     run_id: str,
     experiment_id: str,
+    run_number: int,
     phase: str | None,
     status: str | None,
     job_id: str | None,
     evidence_label: str | None,
+    approval_digest: str | None,
+    artifact_id: str | None,
+    reason_code: str | None,
     latency_ms: int | float | None,
     cost_usd: int | float | None,
     operation_key: str | None,
@@ -210,10 +298,14 @@ def _durable_metadata(
     fields: dict[str, SafeMetadataValue | None] = {
         "run_id": run_id,
         "experiment_id": experiment_id,
+        "run_number": run_number,
         "phase": phase,
         "status": status,
         "provider_id": job_id,
         "evidence_label": evidence_label,
+        "approval_digest": approval_digest,
+        "artifact_id": artifact_id,
+        "reason_code": reason_code,
         "latency_ms": latency_ms,
         "cost_usd": cost_usd,
         "operation_key": operation_key,
@@ -224,6 +316,10 @@ def _durable_metadata(
         candidate: SafeMetadataValue
         if key in {"latency_ms", "cost_usd"}:
             candidate = _safe_measurement(key, value)  # type: ignore[arg-type]
+        elif key == "run_number":
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+                raise ValueError("run_number must be between 1 and 5")
+            candidate = value
         else:
             if not isinstance(value, str):
                 raise ValueError(f"{key} must be a safe string")
@@ -280,6 +376,9 @@ class DurableTelemetryBridge:
         status: str | None = None,
         job_id: str | None = None,
         evidence_label: str | None = None,
+        approval_digest: str | None = None,
+        artifact_id: str | None = None,
+        reason_code: str | None = None,
         latency_ms: int | float | None = None,
         cost_usd: int | float | None = None,
         operation_key: str | None = None,
@@ -293,14 +392,19 @@ class DurableTelemetryBridge:
             metadata=metadata,
             run_id=run_id,
             experiment_id=experiment_id,
+            run_number=run_number,
             phase=phase,
             status=status,
             job_id=job_id,
             evidence_label=evidence_label,
+            approval_digest=approval_digest,
+            artifact_id=artifact_id,
+            reason_code=reason_code,
             latency_ms=latency_ms,
             cost_usd=cost_usd,
             operation_key=operation_key,
         )
+        self._require_correlation(normalized_type, durable_metadata)
         try:
             persisted = self.repository.append_event(
                 run_id,
@@ -324,14 +428,50 @@ class DurableTelemetryBridge:
             latency_ms=latency_ms,
             cost_usd=cost_usd,
             attributes=observer_metadata,
+            event_id=persisted.event_id,
         )
         return persisted
 
-    record = emit
-    append_event = emit
-    emit_event = emit
-    record_event = emit
-    persist_event = emit
+    def record(self, *args: Any, **kwargs: Any) -> RunEventRecord:
+        """Explicit alias for :meth:`emit` with the same argument order."""
+
+        return self.emit(*args, **kwargs)
+
+    def emit_event(self, *args: Any, **kwargs: Any) -> RunEventRecord:
+        """Explicit alias for :meth:`emit` with the same argument order."""
+
+        return self.emit(*args, **kwargs)
+
+    def record_event(self, *args: Any, **kwargs: Any) -> RunEventRecord:
+        """Explicit alias for :meth:`emit` with the same argument order."""
+
+        return self.emit(*args, **kwargs)
+
+    def append_event(
+        self,
+        run_id: str,
+        *,
+        event_type: AutonomousEventType | str,
+        run_number: int,
+        experiment_id: str,
+        reason: str,
+        **kwargs: Any,
+    ) -> RunEventRecord:
+        """Repository-shaped wrapper with explicit telemetry correlation."""
+
+        return self.emit(
+            event_type,
+            run_id=run_id,
+            run_number=run_number,
+            experiment_id=experiment_id,
+            reason=reason,
+            **kwargs,
+        )
+
+    def persist_event(self, *args: Any, **kwargs: Any) -> RunEventRecord:
+        """Explicit alias for :meth:`emit` with the same argument order."""
+
+        return self.emit(*args, **kwargs)
 
     def transition(
         self,
@@ -348,6 +488,9 @@ class DurableTelemetryBridge:
         telemetry_status: str | None = None,
         job_id: str | None = None,
         evidence_label: str | None = None,
+        approval_digest: str | None = None,
+        artifact_id: str | None = None,
+        reason_code: str | None = None,
         latency_ms: int | float | None = None,
         cost_usd: int | float | None = None,
         operation_key: str | None = None,
@@ -371,14 +514,19 @@ class DurableTelemetryBridge:
             metadata=metadata,
             run_id=run_id,
             experiment_id=experiment_id,
+            run_number=run_number,
             phase=phase.value,
             status=status_metadata or telemetry_status or status.value,
             job_id=job_id,
             evidence_label=evidence_label,
+            approval_digest=approval_digest,
+            artifact_id=artifact_id,
+            reason_code=reason_code,
             latency_ms=latency_ms,
             cost_usd=cost_usd,
             operation_key=operation_key,
         )
+        self._require_correlation(normalized_type, durable_metadata)
         try:
             transitioned = self.repository.transition(
                 run_id,
@@ -405,12 +553,27 @@ class DurableTelemetryBridge:
             latency_ms=latency_ms,
             cost_usd=cost_usd,
             attributes=observer_metadata,
+            event_id=self._transition_event_id(
+                run_id,
+                event_sequence=getattr(transitioned, "event_sequence", expected_version + 1),
+            ),
         )
         return transitioned
 
-    record_transition = transition
-    transition_run = transition
-    persist_transition = transition
+    def record_transition(self, run_id: str, **kwargs: Any) -> AutonomousRunState:
+        """Repository-shaped transition wrapper with run ID first."""
+
+        return self.transition(run_id=run_id, **kwargs)
+
+    def transition_run(self, run_id: str, **kwargs: Any) -> AutonomousRunState:
+        """Repository-shaped transition wrapper with run ID first."""
+
+        return self.transition(run_id=run_id, **kwargs)
+
+    def persist_transition(self, run_id: str, **kwargs: Any) -> AutonomousRunState:
+        """Repository-shaped transition wrapper with run ID first."""
+
+        return self.transition(run_id=run_id, **kwargs)
 
     @staticmethod
     def _event_type(event_type: AutonomousEventType | str) -> AutonomousEventType:
@@ -433,10 +596,50 @@ class DurableTelemetryBridge:
         ):
             raise ValueError("run_number must be between 1 and 5")
         _safe_token("experiment_id", experiment_id)
-        if not isinstance(reason, str) or not reason.strip() or _SENSITIVE.search(reason):
-            raise ValueError("reason must be a non-empty safe lifecycle reason")
-        if len(reason) > 2_000:
-            raise ValueError("reason is too long")
+        validate_event_reason(reason)
+
+    @staticmethod
+    def _require_correlation(event_type: AutonomousEventType, metadata: Mapping[str, str]) -> None:
+        aliases = {
+            "job_id": "provider_id",
+            "artifact_id": "artifact_id",
+            "approval_digest": "approval_digest",
+            "evidence_label": "evidence_label",
+            "operation_key": "operation_key",
+            "phase": "phase",
+            "status": "status",
+        }
+        missing = [
+            field
+            for field in _REQUIRED_CORRELATION_FIELDS.get(event_type, frozenset())
+            if aliases[field] not in metadata
+        ]
+        if missing:
+            raise ValueError(
+                f"event {event_type.value} requires correlation field(s): "
+                f"{', '.join(sorted(missing))}"
+            )
+
+    def _transition_event_id(self, run_id: str, *, event_sequence: object) -> str | None:
+        """Resolve the repository-generated event ID without inventing one."""
+
+        list_events = getattr(self.repository, "list_" + "events", None)
+        if isinstance(event_sequence, int) and callable(list_events):
+            try:
+                page = list_events(
+                    run_id, after_sequence=max(0, event_sequence - 1), limit=1
+                )
+                items = getattr(page, "items", page)
+                if items:
+                    event = items[0]
+                    event_id = getattr(event, "event_id", None)
+                    if isinstance(event_id, str) and event_id:
+                        return event_id
+            except Exception:
+                pass
+        # Injected repositories may expose only transition() in tests.  Do not
+        # fabricate an ID that could be mistaken for a durable event identity.
+        return None
 
     def _mirror(
         self,
@@ -452,14 +655,15 @@ class DurableTelemetryBridge:
         latency_ms: int | float | None,
         cost_usd: int | float | None,
         attributes: Mapping[str, SafeMetadataValue],
+        event_id: str | None,
     ) -> None:
         if self.recorder is None:
             return
         observer_type: ObserverEventType | str
-        try:
-            observer_type = ObserverEventType(event_type.value)
-        except ValueError:
-            observer_type = event_type.value
+        observer_type = CANONICAL_EVENT_TYPES[event_type]
+        mirrored_attributes: SafeTelemetryMetadata = dict(attributes)
+        if event_id is not None:
+            mirrored_attributes["event_id"] = event_id
         try:
             self.recorder.record(
                 observer_type,
@@ -472,7 +676,7 @@ class DurableTelemetryBridge:
                 status=status,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
-                attributes=dict(attributes),
+                attributes=mirrored_attributes,
             )
         except Exception:
             # Durable state already succeeded.  The optional observer cannot
@@ -485,6 +689,7 @@ TelemetryBridge = DurableTelemetryBridge
 
 
 __all__ = [
+    "CANONICAL_EVENT_TYPES",
     "SAFE_METADATA_KEYS",
     "AutonomousEventType",
     "AutonomousTelemetry",
