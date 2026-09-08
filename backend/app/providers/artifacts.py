@@ -100,6 +100,14 @@ class ArtifactStore(Protocol):
 
     def get_bytes(self, ref: ArtifactRef) -> bytes: ...
 
+    def put_json(
+        self,
+        key: str,
+        value: Any,
+        *,
+        metadata: Mapping[str, str] | None = None,
+    ) -> ArtifactRef: ...
+
 
 class S3ArtifactStore:
     """Write and read hash-checked artifacts in an S3 bucket.

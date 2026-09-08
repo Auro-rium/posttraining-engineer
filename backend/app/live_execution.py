@@ -746,6 +746,11 @@ class AutonomousRunController:
         finally:
             self._cleanup(training_job, evaluation_job)
 
+    @staticmethod
+    def _require_provider_id(job: JobResult, phase: str) -> None:
+        if not job.provider_job_id:
+            raise LiveExecutionFailed(f"{phase} provider returned no job ID")
+
     def _benchmark(
         self,
         *,
@@ -951,7 +956,7 @@ def create_aws_controller(config: LiveExecutionConfig) -> AutonomousRunControlle
     """Construct real AWS adapters without creating any cloud resources."""
 
     try:
-        import boto3  # type: ignore[import-untyped]
+        import boto3
     except ImportError as exc:  # pragma: no cover
         raise LiveExecutionBlocked("boto3 is required for live execution") from exc
     s3_client = boto3.client("s3", region_name=config.aws_region)
