@@ -3,22 +3,86 @@ Main application entry point for the autonomous post-training engineer.
 Updated for AWS Agents for Humans Hackathon with Strands Agents.
 """
 import logging
-from typing import Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
-import uvicorn
+from collections.abc import Mapping, Sequence
 from datetime import datetime
+from threading import Lock
+from typing import Any
+from uuid import uuid4
 
-# Import our new Strands-based components
-from app.core.state import OptimizationRun
-from app.core.orchestrator import create_orchestrator
-from app.core.environment import create_service_recovery_environment
-from app.runtime_config import get_runtime_config
+import uvicorn
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+
 from app.api.continuous_post_training import install_post_training_api
+from app.api.run_comparison import install_run_comparison_api
+from app.core.environment import create_service_recovery_environment
+from app.core.orchestrator import create_orchestrator
+from app.core.state import OptimizationRun
+from app.observability import EventType, TelemetryRecorder
+from app.posttraining.run_history import (
+    MAX_RUNS,
+    RunHistoryRecord,
+    RunHistoryRepository,
+    RunLimitExceeded,
+    RunRegistry,
+)
+from app.providers.repository import DynamoDBRunRepository
+from app.runtime_config import get_runtime_config
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class _LocalRunHistoryRepository:
+    """Process-local history adapter for the no-AWS demo mode.
+
+    The API uses the same :class:`RunRegistry` contract in local and AWS
+    modes.  This adapter deliberately does not pretend to be durable: it is
+    only a development/demo store and is replaced by DynamoDB in AWS mode.
+    """
+
+    def __init__(self) -> None:
+        self._records: dict[str, RunHistoryRecord] = {}
+        self._lock = Lock()
+
+    def reserve_run(
+        self, record: RunHistoryRecord, *, max_runs: int = MAX_RUNS
+    ) -> RunHistoryRecord:
+        with self._lock:
+            if record.run_id in self._records:
+                raise ValueError(f"run already exists: {record.run_id}")
+            if len(self._records) >= max_runs:
+                raise RunLimitExceeded(f"maximum of {max_runs} runs reached")
+            self._records[record.run_id] = record
+        return record
+
+    def get_run(self, run_id: str) -> RunHistoryRecord | None:
+        with self._lock:
+            return self._records.get(run_id)
+
+    def list_runs(self, *, limit: int = MAX_RUNS) -> Sequence[RunHistoryRecord]:
+        if not 1 <= limit <= MAX_RUNS:
+            raise ValueError(f"limit must be between 1 and {MAX_RUNS}")
+        with self._lock:
+            records = sorted(self._records.values(), key=lambda item: item.run_number)
+            return tuple(records[-limit:])
+
+
+def _create_run_registry(config: Any) -> RunRegistry:
+    """Build the durable-history boundary without creating cloud resources."""
+
+    repository: RunHistoryRepository
+    if config.app_mode == "aws":
+        # Constructing this adapter is side-effect free.  The DynamoDB table
+        # must already exist and is supplied by deployment/CDK configuration.
+        repository = DynamoDBRunRepository(
+            table_name=config.dynamodb_table_name,
+            region_name=config.aws_region,
+        )
+    else:
+        repository = _LocalRunHistoryRepository()
+    return RunRegistry(repository, max_runs=MAX_RUNS)
 
 # Validate deployment configuration before creating the application. AWS mode
 # fails closed rather than silently running the local simulation.
@@ -37,6 +101,83 @@ app = FastAPI(
     version="0.1.0",
 )
 install_post_training_api(app)
+app.state.run_registry = _create_run_registry(settings)
+app.state.telemetry = TelemetryRecorder()
+app.state.run_numbers = {}
+install_run_comparison_api(app, app.state.run_registry)
+
+
+def _record_telemetry(
+    event_type: EventType,
+    run: OptimizationRun,
+    *,
+    phase: str | None = None,
+    job_id: str | None = None,
+    evidence_label: str | None = None,
+    status: str | None = None,
+    attributes: Mapping[str, object] | None = None,
+) -> None:
+    """Emit correlation metadata while keeping telemetry non-blocking."""
+
+    try:
+        app.state.telemetry.record(
+            event_type,
+            run_id=run.runId,
+            run_number=app.state.run_numbers.get(run.runId, 1),
+            experiment_id=f"{run.runId}-experiment",
+            phase=phase,
+            job_id=job_id,
+            evidence_label=evidence_label,
+            status=status,
+            attributes=attributes,
+        )
+    except Exception:
+        # The recorder itself isolates sink failures; this boundary also
+        # protects legacy run objects and route execution from bad metadata.
+        logger.exception("Failed to emit post-training telemetry")
+
+
+def _record_phase_telemetry(
+    run: OptimizationRun,
+    phase: str,
+    phase_result: Mapping[str, Any] | None,
+    *,
+    started: bool = False,
+) -> None:
+    """Record phase/job lifecycle metadata without recording model content."""
+
+    if started:
+        _record_telemetry(EventType.PHASE_STARTED, run, phase=phase, status="running")
+        if phase in {"execute_training", "evaluate"}:
+            _record_telemetry(EventType.JOB_SUBMITTED, run, phase=phase, status="submitted")
+        return
+
+    result = phase_result or {}
+    result_status = str(result.get("status", "unknown"))
+    event_type = (
+        EventType.PHASE_COMPLETED
+        if result_status == "completed"
+        else EventType.PHASE_FAILED
+    )
+    _record_telemetry(event_type, run, phase=phase, status=result_status)
+    if phase in {"execute_training", "evaluate"}:
+        job_event = (
+            EventType.JOB_COMPLETED
+            if result_status == "completed"
+            else EventType.JOB_FAILED
+        )
+        _record_telemetry(job_event, run, phase=phase, status=result_status)
+    if phase == "promote_decision" and result_status == "completed":
+        output = str(result.get("output", ""))
+        decision = "PROMOTE" if "PROMOTE" in output else "REJECT"
+        _record_telemetry(
+            EventType.PROMOTION_DECIDED,
+            run,
+            phase=phase,
+            evidence_label="EXPLANATION",
+            status=decision,
+            attributes={"decision": decision},
+        )
 
 
 
@@ -55,7 +196,9 @@ async def health_check():
             "components": {
                 "orchestrator": "ready",
                 "strands_agents": "initialized",
-                "environment": "available"
+                "environment": "available",
+                "run_history": "ready",
+                "telemetry": "ready",
             }
         }
     )
@@ -79,7 +222,7 @@ async def create_optimization_run(
     base_checkpoint: str,
     environment: str = "agentgym-service-recovery",
     objective: str = "maximize task success rate",
-    budget: dict = None
+    budget: dict | None = None
 ):
     """
     Create a new optimization run.
@@ -100,8 +243,14 @@ async def create_optimization_run(
                 "maxTrainingTimeMin": 120
             }
 
-        # Generate unique run ID
-        run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{hash((target_model, base_checkpoint)) % 10000:04d}"
+        # Generate a unique run ID and reserve the bounded comparison slot.
+        run_id = (
+            f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_"
+            f"{uuid4().hex[:8]}"
+        )
+        history_records = app.state.run_registry.list_runs()
+        run_number = len(history_records) + 1
+        parent_run_id = history_records[-1].run_id if history_records else None
 
         # Initialize the run
         run = orchestrator.initialize_run(
@@ -113,8 +262,26 @@ async def create_optimization_run(
             budget=budget
         )
 
+        app.state.run_registry.register(
+            RunHistoryRecord(
+                run_id=run_id,
+                run_number=run_number,
+                parent_run_id=parent_run_id,
+                champion_run_id=parent_run_id,
+                model_id=target_model,
+            )
+        )
+        app.state.run_numbers[run_id] = run_number
+
         # Store the run
         active_runs[run_id] = run
+
+        _record_telemetry(
+            EventType.RUN_STARTED,
+            run,
+            status=run.status,
+            attributes={"environment": environment, "target_model": target_model},
+        )
 
         logger.info(f"Created optimization run {run_id}")
 
@@ -130,6 +297,9 @@ async def create_optimization_run(
             }
         )
 
+    except RunLimitExceeded as e:
+        logger.warning("Run history limit reached: %s", e)
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Failed to create optimization run: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to create run: {str(e)}")
@@ -153,12 +323,17 @@ async def execute_next_step(run_id: str):
         current_index = orchestrator.phases.index(run.currentPhase) if run.currentPhase in orchestrator.phases else -1
         if current_index + 1 >= len(orchestrator.phases):
             return JSONResponse(content={"runId": run_id, "status": run.status, "message": "run is complete"})
+        next_phase = orchestrator.phases[current_index + 1]
+        _record_phase_telemetry(run, next_phase, None, started=True)
         updated_run, workflow_result = orchestrator.execute_workflow(
-            run, target_phase=orchestrator.phases[current_index + 1]
+            run, target_phase=next_phase
         )
 
         # Update stored run
         active_runs[run_id] = updated_run
+        phase_results = workflow_result.get("phase_results", [])
+        phase_result = phase_results[0] if phase_results else None
+        _record_phase_telemetry(updated_run, next_phase, phase_result)
 
         logger.info(f"Executed step for run {run_id}: {workflow_result.get('overall_status')}")
 
@@ -193,10 +368,31 @@ async def execute_auto_workflow(run_id: str, background_tasks: BackgroundTasks):
     # Add the full workflow execution as a background task
     def run_full_workflow():
         try:
+            current_index = (
+                orchestrator.phases.index(run.currentPhase)
+                if run.currentPhase in orchestrator.phases
+                else -1
+            )
+            for phase in orchestrator.phases[current_index + 1 :]:
+                _record_phase_telemetry(run, phase, None, started=True)
             final_run, workflow_result = orchestrator.execute_workflow(run)
             active_runs[run_id] = final_run
+            for phase_result in workflow_result.get("phase_results", []):
+                if isinstance(phase_result, Mapping):
+                    _record_phase_telemetry(
+                        final_run,
+                        str(phase_result.get("phase", final_run.currentPhase)),
+                        phase_result,
+                    )
+            terminal_event = (
+                EventType.RUN_COMPLETED
+                if workflow_result.get("overall_status") == "completed"
+                else EventType.RUN_FAILED
+            )
+            _record_telemetry(terminal_event, final_run, status=final_run.status)
             logger.info(f"Completed auto workflow for run {run_id}: {workflow_result.get('overall_status')}")
         except Exception as e:
+            _record_telemetry(EventType.RUN_FAILED, run, phase=run.currentPhase, status="failed")
             logger.error(f"Auto workflow failed for run {run_id}: {str(e)}")
 
     background_tasks.add_task(run_full_workflow)
@@ -286,6 +482,7 @@ async def cancel_run(run_id: str):
     run = active_runs[run_id]
     run.status = "cancelled"
     run.update_timestamp()
+    _record_telemetry(EventType.RUN_FAILED, run, status="cancelled")
 
     logger.info(f"Cancelled run {run_id}")
 
