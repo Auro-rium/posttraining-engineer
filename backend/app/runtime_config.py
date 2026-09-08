@@ -23,9 +23,25 @@ class RuntimeConfig(BaseSettings):
     aws_region: str = "us-east-1"
     strands_model: str = "nvidia.nemotron-super-3-120b"
     target_model: str = "google/functiongemma-270m-it"
-    max_experiments: int = Field(default=2, ge=1, le=2)
-    max_cost_usd: float = Field(default=50.0, ge=0)
+    # The hackathon workflow admits at most five top-level candidate runs.  A
+    # hard upper bound here prevents an environment variable or deployment
+    # override from silently widening the deterministic run budget.
+    max_experiments: int = Field(default=5, ge=1, le=5)
+    max_cost_usd: float = Field(default=25.0, ge=0, le=25.0)
     max_training_time_min: int = Field(default=120, ge=1)
+
+    # Objective provenance is part of every comparable evaluation.  Keep the
+    # suite and version in configuration so a coordinator cannot accidentally
+    # compare metrics from different benchmark contracts.
+    objective_suite: str = Field(default="AgentGym/AgentEval", min_length=1)
+    objective_suite_version: str = Field(default="agent-eval-v1", min_length=1)
+
+    # Telemetry is metadata-only and can be disabled for an explicitly
+    # credential-free local run.  The endpoint is optional because the default
+    # logger exporter works without an OTLP collector.
+    telemetry_enabled: bool = True
+    telemetry_exporter: Literal["logging", "otlp", "none"] = "logging"
+    telemetry_otlp_endpoint: str | None = None
 
     s3_artifact_bucket: str | None = None
     s3_artifact_prefix: str = "post-training"
@@ -37,6 +53,10 @@ class RuntimeConfig(BaseSettings):
 
     @model_validator(mode="after")
     def validate_aws_requirements(self) -> RuntimeConfig:
+        if self.telemetry_exporter == "otlp" and not self.telemetry_otlp_endpoint:
+            raise ValueError(
+                "telemetry_otlp_endpoint is required when telemetry_exporter=otlp"
+            )
         if self.app_mode == "aws":
             required = {
                 "s3_artifact_bucket": self.s3_artifact_bucket,
