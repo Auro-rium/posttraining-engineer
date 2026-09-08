@@ -3,6 +3,8 @@ Failure Analyst Agent - Converts raw failures into categorized failure types.
 Responsible for failure pattern recognition and categorization.
 """
 from strands import Agent, tool
+
+from .prompt_contract import get_prompt_contract, resolve_nemotron_model
 from strands.types.tools import ToolResult, ToolUse
 from typing import Dict, Any, List
 import json
@@ -14,31 +16,16 @@ class FailureAnalystAgent:
     """Agent responsible for analyzing failures and categorizing them."""
     
     def __init__(self, model: str = None):
+        prompt_contract = get_prompt_contract("FailureAnalystAgent")
         self.agent = Agent(
             name="FailureAnalystAgent",
-            model=model or "nvidia.nemotron-super-3-120b",
-            system_prompt="""You are the Failure Analyst Agent in an autonomous post-training system.
-            Your role is to analyze benchmark trajectories and convert raw failures into 
-            categorized failure types that can be acted upon.
-            
-            You must:
-            1. Analyze trajectories from the Benchmark Agent
-            2. Identify points where Gemma failed to complete tasks successfully
-            3. Categorize failures into types such as:
-               - Malformed tool arguments
-               - Wrong tool selection  
-               - Premature completion
-               - Failed verification
-               - Looping behavior
-               - Incorrect tool usage sequence
-            4. Group similar failures into clusters with examples
-            5. Provide evidence (trajectory references) for each failure cluster
-            
-            Focus on objective failure analysis - do not attempt to fix issues or 
-            generate solutions. Simply categorize what went wrong."""
+            model=resolve_nemotron_model(model),
+            system_prompt=prompt_contract.prompt,
         )
         
         # Register tools
+        self.prompt_contract = prompt_contract
+        self.prompt_metadata = prompt_contract.metadata()
         self.agent.tool_registry.register_tool(self.analyze_failures)
         self.agent.tool_registry.register_tool(self.categorize_failure_types)
         self.agent.tool_registry.register_tool(self.cluster_similar_failures)

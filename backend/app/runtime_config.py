@@ -7,6 +7,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.agents.prompt_contract import NEMOTRON_MODEL_ID
+
 
 class RuntimeConfig(BaseSettings):
     """Configuration shared by the HTTP process and AWS adapters."""
@@ -21,7 +23,9 @@ class RuntimeConfig(BaseSettings):
     app_mode: Literal["local", "aws"] = "local"
     service_role: Literal["coordinator", "research", "execution"] = "coordinator"
     aws_region: str = "us-east-1"
-    strands_model: str = "nvidia.nemotron-super-3-120b"
+    # Reasoning is intentionally pinned: changing this model invalidates prompt
+    # provenance and makes comparisons between autonomous runs ambiguous.
+    strands_model: str = Field(default=NEMOTRON_MODEL_ID, min_length=1)
     target_model: str = "google/functiongemma-270m-it"
     # The hackathon workflow admits at most five top-level candidate runs.  A
     # hard upper bound here prevents an environment variable or deployment
@@ -53,6 +57,11 @@ class RuntimeConfig(BaseSettings):
 
     @model_validator(mode="after")
     def validate_aws_requirements(self) -> RuntimeConfig:
+        if self.strands_model != NEMOTRON_MODEL_ID:
+            raise ValueError(
+                "strands_model is pinned to NVIDIA Nemotron Super 3 120B: "
+                f"{NEMOTRON_MODEL_ID}"
+            )
         if self.telemetry_exporter == "otlp" and not self.telemetry_otlp_endpoint:
             raise ValueError(
                 "telemetry_otlp_endpoint is required when telemetry_exporter=otlp"

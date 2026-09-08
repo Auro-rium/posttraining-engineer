@@ -15,6 +15,8 @@ from typing import Any
 
 from strands import Agent, tool
 
+from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+
 _EVIDENCE_CLASSES = {"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"}
 
 
@@ -57,15 +59,14 @@ class EvalAgent:
 
     def __init__(self, model: str | None = None, adapter: Any = None):
         self.adapter = adapter
+        prompt_contract = get_prompt_contract("EvalAgent")
         self.agent = Agent(
             name="EvalAgent",
-            model=model or "nvidia.nemotron-super-3-120b",
-            system_prompt="""You are the Eval Agent in an autonomous post-training system.
-            Delegate held-out and regression execution to the configured objective
-            adapter. Never invent scores, task results, provider identifiers, or
-            promotion decisions. Deterministically calculate summaries only from
-            returned measurements.""",
+            model=resolve_nemotron_model(model),
+            system_prompt=prompt_contract.prompt,
         )
+        self.prompt_contract = prompt_contract
+        self.prompt_metadata = prompt_contract.metadata()
         self.agent.tool_registry.register_tool(self.evaluate_held_out_performance)
         self.agent.tool_registry.register_tool(self.run_regression_benchmarks)
         self.agent.tool_registry.register_tool(self.calculate_performance_metrics)

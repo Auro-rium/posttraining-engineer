@@ -13,6 +13,8 @@ from typing import Any
 
 from strands import Agent, tool
 
+from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+
 _EVIDENCE_CLASSES = {"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"}
 _TERMINAL_STATUSES = {"COMPLETED", "FAILED", "STOPPED", "CANCELLED"}
 
@@ -49,16 +51,14 @@ class TrainingExecutorAgent:
 
     def __init__(self, model: str | None = None, adapter: Any = None):
         self.adapter = adapter
+        prompt_contract = get_prompt_contract("TrainingExecutorAgent")
         self.agent = Agent(
             name="TrainingExecutorAgent",
-            model=model or "nvidia.nemotron-super-3-120b",
-            system_prompt="""You are the Training Executor Agent in an
-            autonomous post-training system.
-            Delegate job submission, status polling, and artifact retrieval to the
-            configured training adapter. Report only provider data returned by it.
-            Do not fabricate job ids, resource identifiers, statuses, metrics, or
-            artifact references. Missing adapters are explicit blockers.""",
+            model=resolve_nemotron_model(model),
+            system_prompt=prompt_contract.prompt,
         )
+        self.prompt_contract = prompt_contract
+        self.prompt_metadata = prompt_contract.metadata()
         self.agent.tool_registry.register_tool(self.submit_training_job)
         self.agent.tool_registry.register_tool(self.monitor_training_job)
         self.agent.tool_registry.register_tool(self.handle_training_failure)

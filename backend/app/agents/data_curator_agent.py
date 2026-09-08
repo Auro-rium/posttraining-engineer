@@ -15,6 +15,8 @@ from typing import Any
 
 from strands import Agent, tool
 
+from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+
 _EVIDENCE_CLASSES = {"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"}
 _VERIFIED_EVIDENCE = {"LIVE", "PRIOR_VERIFIED_RUN"}
 
@@ -44,15 +46,14 @@ class DataCuratorAgent:
 
     def __init__(self, model: str | None = None, adapter: Any = None):
         self.adapter = adapter
+        prompt_contract = get_prompt_contract("DataCuratorAgent")
         self.agent = Agent(
             name="DataCuratorAgent",
-            model=model or "nvidia.nemotron-super-3-120b",
-            system_prompt="""You are the Data Curator Agent in an autonomous post-training system.
-            Delegate decision discovery, correction generation, and environment
-            verification to the configured objective adapter. Never include an
-            unverified record in an SFT dataset. Formatting is deterministic and
-            may use only records with LIVE or PRIOR_VERIFIED_RUN evidence.""",
+            model=resolve_nemotron_model(model),
+            system_prompt=prompt_contract.prompt,
         )
+        self.prompt_contract = prompt_contract
+        self.prompt_metadata = prompt_contract.metadata()
         self.agent.tool_registry.register_tool(self.identify_decision_points)
         self.agent.tool_registry.register_tool(self.generate_corrected_trajectories)
         self.agent.tool_registry.register_tool(self.verify_corrections)

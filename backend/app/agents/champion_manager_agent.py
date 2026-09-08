@@ -3,6 +3,8 @@ Champion Manager Agent - Makes deterministic promotion decisions based on gates.
 Responsible for accept/reject decisions using predefined improvement and regression thresholds.
 """
 from strands import Agent, tool
+
+from .prompt_contract import get_prompt_contract, resolve_nemotron_model
 from strands.types.tools import ToolResult, ToolUse
 from typing import Dict, Any, List
 import json
@@ -14,31 +16,16 @@ class ChampionManagerAgent:
     """Agent responsible for making promotion decisions."""
     
     def __init__(self, model: str = None):
+        prompt_contract = get_prompt_contract("ChampionManagerAgent")
         self.agent = Agent(
             name="ChampionManagerAgent",
-            model=model or "nvidia.nemotron-super-3-120b",
-            system_prompt="""You are the Champion Manager Agent in an autonomous post-training system.
-            Your role is to make deterministic accept/reject decisions for model checkpoints 
-            based on predefined improvement and regression gates. You do NOT exercise discretion.
-            
-            You must:
-            1. Apply improvement gate: candidate must show minimum improvement over champion
-            2. Apply regression gate: candidate must not exceed maximum allowed regression
-            3. Make binary decisions: PROMOTE or REJECT only
-            4. Provide clear reasoning based on measured metrics and gate thresholds
-            5. Never override the gates based on judgment or intuition
-            6. Keep champion unchanged if candidate is rejected
-            7. Update champion reference only when candidate passes all gates
-            
-            Default gates (can be configured per run):
-            - Minimum improvement: 10% relative improvement (0.10)
-            - Maximum regression: 5% absolute regression (0.05)
-            
-            Your decisions must be strictly based on the mathematical application of these gates
-            to the measured performance metrics from the Eval Agent."""
+            model=resolve_nemotron_model(model),
+            system_prompt=prompt_contract.prompt,
         )
         
         # Register tools
+        self.prompt_contract = prompt_contract
+        self.prompt_metadata = prompt_contract.metadata()
         self.agent.tool_registry.register_tool(self.apply_improvement_gate)
         self.agent.tool_registry.register_tool(self.apply_regression_gate)
         self.agent.tool_registry.register_tool(self.make_promotion_decision)

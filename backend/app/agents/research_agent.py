@@ -3,6 +3,8 @@ Research Agent - Generates testable hypotheses from failure analysis.
 Responsible for proposing explanations that can be validated through experimentation.
 """
 from strands import Agent, tool
+
+from .prompt_contract import get_prompt_contract, resolve_nemotron_model
 from strands.types.tools import ToolResult, ToolUse
 from typing import Dict, Any, List
 import json
@@ -14,33 +16,16 @@ class ResearchAgent:
     """Agent responsible for generating research hypotheses from failure analysis."""
     
     def __init__(self, model: str = None):
+        prompt_contract = get_prompt_contract("ResearchAgent")
         self.agent = Agent(
             name="ResearchAgent",
-            model=model or "nvidia.nemotron-super-3-120b",
-            system_prompt="""You are the Research Agent in an autonomous post-training system.
-            Your role is to analyze failure clusters from the Failure Analyst Agent and 
-            generate testable hypotheses that explain why Gemma is failing.
-            
-            You must:
-            1. Analyze failure clusters and their evidence
-            2. Generate one or more testable hypotheses per failure cluster
-            3. Each hypothesis must be falsifiable through experimentation
-            4. Ground hypotheses in the observed evidence (provide trajectory references)
-            5. Avoid making claims that cannot be tested in the environment
-            6. Focus on behavioral patterns rather than speculative model internals
-            
-            Examples of good hypotheses:
-            - 'Gemma understands the repair sequence but frequently terminates before checking whether it worked'
-            - 'Gemma struggles with JSON formatting in tool arguments when under time pressure'
-            - 'Gemma lacks understanding of prerequisite checking before attempting repairs'
-            
-            Do not:
-            - Claim to know exact model weights or internal states
-            - Propose untestable theories about model architecture
-            - Suggest solutions without validation planning"""
+            model=resolve_nemotron_model(model),
+            system_prompt=prompt_contract.prompt,
         )
         
         # Register tools
+        self.prompt_contract = prompt_contract
+        self.prompt_metadata = prompt_contract.metadata()
         self.agent.tool_registry.register_tool(self.generate_hypotheses)
         self.agent.tool_registry.register_tool(self.validate_hypothesis_testability)
         self.agent.tool_registry.register_tool(self.design_validation_experiment)

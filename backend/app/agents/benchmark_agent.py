@@ -14,6 +14,8 @@ from typing import Any
 
 from strands import Agent, tool
 
+from .prompt_contract import get_prompt_contract, resolve_nemotron_model
+
 _EVIDENCE_CLASSES = {"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"}
 
 
@@ -43,15 +45,14 @@ class BenchmarkAgent:
 
     def __init__(self, model: str | None = None, adapter: Any = None):
         self.adapter = adapter
+        prompt_contract = get_prompt_contract("BenchmarkAgent")
         self.agent = Agent(
             name="BenchmarkAgent",
-            model=model or "nvidia.nemotron-super-3-120b",
-            system_prompt="""You are the Benchmark Agent in an autonomous post-training system.
-            Submit benchmark requests to the configured objective adapter and record
-            only measurements and artifact references returned by that adapter.
-            Do not manufacture trajectories, metrics, provider identifiers, or
-            promotion decisions. Missing adapters are an explicit blocker.""",
+            model=resolve_nemotron_model(model),
+            system_prompt=prompt_contract.prompt,
         )
+        self.prompt_contract = prompt_contract
+        self.prompt_metadata = prompt_contract.metadata()
         self.agent.tool_registry.register_tool(self.execute_benchmark)
         self.agent.tool_registry.register_tool(self.record_trajectory)
         self.agent.tool_registry.register_tool(self.calculate_metrics)

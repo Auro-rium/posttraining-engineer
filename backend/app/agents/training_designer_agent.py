@@ -3,6 +3,8 @@ Training Designer Agent - Chooses optimal QLoRA configurations within constraint
 Responsible for selecting training parameters that respect budget and resource limits.
 """
 from strands import Agent, tool
+
+from .prompt_contract import get_prompt_contract, resolve_nemotron_model
 from strands.types.tools import ToolResult, ToolUse
 from typing import Dict, Any, List
 import json
@@ -14,32 +16,16 @@ class TrainingDesignerAgent:
     """Agent responsible for designing QLoRA training configurations."""
     
     def __init__(self, model: str = None):
+        prompt_contract = get_prompt_contract("TrainingDesignerAgent")
         self.agent = Agent(
             name="TrainingDesignerAgent",
-            model=model or "nvidia.nemotron-super-3-120b",
-            system_prompt="""You are the Training Designer Agent in an autonomous post-training system.
-            Your role is to select optimal QLoRA (Quantized Low-Rank Adaptation) configurations 
-            for training Gemma models, subject to explicit constraints.
-            
-            You must:
-            1. Analyze the training dataset characteristics
-            2. Consider budget constraints (time, cost, compute)
-            3. Select from allowed QLoRA configuration options only
-            4. Never hallucinate or propose configurations outside allowed ranges
-            5. Optimize for expected improvement given constraints
-            6. Provide clear rationale for your configuration choices
-            
-            Allowed QLoRA parameters:
-            - Rank (r): [8, 16, 32, 64]
-            - Learning rate: [1e-4, 2e-4, 5e-4, 1e-3]  
-            - Epochs: [1, 2, 3, 4]
-            - Dropout: [0.05, 0.1, 0.15]
-            
-            Focus on making principled choices within constraints - 
-            do not attempt to optimize beyond what the constraints allow."""
+            model=resolve_nemotron_model(model),
+            system_prompt=prompt_contract.prompt,
         )
         
         # Register tools
+        self.prompt_contract = prompt_contract
+        self.prompt_metadata = prompt_contract.metadata()
         self.agent.tool_registry.register_tool(self.analyze_dataset_characteristics)
         self.agent.tool_registry.register_tool(self.select_qlora_configuration)
         self.agent.tool_registry.register_tool(self.validate_configuration_constraints)
