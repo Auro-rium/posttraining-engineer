@@ -373,7 +373,13 @@ def _validate_history_metadata(item: Mapping[str, Any]) -> None:
                 refs = list(value)
             else:
                 raise TypeError(f"history {key} must contain opaque references")
-            _references(refs, f"history.{key}")
+            if not refs and key != "dataset_id":
+                continue
+            if key == "dataset_id" and len(refs) == 1 and not _REFERENCE_PATTERN.fullmatch(refs[0]):
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", refs[0]) is None:
+                    raise ValueError("history.dataset_id must be an opaque dataset ID")
+            else:
+                _references(refs, f"history.{key}")
         elif key == "metrics":
             if not isinstance(value, Mapping):
                 raise TypeError("history.metrics must be a mapping")
@@ -386,6 +392,9 @@ def _validate_history_metadata(item: Mapping[str, Any]) -> None:
                     or not math.isfinite(float(metric_value))
                 ):
                     raise ValueError("history.metrics must contain finite numeric values")
+        elif key == "training_config":
+            if not isinstance(value, Mapping):
+                raise TypeError("history.training_config must be a metadata mapping")
         elif value is not None and not isinstance(value, (str, int, float, bool)):
             raise TypeError(f"history.{key} is not metadata")
 
@@ -600,6 +609,7 @@ class AutonomousAgentAdapters:
             "DataCuratorAgent",
             {
                 "verified_trajectory_references": refs,
+                "verified_dataset_artifact_references": sorted(verified_dataset_refs),
                 "hypotheses": hypothesis_values,
                 "experiment_history": history,
             },
@@ -704,11 +714,18 @@ class AutonomousAgentAdapters:
 
 
 def _history_refs(item: Mapping[str, Any]) -> set[str]:
-    for key in ("evidence_refs", "evidence_references", "trajectory_refs", "evidence_refs_used"):
+    references: set[str] = set()
+    for key in (
+        "evidence_refs",
+        "evidence_references",
+        "trajectory_refs",
+        "evidence_refs_used",
+        "evidence_ids",
+    ):
         value = item.get(key)
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            return {str(ref) for ref in value}
-    return set()
+            references.update(str(ref) for ref in value)
+    return references
 
 
 def _coordinator_evidence_metadata(

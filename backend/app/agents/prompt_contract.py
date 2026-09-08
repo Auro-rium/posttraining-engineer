@@ -38,6 +38,7 @@ _HANDOFF_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
         "manifest_hash",
         "trajectory_references",
         "verified_trajectory_references",
+        "verified_dataset_artifact_references",
         "verified_evidence_references",
         "verified_evidence_metadata",
         "verified",
@@ -89,6 +90,7 @@ _HANDOFF_REFERENCE_KEYS: Final[frozenset[str]] = frozenset(
     {
         "trajectory_references",
         "verified_trajectory_references",
+        "verified_dataset_artifact_references",
         "verified_evidence_references",
         "evidence_refs",
         "artifact_ids",
@@ -98,6 +100,7 @@ _HANDOFF_REFERENCE_KEYS: Final[frozenset[str]] = frozenset(
         "dataset_id",
     }
 )
+_HANDOFF_PLAIN_DATASET_KEYS: Final[frozenset[str]] = frozenset({"dataset_id"})
 _HANDOFF_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?:traj|trajectory|artifact|dataset|eval|hypothesis|checkpoint|job|run|s3)://"
     r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$"
@@ -323,7 +326,14 @@ def _validate_handoff_metadata(value: Any, *, field: str | None = None) -> None:
         raise ValueError("handoff metadata text is not safe")
     if _HANDOFF_HAZARD_PATTERN.search(value):
         raise ValueError("handoff metadata contains sealed or instruction-bearing text")
-    if field in _HANDOFF_REFERENCE_KEYS and not _HANDOFF_REFERENCE_PATTERN.fullmatch(value):
+    if (
+        field in _HANDOFF_REFERENCE_KEYS
+        and not _HANDOFF_REFERENCE_PATTERN.fullmatch(value)
+        and not (
+            field in _HANDOFF_PLAIN_DATASET_KEYS
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", value) is not None
+        )
+    ):
         raise ValueError(f"invalid opaque reference: {value!r}")
 
 _COMMON_INPUTS = """Required fields: run_id (string), run_number (integer 1..5), suite (string),

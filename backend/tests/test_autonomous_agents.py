@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
-from app.agents.prompt_contract import NEMOTRON_MODEL_ID
+from app.agents.prompt_contract import NEMOTRON_MODEL_ID, get_prompt_contract
 from app.autonomous.agents import (
     AutonomousAgentAdapters,
     CuratedDatasetPlan,
@@ -18,6 +18,7 @@ from app.autonomous.agents import (
     ResearchHypothesis,
     validate_qlora_config,
 )
+from app.autonomous.models import ExperimentRecord
 
 
 class RecordingProvider:
@@ -281,6 +282,21 @@ def test_safe_nested_metrics_and_evidence_ids_remain_metadata() -> None:
     assert "artifact://eval-1" in provider.prompts[0]
 
 
+def test_real_experiment_record_history_allows_empty_refs_and_plain_dataset_id() -> None:
+    provider = RecordingProvider(
+        {"status": "SUCCEEDED", "evidence_class": "LIVE", "clusters": []}
+    )
+    history = ExperimentRecord(
+        experiment_number=1,
+        dataset_id="dataset-plain-id",
+        provider_job_ids=(),
+        artifact_ids=(),
+        evidence_ids=(),
+    )
+    AutonomousAgentAdapters(provider).analyze_failures(["traj://1"], [history])
+    assert "dataset-plain-id" in provider.prompts[0]
+
+
 def test_failure_evidence_must_be_subset_of_coordinator_references() -> None:
     provider = RecordingProvider(
         {
@@ -390,6 +406,139 @@ def test_curation_requires_coordinator_owned_dataset_artifact() -> None:
         AutonomousAgentAdapters(provider).curate(
             ["traj://verified"],
             verified_dataset_artifact_references=["dataset://owned"],
+        )
+
+
+def test_curation_sends_approved_dataset_artifact_allowlist_to_provider() -> None:
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "LIVE",
+            "plan": {
+                "plan_id": "plan-1",
+                "selected_trajectory_refs": ["traj://verified"],
+                "dataset_artifact_ref": "dataset://owned",
+                "evidence_class": "LIVE",
+            },
+        }
+    )
+    AutonomousAgentAdapters(provider).curate(
+        ["traj://verified"],
+        verified_dataset_artifact_references=["dataset://owned"],
+    )
+    assert '"verified_dataset_artifact_references":["dataset://owned"]' in provider.prompts[0]
+
+
+def test_dataset_artifact_allowlist_is_opaque_in_prompt_contract() -> None:
+    with pytest.raises(ValueError, match=r"reference|metadata"):
+        get_prompt_contract("DataCuratorAgent").render_handoff(
+            {"verified_dataset_artifact_references": ["unsafe-dataset"]}
+        )
+
+
+def test_evidence_ids_are_prior_refs_for_duplicate_hypothesis_rejection() -> None:
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "EXPLANATION",
+            "hypotheses": [
+                {
+                    "hypothesis_id": "h-new",
+                    "cluster_id": "cluster-1",
+                    "statement": "Verify after restart",
+                    "prediction": "fewer premature completions",
+                    "falsifier": "premature completions do not decrease",
+                    "evidence_refs": ["artifact://old"],
+                    "evidence_class": "EXPLANATION",
+                }
+            ],
+        }
+    )
+    cluster = FailureCluster(
+        cluster_id="cluster-1",
+        failure_type="premature_completion",
+        description="Observed failure",
+        count=1,
+        evidence_refs=["artifact://old"],
+    )
+    history = [
+        {
+            "hypothesis_id": "h-old",
+            "cluster_id": "cluster-1",
+            "statement": "Verify after restart",
+            "prediction": "fewer premature completions",
+            "falsifier": "premature completions do not decrease",
+            "evidence_ids": ["artifact://old"],
+            "status": "failed",
+        }
+    ]
+    with pytest.raises(DuplicateHypothesisError):
+        AutonomousAgentAdapters(provider).research(
+            [cluster],
+            history,
+            verified_evidence_references=["artifact://old"],
+            verified_evidence_metadata={
+                "artifact://old": {
+                    "verified": True,
+                    "run_id": "run-1",
+                    "experiment_id": "exp-1",
+                    "measurement_id": "artifact://old",
+                    "evidence_class": "LIVE",
+                }
+            },
+        )
+
+
+def test_evidence_ids_are_consumed_when_legacy_refs_are_empty() -> None:
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "EXPLANATION",
+            "hypotheses": [
+                {
+                    "hypothesis_id": "h-new",
+                    "cluster_id": "cluster-1",
+                    "statement": "Verify after restart",
+                    "prediction": "fewer premature completions",
+                    "falsifier": "premature completions do not decrease",
+                    "evidence_refs": ["artifact://old"],
+                    "evidence_class": "EXPLANATION",
+                }
+            ],
+        }
+    )
+    cluster = FailureCluster(
+        cluster_id="cluster-1",
+        failure_type="premature_completion",
+        description="Observed failure",
+        count=1,
+        evidence_refs=["artifact://old"],
+    )
+    with pytest.raises(DuplicateHypothesisError):
+        AutonomousAgentAdapters(provider).research(
+            [cluster],
+            [
+                {
+                    "hypothesis_id": "h-old",
+                    "cluster_id": "cluster-1",
+                    "statement": "Verify after restart",
+                    "prediction": "fewer premature completions",
+                    "falsifier": "premature completions do not decrease",
+                    "evidence_refs": [],
+                    "evidence_ids": ["artifact://old"],
+                    "status": "failed",
+                }
+            ],
+            verified_evidence_references=["artifact://old"],
+            verified_evidence_metadata={
+                "artifact://old": {
+                    "verified": True,
+                    "run_id": "run-1",
+                    "experiment_id": "exp-1",
+                    "measurement_id": "artifact://old",
+                    "evidence_class": "LIVE",
+                }
+            },
         )
 
 
