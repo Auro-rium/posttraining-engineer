@@ -96,6 +96,17 @@ def test_replay_rejects_mismatched_provenance() -> None:
         engine.verify(mismatched)
 
 
+def test_replay_rejects_forged_top_level_success_and_done_fields() -> None:
+    engine = ServiceRecoveryEngine(seed=5)
+    trajectory = engine.run_episode(
+        "replay-001", [ToolCall(tool="get_logs", arguments={})], split=ObjectiveSplit.REPLAY
+    )
+    forged = trajectory.model_copy(update={"success": True, "done": True})
+
+    with pytest.raises(ValueError, match="outcome"):
+        engine.verify(forged)
+
+
 def test_admission_rejects_a_forged_verified_zero_step_trajectory() -> None:
     engine = ServiceRecoveryEngine(seed=5)
     forged = engine.run_episode("replay-001", [], split=ObjectiveSplit.REPLAY).model_copy(
@@ -332,6 +343,80 @@ def test_benchmark_references_are_replay_verified_and_resolvable_by_curation() -
     )
     assert curated.status_code == 200
     assert curated.json()["manifest"]["row_count"] == 1
+
+
+def test_curation_rejects_reference_metadata_that_differs_from_stored_artifact() -> None:
+    class Adapter:
+        def execute_benchmark(
+            self, request: BenchmarkRequest, engine: ServiceRecoveryEngine
+        ) -> BenchmarkExecutionResult:
+            return BenchmarkExecutionResult(
+                trajectories=tuple(
+                    engine.run_episode(
+                        task_id,
+                        [ToolCall(tool="get_logs", arguments={})],
+                        split=request.split,
+                    )
+                    for task_id in request.task_ids
+                )
+            )
+
+    store = InMemoryTrajectoryArtifactStore()
+    client = TestClient(
+        create_objective_app(
+            ServiceRecoveryEngine(seed=1),
+            auth_token="secret",
+            execution_adapter=Adapter(),
+            artifact_store=store,
+        )
+    )
+    headers = {"authorization": "Bearer secret"}
+    benchmark = client.post(
+        "/v1/benchmark",
+        json={"run_id": "run-1", "split": "replay", "task_ids": ["replay-001"]},
+        headers=headers,
+    )
+    reference = benchmark.json()["trajectory_references"][0]
+    reference["task_id"] = "replay-forged"
+
+    curated = client.post(
+        "/v1/verify-curation",
+        json={
+            "run_id": "run-1",
+            "experiment_id": "exp-1",
+            "split": "replay",
+            "trajectory_references": [reference],
+        },
+        headers=headers,
+    )
+    assert curated.status_code == 422
+
+
+def test_malformed_typed_adapter_result_fails_closed() -> None:
+    class Adapter:
+        def execute_benchmark(
+            self, request: BenchmarkRequest, engine: ServiceRecoveryEngine
+        ) -> BenchmarkExecutionResult:
+            del request, engine
+            return BenchmarkExecutionResult.model_construct(
+                trajectories=(object(),),  # type: ignore[arg-type]
+            )
+
+    client = TestClient(
+        create_objective_app(
+            ServiceRecoveryEngine(seed=1),
+            auth_token="secret",
+            execution_adapter=Adapter(),
+            artifact_store=InMemoryTrajectoryArtifactStore(),
+        )
+    )
+    response = client.post(
+        "/v1/benchmark",
+        json={"run_id": "run-1", "split": "train", "task_ids": ["train-001"]},
+        headers={"authorization": "Bearer secret"},
+    )
+    assert response.status_code == 503
+    assert "BLOCKED" in response.text
 
 
 def test_curation_endpoint_returns_a_content_addressed_dataset_for_replay_scope() -> None:

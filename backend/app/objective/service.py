@@ -109,9 +109,21 @@ class ObjectiveService:
             raise ObjectiveWorkerUnavailable(
                 f"benchmark execution failed: {type(exc).__name__}"
             ) from exc
-        if not isinstance(raw_result, BenchmarkExecutionResult):
-            raise ObjectiveWorkerUnavailable("benchmark adapter must return typed execution result")
-        raw_trajectories = raw_result.trajectories
+        try:
+            if not isinstance(raw_result, BenchmarkExecutionResult):
+                raise ObjectiveWorkerUnavailable(
+                    "benchmark adapter must return typed execution result"
+                )
+            raw_result = BenchmarkExecutionResult.model_validate(
+                raw_result.model_dump(mode="python")
+            )
+            raw_trajectories = raw_result.trajectories
+        except ObjectiveWorkerUnavailable:
+            raise
+        except Exception as exc:
+            raise ObjectiveWorkerUnavailable(
+                f"benchmark adapter returned malformed execution result: {type(exc).__name__}"
+            ) from exc
         if len(raw_trajectories) != len(request.task_ids):
             raise ObjectiveWorkerUnavailable(
                 "benchmark adapter returned incomplete task cardinality"
@@ -166,6 +178,15 @@ class ObjectiveService:
                 if trajectory is None:
                     raise HTTPException(
                         status_code=422, detail="trajectory reference is not resolvable"
+                    )
+                if (
+                    trajectory.task_id != reference.task_id
+                    or trajectory.split is not reference.split
+                    or not trajectory.verified
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="trajectory reference metadata does not match stored artifact",
                     )
                 source_trajectories.append(trajectory)
         confirmed = []

@@ -310,8 +310,17 @@ class ServiceRecoveryEngine:
             raise ValueError("trajectory replay crossed the sealed hidden boundary")
         if replayed.trajectory_id != trajectory.trajectory_id:
             raise ValueError("trajectory provenance does not match replay")
-        if replayed.steps != trajectory.steps or replayed.total_reward != trajectory.total_reward:
-            raise ValueError("trajectory replay does not match deterministic verifier")
+        if (
+            replayed.steps != trajectory.steps
+            or replayed.total_reward != trajectory.total_reward
+            or replayed.success != trajectory.success
+            or replayed.done != trajectory.done
+            or replayed.task_id != trajectory.task_id
+            or replayed.split != trajectory.split
+            or replayed.engine_version != trajectory.engine_version
+            or replayed.seed != trajectory.seed
+        ):
+            raise ValueError("trajectory replay outcome or provenance does not match verifier")
         confirmed = trajectory.model_copy(update={"verified": True})
         return ReplayResult(
             trajectory=confirmed,
