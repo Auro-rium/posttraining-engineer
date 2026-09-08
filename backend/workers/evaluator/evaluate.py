@@ -53,6 +53,15 @@ class EvaluationInputs:
 class EvaluationMetrics:
     task_count: int
     successful_tasks: int
+    task_successes: tuple[bool, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.task_count < 0 or self.successful_tasks < 0:
+            raise EvaluationWorkerError("evaluation counts cannot be negative")
+        if self.task_successes and len(self.task_successes) != self.task_count:
+            raise EvaluationWorkerError("evaluation task outcomes do not match task count")
+        if self.task_successes and sum(self.task_successes) != self.successful_tasks:
+            raise EvaluationWorkerError("evaluation task outcomes do not match success count")
 
     @property
     def success_rate(self) -> float:
@@ -236,6 +245,14 @@ def _sealed_manifest(inputs: EvaluationInputs) -> tuple[Mapping[str, Any], list[
         raise EvaluationArtifactError("sealed evaluation manifest must be a JSON object")
     if manifest.get("manifest_sha256") != inputs.evaluation_manifest_sha256:
         raise EvaluationArtifactError("sealed evaluation manifest digest does not match job input")
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    expected_manifest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if expected_manifest != inputs.evaluation_manifest_sha256:
+        raise EvaluationArtifactError("sealed evaluation manifest checksum does not match content")
+    if manifest.get("suite") != EVALUATION_SUITE:
+        raise EvaluationArtifactError("sealed evaluation suite does not match job input")
     if manifest.get("suite_version") != EVALUATION_SUITE_VERSION:
         raise EvaluationArtifactError("sealed evaluation suite version does not match job input")
     task_file = next(
@@ -248,6 +265,9 @@ def _sealed_manifest(inputs: EvaluationInputs) -> tuple[Mapping[str, Any], list[
     )
     if task_file is None:
         raise EvaluationArtifactError("sealed evaluation task artifact is absent")
+    task_digest = _file_sha256(task_file)
+    if manifest.get("task_bundle_sha256") != task_digest:
+        raise EvaluationArtifactError("sealed task bundle checksum does not match manifest")
     try:
         raw = json.loads(task_file.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -255,13 +275,35 @@ def _sealed_manifest(inputs: EvaluationInputs) -> tuple[Mapping[str, Any], list[
     entries = raw.get("tasks") if isinstance(raw, dict) else raw
     if not isinstance(entries, list) or not entries:
         raise EvaluationArtifactError("sealed evaluation contains no tasks")
+    if manifest.get("task_count") != len(entries):
+        raise EvaluationArtifactError("sealed task count does not match manifest")
+    if len(entries) > 10_000:
+        raise EvaluationArtifactError("sealed evaluation task count exceeds the worker bound")
     task_ids = []
     for entry in entries:
         task_id = entry.get("task_id") if isinstance(entry, dict) else entry
         if not isinstance(task_id, str) or not task_id.strip():
             raise EvaluationArtifactError("sealed evaluation contains an invalid task identifier")
         task_ids.append(task_id)
+    if len(set(task_ids)) != len(task_ids):
+        raise EvaluationArtifactError("sealed evaluation contains duplicate task identifiers")
     return manifest, task_ids
+
+
+def render_action_prompt(task: Task, observations: Sequence[Mapping[str, Any]] = ()) -> str:
+    """Render the same safe policy prompt shape used by trainer SFT examples."""
+
+    return json.dumps(
+        {
+            "task_id": task.task_id,
+            "objective": task.objective,
+            "service": task.service_name,
+            "observations": [dict(item) for item in observations],
+            "output": "JSON array of {tool, arguments} objects",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _decode_actions(text: str) -> tuple[ToolCall, ...]:
@@ -320,19 +362,22 @@ def _model_policy(
         ) from exc
 
     def policy(task: Task) -> tuple[ToolCall, ...]:
-        prompt = json.dumps(
-            {
-                "objective": task.objective,
-                "service": task.service_name,
-                "allowed_tools": task.allowed_tools,
-                "output": "JSON array of {tool, arguments} objects",
-            },
-            sort_keys=True,
-        )
+        prompt = render_action_prompt(task)
         try:
             encoded = tokenizer(prompt, return_tensors="pt")
+            input_ids = encoded.get("input_ids")
+            if input_ids is None:
+                return ()
+            device = getattr(model, "device", None)
+            if device is None:
+                device = next(model.parameters()).device
+            encoded = {
+                key: value.to(device) if hasattr(value, "to") else value
+                for key, value in encoded.items()
+            }
             generated = model.generate(**encoded, max_new_tokens=256)
-            text = tokenizer.decode(generated[0], skip_special_tokens=True)
+            completion = generated[0, input_ids.shape[-1] :]
+            text = tokenizer.decode(completion, skip_special_tokens=True)
         except Exception:
             return ()
         return _decode_actions(text)
@@ -353,13 +398,19 @@ def evaluate_checkpoint(
     checkpoint_manifest = verify_checkpoint_artifact(checkpoint_dir)
     selected_policy = policy or _model_policy(checkpoint_dir, checkpoint_manifest)
     successes = 0
+    task_successes: list[bool] = []
     for task_id in sealed_task_ids:
         engine = ServiceRecoveryEngine(seed=objective_seed, sealed=True)
         task = engine.reset(split=ObjectiveSplit.HIDDEN, task_id=task_id)
         actions = tuple(selected_policy(task))[: task.max_steps]
         result = engine.run_episode(task_id, actions, split=ObjectiveSplit.HIDDEN)
         successes += int(result.success)
-    return EvaluationMetrics(task_count=len(sealed_task_ids), successful_tasks=successes)
+        task_successes.append(bool(result.success))
+    return EvaluationMetrics(
+        task_count=len(sealed_task_ids),
+        successful_tasks=successes,
+        task_successes=tuple(task_successes),
+    )
 
 
 def build_evaluation_report(
@@ -384,6 +435,11 @@ def build_evaluation_report(
         "candidate_task_count": candidate_metrics.task_count,
         "candidate_successful_tasks": candidate_metrics.successful_tasks,
         "candidate_success_rate": candidate_metrics.success_rate,
+        "candidate_metrics": {
+            "task_count": candidate_metrics.task_count,
+            "successful_tasks": candidate_metrics.successful_tasks,
+            "success_rate": candidate_metrics.success_rate,
+        },
     }
     if champion_metrics is not None:
         if champion_manifest is None:
@@ -395,6 +451,57 @@ def build_evaluation_report(
                 "champion_task_count": champion_metrics.task_count,
                 "champion_successful_tasks": champion_metrics.successful_tasks,
                 "champion_success_rate": champion_metrics.success_rate,
+                "champion_metrics": {
+                    "task_count": champion_metrics.task_count,
+                    "successful_tasks": champion_metrics.successful_tasks,
+                    "success_rate": champion_metrics.success_rate,
+                },
+            }
+        )
+        if (
+            not candidate_metrics.task_successes
+            or not champion_metrics.task_successes
+            or len(candidate_metrics.task_successes)
+            != len(champion_metrics.task_successes)
+        ):
+            raise EvaluationWorkerError("paired candidate/champion task outcomes are required")
+        regressions = sum(
+            champion and not candidate
+            for candidate, champion in zip(
+                candidate_metrics.task_successes,
+                champion_metrics.task_successes,
+                strict=True,
+            )
+        )
+        improvements = sum(
+            candidate and not champion
+            for candidate, champion in zip(
+                candidate_metrics.task_successes,
+                champion_metrics.task_successes,
+                strict=True,
+            )
+        )
+        unchanged = candidate_metrics.task_count - regressions - improvements
+        decision = "REGRESSED" if regressions else "IMPROVED" if improvements else "UNCHANGED"
+        evidence = {
+            "candidate_manifest_sha256": candidate_manifest["manifest_sha256"],
+            "champion_manifest_sha256": champion_manifest["manifest_sha256"],
+            "candidate_artifact_sha256": candidate_manifest["artifact_sha256"],
+            "champion_artifact_sha256": champion_manifest["artifact_sha256"],
+            "task_count": candidate_metrics.task_count,
+            "regression_count": regressions,
+            "improvement_count": improvements,
+            "unchanged_count": unchanged,
+        }
+        payload.update(
+            {
+                "regression_count": regressions,
+                "improvement_count": improvements,
+                "unchanged_count": unchanged,
+                "regression_decision": decision,
+                "regression_evidence_sha256": hashlib.sha256(
+                    json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
             }
         )
     return payload

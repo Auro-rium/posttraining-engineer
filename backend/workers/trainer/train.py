@@ -184,6 +184,89 @@ def _manifest_digest(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def format_sft_example(row: Mapping[str, Any]) -> dict[str, str]:
+    """Format one objective row as the prompt/completion policy contract."""
+
+    task_id = row.get("task_id")
+    messages = row.get("messages")
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise TrainingWorkerError("SFT row task_id is required")
+    if not isinstance(messages, (list, tuple)) or not messages:
+        raise TrainingWorkerError("SFT row messages are required")
+    observations: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+    service = ""
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise TrainingWorkerError("SFT row messages must be mappings")
+        name = message.get("name")
+        arguments = message.get("arguments", {})
+        observation = message.get("observation", {})
+        if not isinstance(name, str) or not name.strip() or not isinstance(arguments, Mapping):
+            raise TrainingWorkerError("SFT row contains an invalid tool call")
+        if not isinstance(observation, Mapping):
+            raise TrainingWorkerError("SFT row contains an invalid observation")
+        if not service and isinstance(observation.get("service"), str):
+            service = observation["service"]
+        observations.append(dict(observation))
+        actions.append({"tool": name, "arguments": dict(arguments)})
+    prompt = json.dumps(
+        {
+            "task_id": task_id,
+            "objective": "restore the service and pass its health check",
+            "service": service,
+            "observations": observations,
+            "output": "JSON array of {tool, arguments} objects",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    completion = json.dumps(actions, sort_keys=True, separators=(",", ":"))
+    return {"prompt": prompt, "completion": completion}
+
+
+def _verify_manifest_directory(directory: Path, *, label: str) -> dict[str, Any]:
+    if not directory.exists() or not directory.is_dir():
+        raise TrainingWorkerError(f"{label} directory is absent")
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.is_file():
+        raise TrainingWorkerError(f"{label} manifest.json is absent")
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TrainingWorkerError(f"{label} manifest is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise TrainingWorkerError(f"{label} manifest must be a JSON object")
+    digest = payload.get("manifest_sha256")
+    artifact_digest = payload.get("artifact_sha256")
+    files = payload.get("artifact_files")
+    if (
+        payload.get("kind") != "qlora-adapter"
+        or not isinstance(digest, str)
+        or not _SHA256.fullmatch(digest)
+        or not isinstance(artifact_digest, str)
+        or not _SHA256.fullmatch(artifact_digest)
+        or not isinstance(files, list)
+        or not files
+    ):
+        raise TrainingWorkerError(f"{label} manifest is incomplete")
+    unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
+    if _manifest_digest(unsigned) != digest:
+        raise TrainingWorkerError(f"{label} manifest checksum does not match content")
+    actual_files = _artifact_files(directory)
+    if actual_files != files:
+        raise TrainingWorkerError(f"{label} artifact file list does not match content")
+    if _artifact_digest(actual_files) != artifact_digest:
+        raise TrainingWorkerError(f"{label} artifact checksum does not match content")
+    return payload
+
+
+def verify_parent_adapter(parent_adapter_dir: Path) -> dict[str, Any]:
+    """Verify an immutable parent adapter manifest before it can be loaded."""
+
+    return _verify_manifest_directory(parent_adapter_dir, label="parent adapter")
+
+
 def write_training_manifest(
     dataset_dir: Path,
     *,
@@ -195,6 +278,8 @@ def write_training_manifest(
     base_model_id: str,
     base_model_revision: str,
     qlora_config: Mapping[str, Any],
+    parent_manifest: Mapping[str, Any] | None = None,
+    training_metrics: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write a deterministic, content-addressed checkpoint manifest.
 
@@ -228,10 +313,43 @@ def write_training_manifest(
     if (
         source_manifest.get("dataset_id") != dataset_id
         or source_manifest.get("sha256") != dataset_sha256
+        or source_manifest.get("run_id") != run_id
+        or source_manifest.get("experiment_id") != experiment_id
     ):
         raise TrainingWorkerError("dataset manifest does not match training input")
     files = _artifact_files(output_dir)
     config = _validate_qlora(qlora_config)
+    parent: dict[str, Any] | None = None
+    if parent_manifest is not None:
+        parent = {
+            "artifact_id": str(
+                parent_manifest.get(
+                    "artifact_id", f"checkpoint://{parent_manifest.get('manifest_sha256', '')[:24]}"
+                )
+            ),
+            "manifest_sha256": parent_manifest.get("manifest_sha256"),
+            "artifact_sha256": parent_manifest.get("artifact_sha256"),
+            "base_model_revision": parent_manifest.get("base_model_revision"),
+            "qlora_config": parent_manifest.get("qlora_config"),
+        }
+        if not isinstance(parent["manifest_sha256"], str) or not _SHA256.fullmatch(
+            parent["manifest_sha256"]
+        ):
+            raise TrainingWorkerError("parent adapter manifest digest is invalid")
+        if not isinstance(parent["artifact_sha256"], str) or not _SHA256.fullmatch(
+            parent["artifact_sha256"]
+        ):
+            raise TrainingWorkerError("parent adapter artifact digest is invalid")
+        if not isinstance(parent["base_model_revision"], str) or not _REVISION.fullmatch(
+            parent["base_model_revision"]
+        ):
+            raise TrainingWorkerError("parent adapter base revision is invalid")
+        if not isinstance(parent["qlora_config"], Mapping):
+            raise TrainingWorkerError("parent adapter QLoRA config is absent")
+        if parent["base_model_revision"] != base_model_revision:
+            raise TrainingWorkerError("parent adapter base revision does not match training input")
+        if parent["qlora_config"] != config:
+            raise TrainingWorkerError("parent adapter QLoRA config is incompatible")
     payload: dict[str, Any] = {
         "schema_version": "trainer-manifest-v1",
         "kind": "qlora-adapter",
@@ -245,6 +363,18 @@ def write_training_manifest(
         "artifact_files": files,
         "artifact_sha256": _artifact_digest(files),
     }
+    if parent is not None:
+        payload["parent_adapter"] = parent
+    if training_metrics is not None:
+        metrics = json.loads(json.dumps(dict(training_metrics), sort_keys=True))
+        if not isinstance(metrics, dict) or not metrics:
+            raise TrainingWorkerError("training metrics must be a non-empty mapping")
+        if any(
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            for value in metrics.values()
+        ):
+            raise TrainingWorkerError("training metrics must contain numeric values")
+        payload["training_metrics"] = metrics
     payload["manifest_sha256"] = _manifest_digest(payload)
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
@@ -286,15 +416,32 @@ def load_training_dataset(inputs: TrainingInputs) -> Any:
     if (
         dataset.manifest.dataset_id != inputs.dataset_id
         or dataset.manifest.sha256 != inputs.dataset_sha256
+        or dataset.manifest.run_id != inputs.run_id
+        or dataset.manifest.experiment_id != inputs.experiment_id
     ):
         raise TrainingWorkerError("training dataset manifest does not match job inputs")
     if not dataset.rows:
         raise TrainingWorkerError("training dataset must contain at least one row")
+    source_ids = tuple(row.source_trajectory_id for row in dataset.rows)
+    if (
+        len(set(source_ids)) != len(source_ids)
+        or tuple(dataset.manifest.source_trajectory_ids) != source_ids
+    ):
+        raise TrainingWorkerError("training dataset source trajectory references are not canonical")
+    if not dataset.manifest.target_failure_classes:
+        raise TrainingWorkerError("training dataset has no declared failure classes")
     if any(
-        row.split.value not in _ALLOWED_SPLITS or not row.verifier_confirmed
+        row.split.value not in _ALLOWED_SPLITS
+        or not row.verifier_confirmed
+        or row.source_type != "verified_replay"
+        or row.failure_label not in dataset.manifest.target_failure_classes
+        or any(
+            marker in row.task_id.lower() or marker in row.source_trajectory_id.lower()
+            for marker in ("hidden", "sealed", "validation", "eval", "test")
+        )
         for row in dataset.rows
     ):
-        raise TrainingWorkerError("training dataset contains unverified or sealed rows")
+        raise TrainingWorkerError("training dataset contains unverified, untrusted, or sealed rows")
     return dataset
 
 
@@ -312,9 +459,22 @@ def run_training(inputs: TrainingInputs) -> Path:
 
     dataset = load_training_dataset(inputs)
     config = _validate_qlora(inputs.qlora_config or {})
+    parent_manifest: dict[str, Any] | None = None
+    if inputs.parent_adapter_dir is not None:
+        parent_manifest = verify_parent_adapter(inputs.parent_adapter_dir)
+        if parent_manifest.get("base_model_revision") != inputs.base_model_revision:
+            raise TrainingWorkerError("parent adapter base revision does not match training input")
+        if parent_manifest.get("qlora_config") != config:
+            raise TrainingWorkerError("parent adapter QLoRA config is incompatible")
     try:
         # Heavy dependencies are intentionally local to the real execution path.
-        from peft import LoraConfig, PeftModel, get_peft_model  # type: ignore[import-not-found]
+        import torch  # type: ignore[import-not-found]
+        from peft import (  # type: ignore[import-not-found]
+            LoraConfig,
+            PeftModel,
+            get_peft_model,
+            prepare_model_for_kbit_training,
+        )
         from transformers import (  # type: ignore[import-not-found]
             AutoModelForCausalLM,
             AutoTokenizer,
@@ -335,7 +495,7 @@ def run_training(inputs: TrainingInputs) -> Path:
         quantization = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype="bfloat16",
+            bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
         model = AutoModelForCausalLM.from_pretrained(
@@ -345,6 +505,7 @@ def run_training(inputs: TrainingInputs) -> Path:
             device_map="auto",
             trust_remote_code=False,
         )
+        model = prepare_model_for_kbit_training(model)
         if inputs.parent_adapter_dir is not None:
             model = PeftModel.from_pretrained(
                 model, str(inputs.parent_adapter_dir), is_trainable=True
@@ -359,10 +520,11 @@ def run_training(inputs: TrainingInputs) -> Path:
                     target_modules=list(config["target_modules"]),
                     task_type="CAUSAL_LM",
                 ),
-            )
+        )
 
         def tokenize(row: Any) -> dict[str, Any]:
-            rendered = "\n".join(json.dumps(message, sort_keys=True) for message in row["messages"])
+            example = format_sft_example(row)
+            rendered = f"{example['prompt']}\n{example['completion']}"
             return cast(
                 dict[str, Any],
                 tokenizer(
@@ -372,7 +534,10 @@ def run_training(inputs: TrainingInputs) -> Path:
                 ),
             )
 
-        rows = [{"messages": row.messages} for row in dataset.rows]
+        rows = [
+            {"task_id": row.task_id, "messages": row.messages}
+            for row in dataset.rows
+        ]
         tokenized = [tokenize(row) for row in rows]
         args = TrainingArguments(
             output_dir=str(inputs.model_dir),
@@ -391,7 +556,20 @@ def run_training(inputs: TrainingInputs) -> Path:
             train_dataset=tokenized,
             data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         )
-        trainer.train()
+        training_result = trainer.train()
+        raw_metrics = getattr(training_result, "metrics", None)
+        if not isinstance(raw_metrics, Mapping) or not raw_metrics:
+            raise TrainingWorkerError("training did not return metrics")
+        metrics: dict[str, Any] = {}
+        for name, value in raw_metrics.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            metrics[str(name)] = value
+        if not metrics:
+            raise TrainingWorkerError("training did not return numeric metrics")
+        (inputs.model_dir / "training_metrics.json").write_text(
+            json.dumps(metrics, sort_keys=True, separators=(",", ":")) + "\n"
+        )
         model.save_pretrained(inputs.model_dir)
         tokenizer.save_pretrained(inputs.model_dir)
     except Exception as exc:
@@ -406,6 +584,8 @@ def run_training(inputs: TrainingInputs) -> Path:
         base_model_id=inputs.base_model_id,
         base_model_revision=inputs.base_model_revision,
         qlora_config=config,
+        parent_manifest=parent_manifest,
+        training_metrics=metrics,
     )
 
 
