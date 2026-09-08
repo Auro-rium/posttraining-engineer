@@ -448,6 +448,25 @@ class DynamoDBRunRepository:
             raise
         return record
 
+    def finalize_run(self, record: RunHistoryRecord) -> RunHistoryRecord:
+        """Replace a previously reserved history record with its terminal evidence.
+
+        Reservation owns the counter and uniqueness condition; finalization only
+        updates the already-existing history item and never changes sequence.
+        """
+
+        if not record.run_id.strip():
+            raise ValueError("run_id must not be empty")
+        table = self._table_or_create()
+        item = self._history_item(record)
+        response = table.put_item(
+            Item=item,
+            ConditionExpression="attribute_exists(#pk) AND attribute_exists(#sk)",
+            ExpressionAttributeNames={"#pk": "pk", "#sk": "sk"},
+        )
+        del response
+        return record
+
     def create_run(self, run: RunRecord) -> RunRecord:
         if not run.run_id.strip():
             raise ValueError("run_id must not be empty")
