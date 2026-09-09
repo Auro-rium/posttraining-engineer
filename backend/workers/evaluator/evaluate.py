@@ -10,6 +10,7 @@ be written.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -54,14 +55,21 @@ class EvaluationMetrics:
     task_count: int
     successful_tasks: int
     task_successes: tuple[bool, ...] = ()
+    task_environments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.task_count < 0 or self.successful_tasks < 0:
             raise EvaluationWorkerError("evaluation counts cannot be negative")
+        if self.successful_tasks > self.task_count:
+            raise EvaluationWorkerError("successful task count cannot exceed task count")
         if self.task_successes and len(self.task_successes) != self.task_count:
             raise EvaluationWorkerError("evaluation task outcomes do not match task count")
         if self.task_successes and sum(self.task_successes) != self.successful_tasks:
             raise EvaluationWorkerError("evaluation task outcomes do not match success count")
+        if self.task_environments and len(self.task_environments) != self.task_count:
+            raise EvaluationWorkerError("evaluation task environments do not match task count")
+        if self.task_environments and not self.task_successes:
+            raise EvaluationWorkerError("evaluation task outcomes are required for environments")
 
     @property
     def success_rate(self) -> float:
@@ -198,6 +206,14 @@ def verify_checkpoint_artifact(checkpoint_dir: Path) -> Mapping[str, Any]:
         raise EvaluationArtifactError("checkpoint artifact_sha256 is absent or invalid")
     if not isinstance(files, list) or not files:
         raise EvaluationArtifactError("checkpoint artifact_files are absent")
+    if payload.get("kind") != "qlora-adapter":
+        raise EvaluationArtifactError("checkpoint kind is not a QLoRA adapter")
+    if payload.get("base_model_id") != "google/functiongemma-270m-it":
+        raise EvaluationArtifactError("checkpoint base model identity is not FunctionGemma")
+    if not isinstance(payload.get("base_model_revision"), str) or not _REVISION.fullmatch(
+        payload["base_model_revision"]
+    ):
+        raise EvaluationArtifactError("checkpoint base model revision is absent or mutable")
     unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
     expected_manifest = hashlib.sha256(
         json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
@@ -307,27 +323,34 @@ def render_action_prompt(task: Task, observations: Sequence[Mapping[str, Any]] =
 
 
 def _decode_actions(text: str) -> tuple[ToolCall, ...]:
-    """Parse only allow-listed JSON tool calls from model output."""
+    """Parse one allow-listed JSON tool call from model output.
+
+    Unknown tools are a contract violation, not an unsuccessful action that
+    can be silently dropped.  The policy wrapper turns the violation into a
+    failed task without crossing the sealed boundary.
+    """
 
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
         return ()
     values = value if isinstance(value, list) else [value]
+    if not values:
+        return ()
     actions: list[ToolCall] = []
     for item in values:
         if not isinstance(item, dict) or not isinstance(item.get("tool"), str):
-            continue
+            raise EvaluationWorkerError("model output contains an invalid tool call")
         try:
             actions.append(ToolCall(tool=item["tool"], arguments=item.get("arguments", {})))
-        except Exception:
-            continue
+        except Exception as exc:
+            raise EvaluationWorkerError("model output contains an unknown or invalid tool") from exc
     return tuple(actions)
 
 
 def _model_policy(
     checkpoint_dir: Path, manifest: Mapping[str, Any]
-) -> Callable[[Task], tuple[ToolCall, ...]]:
+) -> Callable[[Task, Sequence[Mapping[str, Any]]], tuple[ToolCall, ...]]:
     try:
         # Heavy dependencies are loaded only while evaluating a real checkpoint.
         from peft import PeftModel  # type: ignore[import-not-found]
@@ -361,8 +384,10 @@ def _model_policy(
             f"real checkpoint loading failed: {type(exc).__name__}"
         ) from exc
 
-    def policy(task: Task) -> tuple[ToolCall, ...]:
-        prompt = render_action_prompt(task)
+    def policy(
+        task: Task, observations: Sequence[Mapping[str, Any]] = ()
+    ) -> tuple[ToolCall, ...]:
+        prompt = render_action_prompt(task, observations)
         try:
             encoded = tokenizer(prompt, return_tensors="pt")
             input_ids = encoded.get("input_ids")
@@ -380,7 +405,10 @@ def _model_policy(
             text = tokenizer.decode(completion, skip_special_tokens=True)
         except Exception:
             return ()
-        return _decode_actions(text)
+        try:
+            return _decode_actions(text)[:1]
+        except EvaluationWorkerError:
+            return ()
 
     return policy
 
@@ -390,7 +418,7 @@ def evaluate_checkpoint(
     *,
     sealed_task_ids: Sequence[str],
     objective_seed: int,
-    policy: Callable[[Task], Sequence[ToolCall]] | None = None,
+    policy: Callable[..., ToolCall | Sequence[ToolCall]] | None = None,
     manifest: Mapping[str, Any] | None = None,
 ) -> EvaluationMetrics:
     """Evaluate one verified checkpoint against task IDs without leaking tasks."""
@@ -399,17 +427,69 @@ def evaluate_checkpoint(
     selected_policy = policy or _model_policy(checkpoint_dir, checkpoint_manifest)
     successes = 0
     task_successes: list[bool] = []
+    task_environments: list[str] = []
+
+    def invoke(
+        selected: Callable[..., ToolCall | Sequence[ToolCall]],
+        task: Task,
+        observations: Sequence[Mapping[str, Any]],
+    ) -> ToolCall | Sequence[ToolCall]:
+        # Existing coordinator test adapters accepted ``policy(task)``.  New
+        # model policies receive the observation history at every step.  Use
+        # signature inspection to preserve the old adapter without masking a
+        # real TypeError raised inside a policy implementation.
+        try:
+            parameters = inspect.signature(selected).parameters.values()
+            accepts_observations = any(
+                parameter.kind is parameter.VAR_POSITIONAL
+                or parameter.kind is parameter.VAR_KEYWORD
+                for parameter in parameters
+            ) or len(
+                [
+                    parameter
+                    for parameter in parameters
+                    if parameter.kind
+                    in {parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD}
+                ]
+            ) >= 2
+        except (TypeError, ValueError):
+            accepts_observations = True
+        return selected(task, observations) if accepts_observations else selected(task)
+
     for task_id in sealed_task_ids:
         engine = ServiceRecoveryEngine(seed=objective_seed, sealed=True)
         task = engine.reset(split=ObjectiveSplit.HIDDEN, task_id=task_id)
-        actions = tuple(selected_policy(task))[: task.max_steps]
-        result = engine.run_episode(task_id, actions, split=ObjectiveSplit.HIDDEN)
-        successes += int(result.success)
-        task_successes.append(bool(result.success))
+        observations: list[Mapping[str, Any]] = []
+        success = False
+        for _ in range(task.max_steps):
+            try:
+                raw_action = invoke(selected_policy, task, tuple(observations))
+                actions = (raw_action,) if isinstance(raw_action, ToolCall) else tuple(raw_action)
+            except (EvaluationWorkerError, TypeError, ValueError):
+                actions = ()
+            if not actions:
+                break
+            # A policy emits one action per observation turn.  Extra actions
+            # are rejected instead of being executed with hidden future state.
+            if len(actions) != 1:
+                break
+            try:
+                action = ToolCall(tool=actions[0].tool, arguments=dict(actions[0].arguments))
+                step = engine.step(action.tool, dict(action.arguments))
+            except (EvaluationWorkerError, TypeError, ValueError):
+                break
+            observations.append(step.observation)
+            if step.done:
+                success = bool(step.success and step.reward > 0)
+                break
+        successes += int(success)
+        task_successes.append(success)
+        task_environments.append(task.service_name)
     return EvaluationMetrics(
         task_count=len(sealed_task_ids),
         successful_tasks=successes,
         task_successes=tuple(task_successes),
+        task_environments=tuple(task_environments),
     )
 
 
@@ -422,6 +502,23 @@ def build_evaluation_report(
     champion_manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build aggregate-only report after artifact-backed evaluation."""
+
+    def environment_aggregates(metrics: EvaluationMetrics) -> dict[str, dict[str, Any]]:
+        if not metrics.task_environments:
+            return {}
+        grouped: dict[str, list[bool]] = {}
+        for environment, success in zip(
+            metrics.task_environments, metrics.task_successes, strict=True
+        ):
+            grouped.setdefault(environment, []).append(success)
+        return {
+            environment: {
+                "task_count": len(results),
+                "successful_tasks": sum(results),
+                "success_rate": sum(results) / len(results),
+            }
+            for environment, results in sorted(grouped.items())
+        }
 
     payload: dict[str, Any] = {
         "schema_version": "evaluation-report-v1",
@@ -439,6 +536,7 @@ def build_evaluation_report(
             "task_count": candidate_metrics.task_count,
             "successful_tasks": candidate_metrics.successful_tasks,
             "success_rate": candidate_metrics.success_rate,
+            "by_environment": environment_aggregates(candidate_metrics),
         },
     }
     if champion_metrics is not None:
@@ -455,6 +553,7 @@ def build_evaluation_report(
                     "task_count": champion_metrics.task_count,
                     "successful_tasks": champion_metrics.successful_tasks,
                     "success_rate": champion_metrics.success_rate,
+                    "by_environment": environment_aggregates(champion_metrics),
                 },
             }
         )
@@ -465,6 +564,12 @@ def build_evaluation_report(
             != len(champion_metrics.task_successes)
         ):
             raise EvaluationWorkerError("paired candidate/champion task outcomes are required")
+        if (
+            candidate_metrics.task_environments
+            and champion_metrics.task_environments
+            and candidate_metrics.task_environments != champion_metrics.task_environments
+        ):
+            raise EvaluationWorkerError("paired candidate/champion environments are required")
         regressions = sum(
             champion and not candidate
             for candidate, champion in zip(
@@ -483,6 +588,31 @@ def build_evaluation_report(
         )
         unchanged = candidate_metrics.task_count - regressions - improvements
         decision = "REGRESSED" if regressions else "IMPROVED" if improvements else "UNCHANGED"
+        environment_regression: dict[str, dict[str, Any]] = {}
+        if candidate_metrics.task_environments:
+            paired: dict[str, list[tuple[bool, bool]]] = {}
+            for environment, candidate, champion in zip(
+                candidate_metrics.task_environments,
+                candidate_metrics.task_successes,
+                champion_metrics.task_successes,
+                strict=True,
+            ):
+                paired.setdefault(environment, []).append((candidate, champion))
+            for environment, values in sorted(paired.items()):
+                env_regressions = sum(champion and not candidate for candidate, champion in values)
+                env_improvements = sum(candidate and not champion for candidate, champion in values)
+                environment_regression[environment] = {
+                    "task_count": len(values),
+                    "candidate_successful_tasks": sum(candidate for candidate, _ in values),
+                    "champion_successful_tasks": sum(champion for _, champion in values),
+                    "regression_count": env_regressions,
+                    "improvement_count": env_improvements,
+                    "decision": "REGRESSED"
+                    if env_regressions
+                    else "IMPROVED"
+                    if env_improvements
+                    else "UNCHANGED",
+                }
         evidence = {
             "candidate_manifest_sha256": candidate_manifest["manifest_sha256"],
             "champion_manifest_sha256": champion_manifest["manifest_sha256"],
@@ -492,13 +622,34 @@ def build_evaluation_report(
             "regression_count": regressions,
             "improvement_count": improvements,
             "unchanged_count": unchanged,
+            # Outcomes are the source of truth for the aggregate counts.  The
+            # evaluator never emits task IDs or hidden content, but this
+            # canonical vector makes the regression decision reproducible.
+            "candidate_task_successes": list(candidate_metrics.task_successes),
+            "champion_task_successes": list(champion_metrics.task_successes),
+            "candidate_task_environments": list(candidate_metrics.task_environments),
+            "champion_task_environments": list(champion_metrics.task_environments),
         }
+        paired_outcomes_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "candidate": list(candidate_metrics.task_successes),
+                    "champion": list(champion_metrics.task_successes),
+                    "environments": list(candidate_metrics.task_environments),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        evidence["paired_outcomes_sha256"] = paired_outcomes_sha256
         payload.update(
             {
                 "regression_count": regressions,
                 "improvement_count": improvements,
                 "unchanged_count": unchanged,
                 "regression_decision": decision,
+                "paired_environment_regression": environment_regression,
+                "paired_outcomes_sha256": paired_outcomes_sha256,
                 "regression_evidence_sha256": hashlib.sha256(
                     json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest(),
@@ -510,7 +661,7 @@ def build_evaluation_report(
 def run_evaluation(
     inputs: EvaluationInputs,
     *,
-    policy: Callable[[Task], Sequence[ToolCall]] | None = None,
+    policy: Callable[..., ToolCall | Sequence[ToolCall]] | None = None,
 ) -> Path:
     """Run sealed evaluation and write a report only after all checks pass."""
 
