@@ -108,6 +108,14 @@ class AutonomousRunRepository(Protocol):
 
     def get(self, run_id: str) -> AutonomousRunState | None: ...
 
+    def update_state(
+        self,
+        run_id: str,
+        *,
+        expected_version: int,
+        updates: Mapping[str, Any],
+    ) -> AutonomousRunState: ...
+
     def transition(
         self,
         run_id: str,
@@ -199,6 +207,42 @@ def _ensure_ttl(ttl_seconds: int) -> int:
     return ttl_seconds
 
 
+_PATCH_FORBIDDEN_FIELDS = frozenset(
+    {
+        "run_id",
+        "model_id",
+        "checkpoint_revision",
+        "benchmark_manifest_sha256",
+        "created_at",
+        "version",
+        "event_sequence",
+        "approval_digest",
+        "approval_consumed",
+        "approval_consumed_at",
+        "lease_owner",
+        "lease_expires_at",
+        "experiments",
+        "updated_at",
+    }
+)
+
+
+def _validated_state_updates(updates: Mapping[str, Any]) -> dict[str, Any]:
+    """Reject identity, sequence, approval, lease, and history mutations."""
+
+    normalized = dict(updates)
+    unknown = set(normalized) - set(AutonomousRunState.model_fields)
+    forbidden = set(normalized) & _PATCH_FORBIDDEN_FIELDS
+    if unknown:
+        raise ValueError(f"unknown autonomous state fields: {', '.join(sorted(unknown))}")
+    if forbidden:
+        raise ValueError(
+            "state patch cannot mutate repository-owned fields: "
+            + ", ".join(sorted(forbidden))
+        )
+    return normalized
+
+
 class InMemoryAutonomousRunRepository:
     """Thread-safe repository with the same conditional semantics as DynamoDB."""
 
@@ -222,6 +266,33 @@ class InMemoryAutonomousRunRepository:
         with self._lock:
             state = self._states.get(run_id)
             return copy_for_storage(state) if state else None
+
+    def update_state(
+        self,
+        run_id: str,
+        *,
+        expected_version: int,
+        updates: Mapping[str, Any],
+    ) -> AutonomousRunState:
+        """Conditionally patch durable state without bypassing validation."""
+
+        with self._lock:
+            current = self._require(run_id)
+            if current.version != expected_version:
+                raise ConcurrentUpdateError(
+                    f"run version is {current.version}; expected {expected_version}"
+                )
+            normalized = _validated_state_updates(updates)
+            next_state = AutonomousRunState.model_validate(
+                current.model_copy(
+                    update={
+                        **normalized,
+                        "version": current.version + 1,
+                        "updated_at": utc_now(),
+                    }
+                ).model_dump(mode="python")
+            )
+            return self._store_state(next_state)
 
     def _require(self, run_id: str) -> AutonomousRunState:
         state = self._states.get(run_id)
@@ -642,6 +713,44 @@ class DynamoDBAutonomousRunRepository:
         if self._client is None:
             raise RepositoryError("DynamoDB transaction client is unavailable")
         return self._client
+
+    def update_state(
+        self,
+        run_id: str,
+        *,
+        expected_version: int,
+        updates: Mapping[str, Any],
+    ) -> AutonomousRunState:
+        """Persist a validated optimistic-CAS state patch."""
+
+        current = self.get(run_id)
+        if current is None:
+            raise RunNotFoundError(f"run {run_id!r} was not found")
+        if current.version != expected_version:
+            raise ConcurrentUpdateError(
+                f"run version is {current.version}; expected {expected_version}"
+            )
+        normalized = _validated_state_updates(updates)
+        next_state = AutonomousRunState.model_validate(
+            current.model_copy(
+                update={
+                    **normalized,
+                    "version": current.version + 1,
+                    "updated_at": utc_now(),
+                }
+            ).model_dump(mode="python")
+        )
+        try:
+            self._table_or_create().put_item(
+                Item=self._item(self.STATE_SK, next_state),
+                ConditionExpression="version = :version",
+                ExpressionAttributeValues={":version": current.version},
+            )
+        except Exception as exc:
+            if self._conditional(exc):
+                raise ConcurrentUpdateError("conditional state update failed") from exc
+            raise
+        return next_state
 
     @staticmethod
     def _operation_sk(operation_key: str) -> str:

@@ -90,6 +90,27 @@ def test_transition_is_optimistic_and_appends_atomic_ordered_event() -> None:
     assert events[0].to_status is AutonomousRunStatus.QUEUED
 
 
+def test_update_state_is_validated_optimistic_and_preserves_repository_fields() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(make_run())
+
+    updated = repository.update_state(
+        "run-1",
+        expected_version=0,
+        updates={"current_dataset_uri": "s3://artifacts/data.jsonl?versionId=v1"},
+    )
+
+    assert updated.current_dataset_uri == "s3://artifacts/data.jsonl?versionId=v1"
+    assert updated.version == 1
+    assert updated.event_sequence == 0
+    with pytest.raises(ConcurrentUpdateError):
+        repository.update_state("run-1", expected_version=0, updates={"safe_stop_requested": True})
+    with pytest.raises(ValueError, match="repository-owned"):
+        repository.update_state("run-1", expected_version=1, updates={"run_id": "other"})
+    with pytest.raises(ValueError, match="unknown"):
+        repository.update_state("run-1", expected_version=1, updates={"not_a_field": True})
+
+
 def test_approval_digest_can_be_consumed_only_once_and_must_match_scope() -> None:
     repository = InMemoryAutonomousRunRepository()
     repository.create(make_run())
@@ -272,7 +293,7 @@ def test_run_state_persists_complete_live_recovery_fields() -> None:
     }
     assert restored.approval_scope["max_experiments"] == 5
     with pytest.raises(TypeError):
-        restored.current_hypothesis["hypothesis_id"] = "changed"  # type: ignore[index]
+        restored.current_hypothesis["hypothesis_id"] = "changed"
 
 
 class StubDynamoTable:
@@ -424,6 +445,21 @@ def test_dynamo_lease_uses_native_resource_expression_values_and_derived_name() 
     repository.claim_lease("run-1", "worker", now=datetime(2026, 9, 8, tzinfo=UTC))
     values = table.puts[-1]["ExpressionAttributeValues"]
     assert values == {":version": 0}
+
+
+def test_dynamo_update_state_uses_validated_conditional_put() -> None:
+    table = StubDynamoTable()
+    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_run()))
+    repository = DynamoDBAutonomousRunRepository(table=table, client=StubDynamoClient())
+
+    updated = repository.update_state(
+        "run-1", expected_version=0, updates={"cancellation_requested": True}
+    )
+
+    assert updated.cancellation_requested is True
+    assert updated.version == 1
+    assert table.puts[-1]["ConditionExpression"] == "version = :version"
+    assert table.puts[-1]["ExpressionAttributeValues"] == {":version": 0}
 
 
 def test_dynamo_operation_intent_requires_existing_run_and_uses_transaction() -> None:
