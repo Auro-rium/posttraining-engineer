@@ -18,6 +18,7 @@ from app.autonomous.agents import (
     QLoRAConfig,
     ResearchHypothesis,
 )
+from app.autonomous.dispatcher import AutonomousRunDispatcher
 from app.autonomous.models import (
     AutonomousRunState,
     AutonomousRunStatus,
@@ -431,3 +432,109 @@ async def test_safe_stop_requested_before_next_phase_stops_without_training() ->
     assert result.status is AutonomousRunStatus.STOPPED
     assert result.stop_reason == "safe stop requested"
     assert provider.training_submits == 0
+
+
+def test_missing_dataset_provenance_is_empty_not_fabricated() -> None:
+    state = _state(metadata={"checkpoint_uri": "s3://artifacts/functiongemma"})
+    assert AutonomousRunSupervisor._dataset_refs(state) == ()
+
+
+@pytest.mark.asyncio
+async def test_baseline_evidence_survives_new_supervisor_instance() -> None:
+    store = _StateStore()
+    supervisor, _ = _supervisor(store)
+    state = store.get("run-1")
+    assert state is not None
+    baseline = await supervisor._ensure_baseline(state)
+    restarted = AutonomousRunSupervisor(
+        repository=store,
+        objective=_Objective(),
+        agents=_Agents(),
+        provider=_Provider([0.5]),
+        request_factory=_Factory(),
+        artifacts=_Artifacts(),
+        evaluator=_Evaluator(),
+        poll_interval_seconds=0,
+    )
+    loaded = restarted._champion_evaluation("run-1", baseline)
+    assert loaded.run_id == "eval://run-1/baseline"
+
+
+@pytest.mark.asyncio
+async def test_safe_stop_after_training_does_not_submit_evaluation() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(store)
+    original = provider.submit_training
+
+    def submit_and_request_stop(request: TrainingJobRequest) -> JobResult:
+        result = original(request)
+        current = store.get("run-1")
+        assert current is not None
+        store.update_state(
+            "run-1", expected_version=current.version, updates={"safe_stop_requested": True}
+        )
+        return result
+
+    provider.submit_training = submit_and_request_stop  # type: ignore[method-assign]
+    result = await supervisor.run_optimization("run-1")
+    assert result.status is AutonomousRunStatus.STOPPED
+    assert result.stop_reason == "safe stop requested"
+    assert provider.evaluation_submits == 0
+
+
+@pytest.mark.asyncio
+async def test_stopped_training_due_to_cancel_is_cancelled_not_failed() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(store)
+
+    def submit_stopped(request: TrainingJobRequest) -> JobResult:
+        current = store.get("run-1")
+        assert current is not None
+        store.update_state(
+            "run-1", expected_version=current.version, updates={"cancellation_requested": True}
+        )
+        return JobResult(request.job_name, f"train://{request.job_name}", JobStatus.STOPPED)
+
+    provider.submit_training = submit_stopped  # type: ignore[method-assign]
+    result = await supervisor.run_optimization("run-1")
+    assert result.status is AutonomousRunStatus.CANCELLED
+    assert result.stop_reason == "cancellation requested"
+
+
+@pytest.mark.asyncio
+async def test_failed_training_job_is_failed_not_stopped() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(store)
+
+    def submit_failed(request: TrainingJobRequest) -> JobResult:
+        return JobResult(
+            request.job_name,
+            f"train://{request.job_name}",
+            JobStatus.FAILED,
+            failure_reason="trainer failed",
+        )
+
+    provider.submit_training = submit_failed  # type: ignore[method-assign]
+    result = await supervisor.run_optimization("run-1")
+    assert result.status is AutonomousRunStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_claims_lease_and_releases_it_after_supervisor() -> None:
+    store = _StateStore()
+    state = _state(status=AutonomousRunStatus.QUEUED, phase=RunPhase.QUEUED)
+    store.create(state)
+    calls: list[str] = []
+
+    class _StubSupervisor:
+        async def run_optimization(self, run_id: str) -> AutonomousRunState:
+            calls.append(run_id)
+            return store.get(run_id)  # type: ignore[return-value]
+
+    dispatcher = AutonomousRunDispatcher(
+        repository=store, supervisor=_StubSupervisor(), owner="worker-a", lease_ttl_seconds=30
+    )
+    result = await dispatcher.dispatch_once()
+    assert calls == ["run-1"]
+    assert result == ["run-1"]
+    assert store.get("run-1").lease_owner is None  # type: ignore[union-attr]

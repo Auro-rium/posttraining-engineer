@@ -1,5 +1,6 @@
 """Durable contracts for the autonomous live post-training loop."""
 
+from .dispatcher import AutonomousRunDispatcher, OptimizationRunner
 from .models import (
     AutonomousRunState,
     AutonomousRunStatus,
@@ -27,6 +28,7 @@ from .repository import (
 
 __all__ = [
     "ApprovalAlreadyConsumedError",
+    "AutonomousRunDispatcher",
     "AutonomousRunRepository",
     "AutonomousRunState",
     "AutonomousRunStatus",
@@ -39,6 +41,7 @@ __all__ = [
     "InMemoryAutonomousRunRepository",
     "LeaseConflictError",
     "OperationAlreadyExistsError",
+    "OptimizationRunner",
     "RepositoryError",
     "RunAlreadyExistsError",
     "RunEventRecord",
