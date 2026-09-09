@@ -428,25 +428,25 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
 
         def create_training_job(self, **kwargs: object) -> dict[str, object]:
             self.calls.append(("training", kwargs))
-            arn = "arn:train"
+            arn = "arn:aws:sagemaker:us-east-1:123456789012:training-job/train-1"
             self.training = {
                 "TrainingJobName": kwargs["TrainingJobName"],
                 "TrainingJobArn": arn,
                 "TrainingJobStatus": "Completed",
             }
             self.tags[arn] = cast(list[dict[str, str]], kwargs.get("Tags", []))
-            return {"TrainingJobArn": "arn:train"}
+            return {"TrainingJobArn": arn}
 
         def create_processing_job(self, **kwargs: object) -> dict[str, object]:
             self.calls.append(("evaluation", kwargs))
-            arn = "arn:eval"
+            arn = "arn:aws:sagemaker:us-east-1:123456789012:processing-job/eval-1"
             self.processing = {
                 "ProcessingJobName": kwargs["ProcessingJobName"],
                 "ProcessingJobArn": arn,
                 "ProcessingJobStatus": "Completed",
             }
             self.tags[arn] = cast(list[dict[str, str]], kwargs.get("Tags", []))
-            return {"ProcessingJobArn": "arn:eval"}
+            return {"ProcessingJobArn": arn}
 
         def describe_training_job(self, **kwargs: object) -> dict[str, object]:
             if self.training is None:
@@ -486,8 +486,14 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
         )
     )
 
-    assert training.provider_job_id == "arn:train"
-    assert evaluation.provider_job_id == "arn:eval"
+    assert (
+        training.provider_job_id
+        == "arn:aws:sagemaker:us-east-1:123456789012:training-job/train-1"
+    )
+    assert (
+        evaluation.provider_job_id
+        == "arn:aws:sagemaker:us-east-1:123456789012:processing-job/eval-1"
+    )
     assert provider.get_training_status("train-1").status == "completed"
     assert provider.get_evaluation_status("eval-1").status == "completed"
     assert client.calls[0][1]["HyperParameters"] == {"epochs": "1"}

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import errno
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -242,6 +243,17 @@ def test_transport_describe_failures_are_classified_as_transient(error: BaseExce
     assert is_transient_describe_error(error)
 
 
+@pytest.mark.parametrize(
+    "error", [PermissionError("permission denied"), FileNotFoundError("missing socket")]
+)
+def test_permanent_os_errors_are_not_classified_as_transient(error: BaseException) -> None:
+    assert not is_transient_describe_error(error)
+
+
+def test_network_os_error_with_transient_errno_is_classified_as_transient() -> None:
+    assert is_transient_describe_error(OSError(errno.ECONNRESET, "connection reset"))
+
+
 def test_terminal_failure_reason_is_bounded_and_redacted() -> None:
     client = _FakeClient()
     client.training = {
@@ -278,6 +290,33 @@ def test_adversarial_terminal_failure_text_is_not_returned_or_retained() -> None
     assert "Credentials" not in result.raw_response
 
 
+def test_safe_raw_response_keeps_only_validated_metadata() -> None:
+    client = _FakeClient()
+    client.training = {
+        "TrainingJobArn": "arn:aws:sagemaker:us-east-1:123:training-job/existing",
+        "TrainingJobStatus": "Failed",
+        "SecondaryStatus": "private nested provider output",
+        "ModelArtifacts": {
+            "S3ModelArtifacts": "s3://bucket/model.tar.gz",
+            "NestedUntrusted": "private task content",
+        },
+        "FailureReason": "container failed",
+    }
+
+    result = SageMakerProvider(client=client).get_training_status("apt-run-001-train")
+
+    assert result.artifact_uri == "s3://bucket/model.tar.gz"
+    assert set(result.raw_response) == {
+        "TrainingJobName",
+        "TrainingJobArn",
+        "TrainingJobStatus",
+        "FailureReason",
+    }
+    assert "SecondaryStatus" not in result.raw_response
+    assert "ModelArtifacts" not in result.raw_response
+    assert "private" not in str(result.raw_response)
+
+
 def test_sparse_status_response_does_not_fabricate_provider_id() -> None:
     client = _FakeClient()
     client.training = {"TrainingJobStatus": "Completed"}
@@ -297,6 +336,44 @@ def test_provider_ids_reject_control_characters_and_unsafe_grammar(provider_id: 
 
     with pytest.raises(ProviderResponseError, match="provider job ID"):
         SageMakerProvider(client=client).get_training_status("apt-run-001-train")
+
+
+class _AmbiguousCreateClient(_FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_after_create = True
+
+    def create_training_job(self, **kwargs: object) -> dict[str, Any]:
+        response = super().create_training_job(**kwargs)
+        if self.fail_after_create:
+            arn = "arn:aws:sagemaker:us-east-1:123456789012:training-job/new"
+            self.training = {
+                "TrainingJobName": kwargs["TrainingJobName"],
+                "TrainingJobArn": arn,
+                "TrainingJobStatus": "InProgress",
+            }
+            self.tags = {
+                "Tags": cast(list[dict[str, str]], kwargs.get("Tags", []))
+            }
+            self.fail_after_create = False
+            raise TimeoutError("connection lost after create")
+        return response
+
+
+def test_create_timeout_then_retry_reconciles_without_duplicate_create() -> None:
+    request = _training_request()
+    client = _AmbiguousCreateClient()
+    provider = SageMakerProvider(client=client)
+
+    with pytest.raises(TimeoutError):
+        provider.submit_training(request)
+    result = provider.submit_training(request)
+
+    assert (
+        result.provider_job_id
+        == "arn:aws:sagemaker:us-east-1:123456789012:training-job/new"
+    )
+    assert client.create_training_calls == 1
 
 
 def test_stop_calls_are_idempotent_when_job_is_missing() -> None:

@@ -7,6 +7,7 @@ created lazily, so importing this module cannot require AWS credentials.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import re
@@ -122,6 +123,20 @@ class JobResult:
 _JOB_NAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:/.@+_=,-]{0,1999}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_TRANSIENT_OS_ERRNOS = frozenset(
+    {
+        errno.ECONNABORTED,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EHOSTDOWN,
+        errno.EHOSTUNREACH,
+        errno.ENETDOWN,
+        errno.ENETRESET,
+        errno.ENETUNREACH,
+        errno.EPIPE,
+        errno.ETIMEDOUT,
+    }
+)
 _TRANSIENT_ERROR_CODES = frozenset(
     {
         "InternalError",
@@ -276,8 +291,10 @@ def _error_message(exc: BaseException) -> str:
 def is_transient_describe_error(exc: BaseException) -> bool:
     """Classify only provider read failures safe for bounded supervisor retry."""
 
-    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+    if isinstance(exc, (TimeoutError, ConnectionError)):
         return True
+    if isinstance(exc, OSError):
+        return getattr(exc, "errno", None) in _TRANSIENT_OS_ERRNOS
     if exc.__class__.__name__ in {
         "ConnectTimeoutError",
         "ConnectionClosedError",
@@ -336,47 +353,28 @@ def _safe_failure_reason(value: object) -> str | None:
     return "provider reported terminal failure"
 
 
-def _safe_raw_response(response: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
+def _safe_raw_response(
+    response: Mapping[str, Any], *, kind: str, status: JobStatus
+) -> dict[str, Any]:
     """Retain only provider metadata needed by local callers."""
 
     name_key = "TrainingJobName" if kind == "training" else "ProcessingJobName"
     arn_key = "TrainingJobArn" if kind == "training" else "ProcessingJobArn"
     status_key = "TrainingJobStatus" if kind == "training" else "ProcessingJobStatus"
-    safe: dict[str, Any] = {
-        key: response[key]
-        for key in (name_key, arn_key, status_key, "SecondaryStatus")
-        if key in response
-    }
+    safe: dict[str, Any] = {key: response[key] for key in (name_key, arn_key) if key in response}
+    if status_key in response:
+        safe[status_key] = status.value
     if "FailureReason" in response:
         safe["FailureReason"] = _safe_failure_reason(response.get("FailureReason"))
-    if kind == "training":
-        artifacts = response.get("ModelArtifacts")
-        if isinstance(artifacts, Mapping) and artifacts.get("S3ModelArtifacts"):
-            safe["ModelArtifacts"] = {"S3ModelArtifacts": artifacts["S3ModelArtifacts"]}
-    else:
-        outputs = response.get("ProcessingOutputConfig")
-        if isinstance(outputs, Mapping):
-            listed = outputs.get("Outputs")
-            if isinstance(listed, list):
-                safe_outputs: list[dict[str, Any]] = []
-                for item in listed:
-                    if not isinstance(item, Mapping):
-                        continue
-                    output: dict[str, Any] = {}
-                    if item.get("OutputName"):
-                        output["OutputName"] = item["OutputName"]
-                    s3_output = item.get("S3Output")
-                    if isinstance(s3_output, Mapping):
-                        output["S3Output"] = {
-                            key: s3_output[key]
-                            for key in ("S3Uri", "LocalPath", "S3UploadMode")
-                            if key in s3_output
-                        }
-                    if output:
-                        safe_outputs.append(output)
-                if safe_outputs:
-                    safe["ProcessingOutputConfig"] = {"Outputs": safe_outputs}
     return safe
+
+
+def _validate_artifact_uri(value: object) -> str:
+    if not isinstance(value, str) or not value.startswith("s3://"):
+        raise ProviderResponseError("SageMaker response contained an invalid artifact URI")
+    if len(value) > 2_048 or any(character.isspace() or ord(character) < 32 for character in value):
+        raise ProviderResponseError("SageMaker response contained an invalid artifact URI")
+    return value
 
 
 def _status(value: object) -> JobStatus:
@@ -566,7 +564,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         if kind == "training":
             model_artifacts = response.get("ModelArtifacts")
             if isinstance(model_artifacts, Mapping) and model_artifacts.get("S3ModelArtifacts"):
-                artifact_uri = str(model_artifacts["S3ModelArtifacts"])
+                artifact_uri = _validate_artifact_uri(model_artifacts["S3ModelArtifacts"])
         else:
             outputs = response.get("ProcessingOutputConfig")
             if isinstance(outputs, Mapping):
@@ -574,7 +572,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                 if isinstance(listed, list) and listed and isinstance(listed[0], Mapping):
                     s3_output = listed[0].get("S3Output")
                     if isinstance(s3_output, Mapping) and s3_output.get("S3Uri"):
-                        artifact_uri = str(s3_output["S3Uri"])
+                        artifact_uri = _validate_artifact_uri(s3_output["S3Uri"])
         failure_reason = None
         if status in {JobStatus.FAILED, JobStatus.STOPPED}:
             failure_reason = _safe_failure_reason(response.get("FailureReason"))
@@ -584,7 +582,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
             status=status,
             artifact_uri=artifact_uri,
             failure_reason=failure_reason,
-            raw_response=_safe_raw_response(response, kind=kind),
+            raw_response=_safe_raw_response(response, kind=kind, status=status),
         )
 
     def reconcile_training(self, request: TrainingJobRequest) -> JobResult | None:
