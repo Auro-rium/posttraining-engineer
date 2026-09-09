@@ -436,8 +436,16 @@ class AutonomousRunState(ContractModel):
     model_id: str = Field(default="google/functiongemma-270m-it", min_length=1)
     checkpoint_revision: str
     checkpoint_id: str | None = Field(default=None, min_length=1)
+    base_checkpoint_uri: str | None = Field(default=None, min_length=1)
+    base_checkpoint_sha256: str | None = None
+    champion_checkpoint_uri: str | None = Field(default=None, min_length=1)
+    champion_checkpoint_sha256: str | None = None
+    champion_score: float | None = Field(default=None, ge=0, le=1)
     benchmark_id: str = Field(default="service-recovery-v1", min_length=1)
     benchmark_manifest_sha256: str
+    benchmark_suite: str = Field(default="AgentGym/AgentEval", min_length=1)
+    benchmark_version: str = Field(default="agent-eval-v1", min_length=1)
+    benchmark_seed: int = 7
     max_experiments: int = Field(default=5, ge=1, le=5)
     approved_budget_usd: float = Field(default=25.0, gt=0, le=25)
     status: AutonomousRunStatus = AutonomousRunStatus.PREPARED
@@ -445,6 +453,8 @@ class AutonomousRunState(ContractModel):
     version: int = Field(default=0, ge=0)
     event_sequence: int = Field(default=0, ge=0)
     approval_digest: str | None = None
+    approval_scope: dict[str, Any] = Field(default_factory=dict)
+    approval_expires_at: datetime | None = None
     approval_consumed: bool = False
     approval_consumed_at: datetime | None = None
     lease_owner: str | None = None
@@ -457,6 +467,13 @@ class AutonomousRunState(ContractModel):
     baseline_artifact_ids: tuple[str, ...] = Field(default_factory=tuple)
     champion_artifact_ids: tuple[str, ...] = Field(default_factory=tuple)
     current_experiment_number: int | None = Field(default=None, ge=1, le=5)
+    current_hypothesis: dict[str, Any] | None = None
+    current_dataset_uri: str | None = Field(default=None, min_length=1)
+    current_dataset_sha256: str | None = None
+    current_training_job_id: str | None = Field(default=None, min_length=1)
+    current_evaluation_job_id: str | None = Field(default=None, min_length=1)
+    current_candidate_uri: str | None = Field(default=None, min_length=1)
+    current_candidate_sha256: str | None = None
     experiments: list[ExperimentRecord] = Field(default_factory=list)
     stop_reason: str | None = Field(default=None, min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
@@ -470,14 +487,27 @@ class AutonomousRunState(ContractModel):
             raise ValueError("checkpoint_revision must be a 40-character immutable revision")
         return value.lower()
 
-    @field_validator("benchmark_manifest_sha256", "approval_digest")
+    @field_validator(
+        "benchmark_manifest_sha256",
+        "approval_digest",
+        "base_checkpoint_sha256",
+        "champion_checkpoint_sha256",
+        "current_dataset_sha256",
+        "current_candidate_sha256",
+    )
     @classmethod
     def require_sha256(cls, value: str | None) -> str | None:
         if value is not None and not _SHA256.fullmatch(value):
             raise ValueError("digest must be a lowercase 64-character SHA-256 value")
         return value
 
-    @field_validator("created_at", "updated_at", "approval_consumed_at", "lease_expires_at")
+    @field_validator(
+        "created_at",
+        "updated_at",
+        "approval_consumed_at",
+        "approval_expires_at",
+        "lease_expires_at",
+    )
     @classmethod
     def require_aware_datetime(cls, value: datetime | None) -> datetime | None:
         if value is not None and (value.tzinfo is None or value.utcoffset() is None):
@@ -504,7 +534,13 @@ class AutonomousRunState(ContractModel):
     def freeze_experiments(cls, value: list[ExperimentRecord]) -> tuple[ExperimentRecord, ...]:
         return tuple(value)
 
-    @field_validator("metadata", "baseline_metrics", "champion_metrics", mode="after")
+    @field_validator(
+        "metadata",
+        "baseline_metrics",
+        "champion_metrics",
+        "approval_scope",
+        mode="after",
+    )
     @classmethod
     def freeze_state_mappings(cls, value: dict[str, Any]) -> FrozenDict:
         return cast(FrozenDict, _deep_freeze(value))
@@ -521,6 +557,13 @@ class AutonomousRunState(ContractModel):
         object.__setattr__(self, "metadata", _deep_freeze(self.metadata))
         object.__setattr__(self, "baseline_metrics", _deep_freeze(self.baseline_metrics))
         object.__setattr__(self, "champion_metrics", _deep_freeze(self.champion_metrics))
+        object.__setattr__(self, "approval_scope", _deep_freeze(self.approval_scope))
+        if self.current_hypothesis is not None:
+            object.__setattr__(
+                self,
+                "current_hypothesis",
+                _deep_freeze(self.current_hypothesis),
+            )
         return self
 
     @property

@@ -238,6 +238,43 @@ def test_models_reject_invalid_scope_and_unknown_fields() -> None:
         )
 
 
+def test_run_state_persists_complete_live_recovery_fields() -> None:
+    state = make_run().model_copy(
+        update={
+            "base_checkpoint_uri": "s3://artifacts/base.tar.gz?versionId=v1",
+            "base_checkpoint_sha256": "1" * 64,
+            "champion_checkpoint_uri": "s3://artifacts/champion.tar.gz?versionId=v2",
+            "champion_checkpoint_sha256": "2" * 64,
+            "champion_score": 0.75,
+            "benchmark_suite": "AgentGym/AgentEval",
+            "benchmark_version": "agent-eval-v1",
+            "benchmark_seed": 7,
+            "current_hypothesis": {
+                "hypothesis_id": "hyp-1",
+                "evidence_ids": ["ev-1"],
+            },
+            "current_dataset_uri": "s3://artifacts/data.jsonl?versionId=v3",
+            "current_dataset_sha256": "3" * 64,
+            "current_training_job_id": "training-job-1",
+            "current_evaluation_job_id": "evaluation-job-1",
+            "current_candidate_uri": "s3://artifacts/candidate.tar.gz?versionId=v4",
+            "current_candidate_sha256": "4" * 64,
+            "approval_scope": {"max_experiments": 5, "max_cost_usd": 25.0},
+            "approval_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+        }
+    )
+
+    restored = AutonomousRunState.model_validate(state.model_dump(mode="python"))
+    assert restored.current_training_job_id == "training-job-1"
+    assert restored.current_hypothesis == {
+        "hypothesis_id": "hyp-1",
+        "evidence_ids": ("ev-1",),
+    }
+    assert restored.approval_scope["max_experiments"] == 5
+    with pytest.raises(TypeError):
+        restored.current_hypothesis["hypothesis_id"] = "changed"  # type: ignore[index]
+
+
 class StubDynamoTable:
     """Native resource-table stub with keyset pagination and captured writes."""
 
