@@ -11,12 +11,14 @@ the result that callers should persist.
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import hashlib
 import io
 import json
 import re
 import tarfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -31,13 +33,36 @@ _WEIGHT_NAMES = (
 _GATE_MARKERS = frozenset(
     {".gated", "gated", "gated.json", "access_request.json", "access_denied"}
 )
-_RESTRICTED_FLAGS = frozenset(
-    {"gated", "is_gated", "private", "is_private", "access_restricted", "access_denied"}
+_CACHE_COMPONENTS = frozenset(
+    {".cache", "cache", "refs", "snapshots", "blobs", ".git", ".hg", ".svn"}
 )
+_RESTRICTED_FLAGS = frozenset(
+    {
+        "gated",
+        "is_gated",
+        "private",
+        "is_private",
+        "access_restricted",
+        "access_denied",
+        "disabled",
+        "unavailable",
+    }
+)
+_SHARD_RE = {
+    ".safetensors": re.compile(r"^model-(\d{5})-of-(\d{5})\.safetensors$"),
+    ".bin": re.compile(r"^pytorch_model-(\d{5})-of-(\d{5})\.bin$"),
+}
 
 
 class CheckpointStagingError(ValueError):
     """Raised when a checkpoint cannot be proven safe and complete to stage."""
+
+
+def _parse_shard_name(name: str, suffix: str) -> tuple[int, int] | None:
+    match = _SHARD_RE[suffix].fullmatch(name)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +122,7 @@ class StagedCheckpoint:
     bucket: str
     key: str
     version_id: str
+    encryption: str
     metadata: dict[str, str]
 
     @property
@@ -125,6 +151,7 @@ class StagedCheckpoint:
             "uri": self.uri,
             "version_id": self.version_id,
             "version_ref": self.version_ref,
+            "encryption": self.encryption,
             "metadata": dict(self.metadata),
         }
 
@@ -161,8 +188,12 @@ def _relative_files(root: Path) -> list[Path]:
             raise CheckpointStagingError(
                 f"checkpoint contains cache lock/partial input: {relative}"
             )
-        if "refs" in parts:
-            raise CheckpointStagingError(f"checkpoint contains mutable cache reference: {relative}")
+        if any(part in _CACHE_COMPONENTS for part in parts):
+            if "refs" in parts:
+                raise CheckpointStagingError(
+                    f"checkpoint contains mutable cache reference: {relative}"
+                )
+            raise CheckpointStagingError(f"checkpoint contains mutable cache artifact: {relative}")
         if any(part in {".locks", "locks"} or part.startswith(".lock") for part in parts):
             raise CheckpointStagingError(f"checkpoint contains cache lock directory: {relative}")
         if path.is_file():
@@ -176,7 +207,7 @@ def _truthy_restricted_flag(value: object) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return value.strip().lower() not in {"", "0", "false", "no", "n", "off", "none", "null"}
     return bool(value) if isinstance(value, (int, float)) else False
 
 
@@ -193,7 +224,9 @@ def _contains_restricted_flag(value: object) -> bool:
     return False
 
 
-def _reject_gated_metadata(paths: list[Path], root: Path) -> None:
+def _reject_gated_metadata(
+    paths: list[Path], root: Path, *, revision: str, model_id: str
+) -> None:
     for path in paths:
         if path.suffix.lower() != ".json":
             continue
@@ -203,10 +236,63 @@ def _reject_gated_metadata(paths: list[Path], root: Path) -> None:
             raise CheckpointStagingError(
                 f"invalid checkpoint JSON metadata: {path.relative_to(root)}"
             ) from exc
+        if not isinstance(value, dict):
+            raise CheckpointStagingError(
+                f"checkpoint JSON metadata/report must be an object: {path.relative_to(root)}"
+            )
         if _contains_restricted_flag(value):
             raise CheckpointStagingError(
                 f"checkpoint metadata is gated/private/restricted: {path.relative_to(root)}"
             )
+        _validate_hf_metadata_identity(
+            value,
+            path.relative_to(root).as_posix(),
+            revision=revision,
+            model_id=model_id,
+        )
+
+
+def _validate_hf_metadata_identity(
+    value: dict[object, object],
+    relative: str,
+    *,
+    revision: str,
+    model_id: str,
+) -> None:
+    """Validate identity/status fields when a Hub metadata report is present."""
+
+    for field in ("siblings", "files"):
+        observed = value.get(field)
+        if observed is not None and not isinstance(observed, list):
+            raise CheckpointStagingError(f"HF metadata has an invalid {field} shape: {relative}")
+    for field in ("status", "state"):
+        observed = value.get(field)
+        if observed is not None and not isinstance(observed, str):
+            raise CheckpointStagingError(f"HF metadata has an invalid {field} shape: {relative}")
+
+    for field in ("sha", "revision", "commit_sha", "hf_revision"):
+        observed = value.get(field)
+        if observed is not None:
+            if not isinstance(observed, str) or not _REVISION_RE.fullmatch(observed):
+                raise CheckpointStagingError(f"HF metadata has an invalid revision: {relative}")
+            if observed != revision:
+                raise CheckpointStagingError(
+                    f"HF metadata revision does not match requested commit: {relative}"
+                )
+    for field in ("model_id", "repo_id", "id"):
+        observed = value.get(field)
+        if observed is not None and observed != model_id:
+            raise CheckpointStagingError(f"HF metadata model does not match target: {relative}")
+    for field in ("status", "state"):
+        observed = value.get(field)
+        if isinstance(observed, str) and observed.strip().lower() in {
+            "unavailable",
+            "disabled",
+            "gated",
+            "private",
+            "error",
+        }:
+            raise CheckpointStagingError(f"HF revision is unavailable: {relative}")
 
 
 def _validate_required_files(paths: list[Path], root: Path) -> None:
@@ -228,6 +314,12 @@ def _validate_required_files(paths: list[Path], root: Path) -> None:
             ) from exc
         if not isinstance(value, dict):
             raise CheckpointStagingError(f"required checkpoint JSON must be an object: {filename}")
+        if filename == "config.json" and not isinstance(value.get("model_type"), str):
+            raise CheckpointStagingError(f"required checkpoint JSON has no model_type: {filename}")
+        if filename == "tokenizer.json" and not isinstance(
+            value.get("version"), (str, int, float)
+        ):
+            raise CheckpointStagingError(f"required checkpoint JSON has no version: {filename}")
 
     weights = [
         path
@@ -243,12 +335,48 @@ def _validate_required_files(paths: list[Path], root: Path) -> None:
         )
     if any(path.stat().st_size == 0 for path in weights):
         raise CheckpointStagingError("checkpoint is incomplete; model weight file is empty")
+    nested_weights = [path for path in weights if path.parent != root]
+    if nested_weights:
+        raise CheckpointStagingError(
+            "model weight files must be at the checkpoint root: "
+            + ", ".join(path.relative_to(root).as_posix() for path in nested_weights)
+        )
+
+    safetensor_shards = {
+        path.name for path in paths if _SHARD_RE[".safetensors"].fullmatch(path.name)
+    }
+    bin_shards = {path.name for path in paths if _SHARD_RE[".bin"].fullmatch(path.name)}
+    unsupported_shards = {
+        path.name
+        for path in paths
+        if (path.name.startswith("model-") and path.suffix == ".safetensors")
+        or (path.name.startswith("pytorch_model-") and path.suffix == ".bin")
+    } - safetensor_shards - bin_shards
+    if unsupported_shards:
+        raise CheckpointStagingError(
+            "checkpoint contains an invalid weight shard name: "
+            + ", ".join(sorted(unsupported_shards))
+        )
 
     index_paths = [
         path
         for path in paths
         if path.name in {"model.safetensors.index.json", "pytorch_model.bin.index.json"}
     ]
+    nested_indexes = [path for path in index_paths if path.parent != root]
+    if nested_indexes:
+        raise CheckpointStagingError(
+            "weight indexes must be at the checkpoint root: "
+            + ", ".join(path.relative_to(root).as_posix() for path in nested_indexes)
+        )
+    index_names = {path.name for path in index_paths}
+    if safetensor_shards and "model.safetensors.index.json" not in index_names:
+        raise CheckpointStagingError("sharded safetensors require a weight index")
+    if bin_shards and "pytorch_model.bin.index.json" not in index_names:
+        raise CheckpointStagingError("sharded pytorch weights require a weight index")
+    if safetensor_shards and bin_shards:
+        raise CheckpointStagingError("checkpoint mixes safetensors and pytorch weight shards")
+
     for index_path in index_paths:
         try:
             index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -261,38 +389,54 @@ def _validate_required_files(paths: list[Path], root: Path) -> None:
             raise CheckpointStagingError(
                 f"weight index has no weight_map: {index_path.relative_to(root)}"
             )
+        index_metadata = index.get("metadata") if isinstance(index, dict) else None
+        if index_metadata is not None and not isinstance(index_metadata, dict):
+            raise CheckpointStagingError(
+                f"weight index metadata has an invalid shape: {index_path.relative_to(root)}"
+            )
+        if isinstance(index_metadata, dict) and "total_size" in index_metadata:
+            total_size = index_metadata["total_size"]
+            if (
+                isinstance(total_size, bool)
+                or not isinstance(total_size, (int, float))
+                or total_size < 0
+            ):
+                raise CheckpointStagingError(
+                    f"weight index metadata has an invalid total_size: "
+                    f"{index_path.relative_to(root)}"
+                )
         expected_suffix = ".safetensors" if index_path.name.startswith("model.") else ".bin"
+        expected_shards = safetensor_shards if expected_suffix == ".safetensors" else bin_shards
         mapped_shards: set[str] = set()
-        for value in weight_map.values():
+        parsed_shards: list[tuple[int, int]] = []
+        for parameter, value in weight_map.items():
+            if not isinstance(parameter, str) or not parameter:
+                raise CheckpointStagingError(
+                    "weight index contains an invalid parameter name: "
+                    f"{index_path.relative_to(root)}"
+                )
             if not isinstance(value, str) or not value:
                 raise CheckpointStagingError(
                     f"weight index contains a non-string shard: {index_path.relative_to(root)}"
                 )
             shard = PurePosixPath(value)
-            if (
-                shard.name != value
-                or not value.endswith(expected_suffix)
-                or not (
-                    value.startswith("model-")
-                    if expected_suffix == ".safetensors"
-                    else value.startswith("pytorch_model-")
+            shard_parts = _parse_shard_name(value, expected_suffix)
+            if shard.name != value or shard_parts is None:
+                raise CheckpointStagingError(
+                    f"weight index contains an invalid shard name: {value}"
                 )
-            ):
+            shard_number, declared_total = shard_parts
+            if shard_number < 1 or declared_total < 1:
+                raise CheckpointStagingError(
+                    f"weight index contains an invalid shard name: {value}"
+                )
+            if shard_number > declared_total:
                 raise CheckpointStagingError(
                     f"weight index contains an invalid shard name: {value}"
                 )
             mapped_shards.add(value)
-        available_shards = {
-            path.name
-            for path in paths
-            if (
-                path.name.startswith("model-")
-                and path.name.endswith(".safetensors")
-                if expected_suffix == ".safetensors"
-                else path.name.startswith("pytorch_model-")
-                and path.name.endswith(".bin")
-            )
-        }
+            parsed_shards.append((shard_number, declared_total))
+        available_shards = expected_shards
         missing_shards = sorted(mapped_shards - names)
         if missing_shards:
             raise CheckpointStagingError(
@@ -303,6 +447,20 @@ def _validate_required_files(paths: list[Path], root: Path) -> None:
                 "weight index does not match available model shards: "
                 f"expected {sorted(mapped_shards)}, found {sorted(available_shards)}"
             )
+        shard_numbers = {number for number, _ in parsed_shards}
+        declared_totals = {total for _, total in parsed_shards}
+        expected_total = next(iter(declared_totals))
+        if len(declared_totals) != 1 or expected_total != len(mapped_shards):
+            raise CheckpointStagingError(
+                f"weight index has an incomplete shard set: {index_path.relative_to(root)}"
+            )
+        if shard_numbers != set(range(1, expected_total + 1)):
+            raise CheckpointStagingError(
+                f"weight index has an incomplete shard set: {index_path.relative_to(root)}"
+            )
+        for shard_name in mapped_shards:
+            if (root / shard_name).stat().st_size == 0:
+                raise CheckpointStagingError(f"model weight file is empty: {shard_name}")
 
 
 def validate_checkpoint_directory(
@@ -320,7 +478,7 @@ def validate_checkpoint_directory(
     validate_immutable_revision(revision)
     root = Path(checkpoint_dir).expanduser()
     paths = _relative_files(root)
-    _reject_gated_metadata(paths, root)
+    _reject_gated_metadata(paths, root, revision=revision, model_id=model_id)
     _validate_required_files(paths, root)
     if not paths:
         raise CheckpointStagingError("checkpoint directory is empty")
@@ -384,6 +542,36 @@ def _safe_prefix(prefix: str) -> str:
     return clean
 
 
+def _required_bucket_encryption(s3_client: Any, bucket: str) -> str:
+    """Return the configured SSE algorithm or fail before any upload."""
+
+    try:
+        response = s3_client.get_bucket_encryption(Bucket=bucket)
+    except Exception as exc:
+        raise CheckpointStagingError("could not verify S3 bucket encryption") from exc
+    if not isinstance(response, Mapping):
+        raise CheckpointStagingError("S3 bucket encryption report has an invalid shape")
+    configuration = response.get("ServerSideEncryptionConfiguration")
+    if not isinstance(configuration, Mapping):
+        raise CheckpointStagingError("S3 bucket encryption is missing its configuration")
+    rules = configuration.get("Rules")
+    if not isinstance(rules, list):
+        raise CheckpointStagingError("S3 bucket encryption report has no rules")
+    algorithms: set[str] = set()
+    for rule in rules:
+        if not isinstance(rule, Mapping):
+            continue
+        default = rule.get("ApplyServerSideEncryptionByDefault")
+        if isinstance(default, Mapping):
+            algorithm = default.get("SSEAlgorithm")
+            if isinstance(algorithm, str):
+                algorithms.add(algorithm)
+    supported = algorithms.intersection({"AES256", "aws:kms"})
+    if not supported:
+        raise CheckpointStagingError("S3 bucket encryption must be SSE-S3 or SSE-KMS")
+    return sorted(supported)[0]
+
+
 def stage_checkpoint(
     checkpoint_dir: str | Path,
     *,
@@ -416,6 +604,8 @@ def stage_checkpoint(
         raise CheckpointStagingError("could not verify S3 bucket versioning") from exc
     if not isinstance(versioning, dict) or versioning.get("Status") != "Enabled":
         raise CheckpointStagingError("S3 bucket versioning must be Enabled before staging")
+    encryption = _required_bucket_encryption(s3_client, bucket)
+    checksum_b64 = base64.b64encode(bytes.fromhex(bundle.sha256)).decode("ascii")
 
     metadata = {
         "sha256": bundle.sha256,
@@ -425,6 +615,10 @@ def stage_checkpoint(
         "file-count": str(len(bundle.files)),
         "bundle-size-bytes": str(bundle.size_bytes),
         "s3-versioning": "Enabled",
+        "s3-encryption": encryption,
+        "checksum-algorithm": "SHA256",
+        "checksum-sha256": bundle.sha256,
+        "checksum-sha256-base64": checksum_b64,
     }
     try:
         response = s3_client.put_object(
@@ -432,6 +626,8 @@ def stage_checkpoint(
             Key=key,
             Body=bundle.data,
             ContentType="application/gzip",
+            ServerSideEncryption=encryption,
+            ChecksumSHA256=checksum_b64,
             Metadata=metadata,
         )
     except Exception as exc:
@@ -445,6 +641,9 @@ def stage_checkpoint(
         or version_id.strip().lower() == "null"
     ):
         raise CheckpointStagingError("S3 upload did not return a version id")
+    returned_checksum = response.get("ChecksumSHA256") if isinstance(response, dict) else None
+    if not isinstance(returned_checksum, str) or returned_checksum != checksum_b64:
+        raise CheckpointStagingError("S3 upload did not return matching checksum provenance")
     version_id = version_id.strip()
     return StagedCheckpoint(
         model_id=bundle.model_id,
@@ -455,6 +654,7 @@ def stage_checkpoint(
         bucket=bucket,
         key=key,
         version_id=str(version_id),
+        encryption=encryption,
         metadata=metadata,
     )
 

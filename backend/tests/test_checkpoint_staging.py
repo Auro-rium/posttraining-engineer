@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import builtins
 import hashlib
 import json
@@ -181,6 +182,58 @@ def test_indexed_shards_missing_from_disk_are_rejected(tmp_path: Path) -> None:
         validate_checkpoint_directory(checkpoint, revision=REVISION)
 
 
+def test_sharded_safetensors_require_an_index(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "model.safetensors").unlink()
+    (checkpoint / "model-00001-of-00002.safetensors").write_bytes(b"shard-1")
+    (checkpoint / "model-00002-of-00002.safetensors").write_bytes(b"shard-2")
+
+    with pytest.raises(CheckpointStagingError, match="weight index"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+def test_indexed_safetensors_require_a_complete_numbered_set(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "model.safetensors").unlink()
+    (checkpoint / "model-00001-of-00003.safetensors").write_bytes(b"shard-1")
+    (checkpoint / "model-00003-of-00003.safetensors").write_bytes(b"shard-3")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "layer.0": "model-00001-of-00003.safetensors",
+                    "layer.2": "model-00003-of-00003.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CheckpointStagingError, match=r"complete|missing"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+@pytest.mark.parametrize("filename", ["metadata.json", "report.json", "manifest.json"])
+def test_optional_hf_metadata_and_reports_must_be_object_json(
+    tmp_path: Path, filename: str
+) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / filename).write_text("[]", encoding="utf-8")
+
+    with pytest.raises(CheckpointStagingError, match=r"JSON.*object"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+def test_unavailable_hf_revision_metadata_is_rejected(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"sha": REVISION, "disabled": True}), encoding="utf-8"
+    )
+
+    with pytest.raises(CheckpointStagingError, match=r"unavailable|restricted"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
 def test_bundle_bytes_and_hash_are_deterministic(tmp_path: Path) -> None:
     first = _checkpoint(tmp_path / "first")
     second = _checkpoint(tmp_path / "second")
@@ -202,9 +255,25 @@ class _VersionedS3:
         assert kwargs == {"Bucket": "artifacts"}
         return {"Status": "Enabled"}
 
+    def get_bucket_encryption(self, **kwargs: object) -> dict[str, object]:
+        assert kwargs == {"Bucket": "artifacts"}
+        return {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [
+                    {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}
+                ]
+            }
+        }
+
     def put_object(self, **kwargs: object) -> dict[str, object]:
         self.put_calls.append(kwargs)
-        return {"VersionId": "version-17", "ETag": '"etag"'}
+        body = kwargs["Body"]
+        assert isinstance(body, bytes)
+        return {
+            "VersionId": "version-17",
+            "ChecksumSHA256": base64.b64encode(hashlib.sha256(body).digest()).decode("ascii"),
+            "ETag": '"etag"',
+        }
 
 
 def test_stage_upload_is_content_addressed_and_has_version_metadata(tmp_path: Path) -> None:
@@ -226,6 +295,9 @@ def test_stage_upload_is_content_addressed_and_has_version_metadata(tmp_path: Pa
     assert metadata["sha256"] == staged.sha256
     assert metadata["hf-revision"] == REVISION
     assert metadata["model-id"] == TARGET_MODEL_ID
+    assert metadata["s3-encryption"] == "AES256"
+    assert metadata["checksum-sha256"] == staged.sha256
+    assert "ChecksumSHA256" in call
     assert staged.version_id == "version-17"
     assert staged.version_ref.endswith("?versionId=version-17")
 
@@ -241,6 +313,53 @@ def test_staging_rejects_unversioned_bucket_without_upload(tmp_path: Path) -> No
     with pytest.raises(CheckpointStagingError, match="versioning"):
         stage_checkpoint(checkpoint, bucket="artifacts", revision=REVISION, s3_client=client)
     assert client.put_calls == []
+
+
+def test_staging_rejects_missing_bucket_encryption_without_upload(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+
+    class Unencrypted(_VersionedS3):
+        def get_bucket_encryption(self, **kwargs: object) -> dict[str, object]:
+            return {}
+
+    client = Unencrypted()
+    with pytest.raises(CheckpointStagingError, match="encryption"):
+        stage_checkpoint(checkpoint, bucket="artifacts", revision=REVISION, s3_client=client)
+    assert client.put_calls == []
+
+
+def test_staging_rejects_missing_checksum_provenance(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+
+    class NoChecksum(_VersionedS3):
+        def put_object(self, **kwargs: object) -> dict[str, object]:
+            self.put_calls.append(kwargs)
+            return {"VersionId": "version-17"}
+
+    with pytest.raises(CheckpointStagingError, match="checksum"):
+        stage_checkpoint(
+            checkpoint,
+            bucket="artifacts",
+            revision=REVISION,
+            s3_client=NoChecksum(),
+        )
+
+
+def test_staging_rejects_mismatched_checksum_provenance(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+
+    class WrongChecksum(_VersionedS3):
+        def put_object(self, **kwargs: object) -> dict[str, object]:
+            self.put_calls.append(kwargs)
+            return {"VersionId": "version-17", "ChecksumSHA256": "wrong"}
+
+    with pytest.raises(CheckpointStagingError, match="matching checksum"):
+        stage_checkpoint(
+            checkpoint,
+            bucket="artifacts",
+            revision=REVISION,
+            s3_client=WrongChecksum(),
+        )
 
 
 @pytest.mark.parametrize("version_id", [None, "", "null", "NULL", 17])
