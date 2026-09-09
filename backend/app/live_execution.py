@@ -108,6 +108,9 @@ class ApprovalPacket(BaseModel):
     volume_size_gb: int = Field(ge=1)
     max_runtime_seconds: int = Field(ge=1)
     estimated_cost_usd: float = Field(ge=0)
+    immutable_model_revision: str
+    max_experiments: int = Field(ge=1, le=MAX_RUNS)
+    max_cost_usd: float = Field(ge=0, le=25.0)
     # Defaults preserve the low-level signing helper for generic packets;
     # controller validation rejects empty provenance values for execution.
     target_model: str = ""
@@ -134,11 +137,18 @@ class ApprovalPacket(BaseModel):
             raise ValueError("run_id must be a safe identifier")
         return value
 
-    @field_validator("estimated_cost_usd")
+    @field_validator("estimated_cost_usd", "max_cost_usd")
     @classmethod
     def validate_finite_cost(cls, value: float) -> float:
         if not isfinite(value):
             raise ValueError("estimated_cost_usd must be finite")
+        return value
+
+    @field_validator("immutable_model_revision")
+    @classmethod
+    def validate_model_revision(cls, value: str) -> str:
+        if not _SHA1.fullmatch(value):
+            raise ValueError("immutable_model_revision must be a 40-character commit SHA")
         return value
 
     @field_validator("manifest_sha256", "checkpoint_sha256")
@@ -1568,6 +1578,9 @@ class AutonomousRunController:
             volume_size_gb=self.config.volume_size_gb,
             max_runtime_seconds=self.config.max_runtime_seconds,
             estimated_cost_usd=self.config.estimated_run_cost_usd,
+            immutable_model_revision=self.config.hf_revision,
+            max_experiments=self.config.max_runs,
+            max_cost_usd=self.config.max_cost_usd,
             target_model=self.config.target_model,
             objective_suite=self.config.objective_suite,
             objective_suite_version=self.config.objective_suite_version,
@@ -1633,6 +1646,8 @@ class AutonomousRunController:
             "instance_count": self.config.instance_count,
             "volume_size_gb": self.config.volume_size_gb,
             "max_runtime_seconds": self.config.max_runtime_seconds,
+            "max_experiments": self.config.max_runs,
+            "max_cost_usd": self.config.max_cost_usd,
         }
 
     def _validate_approval_packet(
@@ -1648,6 +1663,14 @@ class AutonomousRunController:
             raise LiveExecutionBlocked("approval packet runtime does not match configuration")
         if packet.estimated_cost_usd != self.config.estimated_run_cost_usd:
             raise LiveExecutionBlocked("approval packet cost does not match configuration")
+        if (
+            packet.immutable_model_revision != self.config.hf_revision
+            or packet.max_experiments != self.config.max_runs
+            or packet.max_cost_usd != self.config.max_cost_usd
+        ):
+            raise LiveExecutionBlocked(
+                "approval packet bounded optimization scope does not match configuration"
+            )
         if (
             packet.target_model != self.config.target_model
             or packet.objective_suite != self.config.objective_suite

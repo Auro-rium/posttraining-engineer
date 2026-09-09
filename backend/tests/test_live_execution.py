@@ -139,6 +139,9 @@ def _approval_packet(**overrides: object) -> ApprovalPacket:
         "volume_size_gb": 30,
         "max_runtime_seconds": 600,
         "estimated_cost_usd": 0.5,
+        "immutable_model_revision": "c" * 40,
+        "max_experiments": 5,
+        "max_cost_usd": 25.0,
         "manifest_sha256": "a" * 64,
         "checkpoint_sha256": "b" * 64,
         "issued_at": datetime.now(UTC),
@@ -157,6 +160,9 @@ def test_approval_token_is_bound_to_packet_and_rejects_tampering() -> None:
 
     other_packet = _approval_packet(run_number=2)
     assert other_packet.digest != packet.digest
+    assert _approval_packet(max_experiments=4).digest != packet.digest
+    assert _approval_packet(max_cost_usd=24.0).digest != packet.digest
+    assert _approval_packet(immutable_model_revision="d" * 40).digest != packet.digest
 
     with pytest.raises(LiveExecutionBlocked, match="signature"):
         _decode_approval_token(token, "wrong-secret")
