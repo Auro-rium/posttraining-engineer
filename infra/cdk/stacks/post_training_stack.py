@@ -154,15 +154,6 @@ class PostTrainingStack(Stack):
             encryption_key=artifact_key,
             removal_policy=RemovalPolicy.RETAIN,
         )
-        state.add_global_secondary_index(
-            index_name="LeaseDispatcherIndex",
-            partition_key=dynamodb.Attribute(name="status", type=dynamodb.AttributeType.STRING),
-            sort_key=dynamodb.Attribute(
-                name="event_sequence", type=dynamodb.AttributeType.NUMBER
-            ),
-            projection_type=dynamodb.ProjectionType.ALL,
-        )
-
         backend_repository = ecr.Repository(
             self,
             "BackendRepository",
@@ -205,6 +196,22 @@ class PostTrainingStack(Stack):
             ),
             removal_policy=RemovalPolicy.RETAIN,
         )
+
+        # An externally hosted objective worker is already the complete
+        # objective boundary. Only certificate-only deployments create the
+        # internal worker and its ALB; an external URL must never leave an
+        # unused plaintext listener in the stack.
+        objective_worker_url = self._text("objective_worker_url").strip()
+        certificate_arn = self._text("objective_certificate_arn").strip()
+        if objective_worker_url:
+            self._require_https_url(objective_worker_url)
+        elif certificate_arn:
+            self._require_certificate_arn(certificate_arn)
+        else:
+            raise ValueError(
+                "objective_worker_url or objective_certificate_arn is required"
+            )
+        internal_objective = not objective_worker_url
 
         vpc = ec2.Vpc(self, "RuntimeVpc", max_azs=2, nat_gateways=1)
         cluster = ecs.Cluster(self, "RuntimeCluster", vpc=vpc, container_insights=True)
@@ -328,27 +335,54 @@ class PostTrainingStack(Stack):
             )
         )
 
-        objective_role = iam.Role(
-            self,
-            "ObjectiveTaskRole",
-            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-        )
-        objective_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="ObjectiveReadPrefix",
-                actions=["s3:GetObject"],
-                resources=[f"{artifacts.bucket_arn}/{prefix}/*"],
+        objective_role = (
+            iam.Role(
+                self,
+                "ObjectiveTaskRole",
+                assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
             )
+            if internal_objective
+            else None
         )
-        objective_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="ObjectiveListPrefix",
-                actions=["s3:ListBucket"],
-                resources=[artifacts.bucket_arn],
-                conditions={"StringLike": {"s3:prefix": [prefix, f"{prefix}/*"]}},
+        if objective_role is not None:
+            objective_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="ObjectiveArtifactPrefixReadWrite",
+                    actions=[
+                        "s3:GetObject",
+                        "s3:GetObjectVersion",
+                        "s3:PutObject",
+                        "s3:AbortMultipartUpload",
+                    ],
+                    resources=[f"{artifacts.bucket_arn}/{prefix}/*"],
+                )
             )
-        )
-        artifact_key.grant_decrypt(objective_role)
+            objective_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="ObjectiveListPrefix",
+                    actions=["s3:ListBucket"],
+                    resources=[artifacts.bucket_arn],
+                    conditions={"StringLike": {"s3:prefix": [prefix, f"{prefix}/*"]}},
+                )
+            )
+            objective_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="ObjectiveListVersionsPrefix",
+                    actions=["s3:ListBucketVersions"],
+                    resources=[artifacts.bucket_arn],
+                    conditions={"StringLike": {"s3:prefix": [prefix, f"{prefix}/*"]}},
+                )
+            )
+            objective_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="ObjectiveReadBucketVersioning",
+                    actions=["s3:GetBucketVersioning"],
+                    resources=[artifacts.bucket_arn],
+                )
+            )
+            # GetObject authorizes HeadObject; the explicit version action is
+            # required because the immutable store always supplies VersionId.
+            artifact_key.grant_encrypt_decrypt(objective_role)
 
         execution_role = iam.Role(
             self,
@@ -364,87 +398,81 @@ class PostTrainingStack(Stack):
         approval_secret.grant_read(execution_role)
         objective_secret.grant_read(execution_role)
 
-        objective_execution_role = iam.Role(
-            self,
-            "ObjectiveExecutionRole",
-            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-            managed_policies=[
-                iam.ManagedPolicy.from_aws_managed_policy_name(
-                    "service-role/AmazonECSTaskExecutionRolePolicy"
-                )
-            ],
-        )
-        backend_repository.grant_pull(objective_execution_role)
-        objective_secret.grant_read(objective_execution_role)
+        objective_service: ecs_patterns.ApplicationLoadBalancedFargateService | None = None
+        if internal_objective:
+            # Certificate-only mode is the private, in-stack objective
+            # deployment. It is always TLS; there is no HTTP fallback.
+            objective_execution_role = iam.Role(
+                self,
+                "ObjectiveExecutionRole",
+                assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+                managed_policies=[
+                    iam.ManagedPolicy.from_aws_managed_policy_name(
+                        "service-role/AmazonECSTaskExecutionRolePolicy"
+                    )
+                ],
+            )
+            backend_repository.grant_pull(objective_execution_role)
+            objective_secret.grant_read(objective_execution_role)
 
-        objective_task_definition = ecs.FargateTaskDefinition(
-            self,
-            "ObjectiveTaskDefinition",
-            cpu=512,
-            memory_limit_mib=1024,
-            task_role=objective_role,
-            execution_role=objective_execution_role,
-        )
-        objective_task_definition.add_container(
-            "Objective",
-            image=self._image(backend_repository, "backend_image_digest"),
-            logging=ecs.LogDrivers.aws_logs(stream_prefix="objective", log_group=objective_logs),
-            environment={
-                "APP_MODE": "aws",
-                "SERVICE_ROLE": "objective",
-                "AWS_REGION": self.region or "us-east-1",
-                "TARGET_MODEL": target_model,
-                "OBJECTIVE_SUITE": objective_suite,
-                "OBJECTIVE_SUITE_VERSION": objective_suite_version,
-                "S3_ARTIFACT_BUCKET": artifacts.bucket_name,
-                "S3_ARTIFACT_PREFIX": prefix,
-            },
-            secrets={
-                "OBJECTIVE_AUTH_TOKEN": ecs.Secret.from_secrets_manager(objective_secret),
-            },
-            port_mappings=[ecs.PortMapping(container_port=8080)],
-        )
-        objective_worker_url = self._text("objective_worker_url")
-        certificate_arn = self._text("objective_certificate_arn")
-        if not objective_worker_url and not certificate_arn:
-            raise ValueError(
-                "objective_worker_url or objective_certificate_arn is required"
+            if objective_role is None:  # pragma: no cover - guarded above
+                raise AssertionError("internal objective role was not created")
+            objective_task_definition = ecs.FargateTaskDefinition(
+                self,
+                "ObjectiveTaskDefinition",
+                cpu=512,
+                memory_limit_mib=1024,
+                task_role=objective_role,
+                execution_role=objective_execution_role,
             )
-        if objective_worker_url:
-            self._require_https_url(objective_worker_url)
-        objective_service_options: dict[str, Any] = {
-            "listener_port": 443 if certificate_arn else 80,
-            "open_listener": False,
-        }
-        if certificate_arn:
-            self._require_certificate_arn(certificate_arn)
-            objective_service_options.update(
-                {
-                    "protocol": elbv2.ApplicationProtocol.HTTPS,
-                    "certificate": acm.Certificate.from_certificate_arn(
-                        self, "ObjectiveCertificate", certificate_arn
-                    ),
-                }
+            objective_task_definition.add_container(
+                "Objective",
+                image=self._image(backend_repository, "backend_image_digest"),
+                logging=ecs.LogDrivers.aws_logs(
+                    stream_prefix="objective", log_group=objective_logs
+                ),
+                environment={
+                    "APP_MODE": "aws",
+                    "SERVICE_ROLE": "objective",
+                    "AWS_REGION": self.region or "us-east-1",
+                    "TARGET_MODEL": target_model,
+                    "OBJECTIVE_SUITE": objective_suite,
+                    "OBJECTIVE_SUITE_VERSION": objective_suite_version,
+                    "S3_ARTIFACT_BUCKET": artifacts.bucket_name,
+                    "S3_ARTIFACT_PREFIX": prefix,
+                },
+                secrets={
+                    "OBJECTIVE_AUTH_TOKEN": ecs.Secret.from_secrets_manager(objective_secret),
+                },
+                port_mappings=[ecs.PortMapping(container_port=8080)],
             )
-        objective_service = ecs_patterns.ApplicationLoadBalancedFargateService(
-            self,
-            "ObjectiveService",
-            cluster=cluster,
-            task_definition=objective_task_definition,
-            desired_count=int(self._context("objective_desired_count", 1)),
-            public_load_balancer=False,
-            assign_public_ip=False,
-            health_check_grace_period=Duration.seconds(60),
-            **objective_service_options,
-        )
-        objective_service.target_group.configure_health_check(path="/health", port="8080")
-        objective_service.service.connections.allow_from(
-            objective_service.load_balancer,
-            ec2.Port.tcp(8080),
-            "Allow the internal load balancer to reach the objective worker",
-        )
-        if not objective_worker_url:
-            objective_worker_url = "https://" + objective_service.load_balancer.load_balancer_dns_name
+            objective_service = ecs_patterns.ApplicationLoadBalancedFargateService(
+                self,
+                "ObjectiveService",
+                cluster=cluster,
+                task_definition=objective_task_definition,
+                desired_count=int(self._context("objective_desired_count", 1)),
+                public_load_balancer=False,
+                assign_public_ip=False,
+                health_check_grace_period=Duration.seconds(60),
+                listener_port=443,
+                open_listener=False,
+                protocol=elbv2.ApplicationProtocol.HTTPS,
+                certificate=acm.Certificate.from_certificate_arn(
+                    self, "ObjectiveCertificate", certificate_arn
+                ),
+            )
+            objective_service.target_group.configure_health_check(path="/health", port="8080")
+            objective_service.service.connections.allow_from(
+                objective_service.load_balancer,
+                ec2.Port.tcp(8080),
+                "Allow the internal load balancer to reach the objective worker",
+            )
+            # The DNS name is a CloudFormation token and resolves to the real
+            # private ALB endpoint after the stack is created.
+            objective_worker_url = (
+                "https://" + objective_service.load_balancer.load_balancer_dns_name
+            )
         coordinator_security_group = ec2.SecurityGroup(
             self,
             "CoordinatorSecurityGroup",
@@ -452,11 +480,12 @@ class PostTrainingStack(Stack):
             allow_all_outbound=True,
             description="Coordinator egress to private objective worker only",
         )
-        objective_service.load_balancer.connections.allow_from(
-            coordinator_security_group,
-            ec2.Port.tcp(443 if certificate_arn else 80),
-            "Allow only the coordinator to call the objective worker",
-        )
+        if objective_service is not None:
+            objective_service.load_balancer.connections.allow_from(
+                coordinator_security_group,
+                ec2.Port.tcp(443),
+                "Allow only the coordinator to call the objective worker",
+            )
 
         task_definition = ecs.FargateTaskDefinition(
             self,
@@ -485,7 +514,8 @@ class PostTrainingStack(Stack):
             ),
             secrets={
                 "LIVE_APPROVAL_SECRET": ecs.Secret.from_secrets_manager(approval_secret),
-                "OBJECTIVE_AUTH_TOKEN": ecs.Secret.from_secrets_manager(objective_secret),
+                # Matches config_from_environment's live controller contract.
+                "OBJECTIVE_WORKER_AUTH_TOKEN": ecs.Secret.from_secrets_manager(objective_secret),
             },
             port_mappings=[ecs.PortMapping(container_port=8080)],
         )
@@ -499,11 +529,12 @@ class PostTrainingStack(Stack):
             security_groups=[coordinator_security_group],
             health_check_grace_period=Duration.seconds(60),
         )
-        service.connections.allow_to(
-            objective_service.load_balancer,
-            ec2.Port.tcp(443 if certificate_arn else 80),
-            "Allow the coordinator to call the internal objective worker",
-        )
+        if objective_service is not None:
+            service.connections.allow_to(
+                objective_service.load_balancer,
+                ec2.Port.tcp(443),
+                "Allow the coordinator to call the internal objective worker",
+            )
 
         logs.MetricFilter(
             self,

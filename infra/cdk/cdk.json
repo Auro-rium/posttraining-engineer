@@ -2,10 +2,7 @@
   "app": "../../backend/.venv/bin/python app.py",
   "context": {
     "region": "us-east-1",
-    "backend_image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "trainer_image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-    "evaluator_image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-    "objective_worker_url": "https://objective.internal",
+    "config_note": "development-only; pass real immutable image digests and objective_worker_url or objective_certificate_arn explicitly",
     "artifact_prefix": "post-training",
     "target_model": "google/functiongemma-270m-it",
     "strands_model": "nvidia.nemotron-super-3-120b",

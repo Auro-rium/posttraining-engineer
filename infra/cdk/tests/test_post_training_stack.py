@@ -68,7 +68,7 @@ def test_artifacts_are_encrypted_versioned_and_private() -> None:
     }
 
 
-def test_state_table_has_lease_dispatcher_gsi() -> None:
+def test_state_table_matches_recovery_scan_without_unused_gsi() -> None:
     table = template().find_resources("AWS::DynamoDB::Table")
     assert len(table) == 1
     properties = next(iter(table.values()))["Properties"]
@@ -76,22 +76,11 @@ def test_state_table_has_lease_dispatcher_gsi() -> None:
         {"AttributeName": "pk", "KeyType": "HASH"},
         {"AttributeName": "sk", "KeyType": "RANGE"},
     ]
-    assert {item["AttributeName"] for item in properties["AttributeDefinitions"]} >= {
+    assert {item["AttributeName"] for item in properties["AttributeDefinitions"]} == {
         "pk",
         "sk",
-        "status",
-        "event_sequence",
     }
-    assert properties["GlobalSecondaryIndexes"] == [
-        {
-            "IndexName": "LeaseDispatcherIndex",
-            "KeySchema": [
-                {"AttributeName": "status", "KeyType": "HASH"},
-                {"AttributeName": "event_sequence", "KeyType": "RANGE"},
-            ],
-            "Projection": {"ProjectionType": "ALL"},
-        }
-    ]
+    assert "GlobalSecondaryIndexes" not in properties
 
 
 def test_secrets_are_created_and_injected_without_plaintext_values() -> None:
@@ -100,16 +89,25 @@ def test_secrets_are_created_and_injected_without_plaintext_values() -> None:
     task_definitions = template().find_resources("AWS::ECS::TaskDefinition")
     serialized = json.dumps(task_definitions)
     assert "LIVE_APPROVAL_SECRET" in serialized
-    assert "OBJECTIVE_AUTH_TOKEN" in serialized
+    assert "OBJECTIVE_WORKER_AUTH_TOKEN" in serialized
     assert "secret-value" not in serialized
 
 
 def test_objective_service_is_internal_and_token_authenticated() -> None:
-    template().resource_count_is("AWS::ECS::Service", 2)
-    load_balancers = template().find_resources("AWS::ElasticLoadBalancingV2::LoadBalancer")
+    stack_template = template(
+        {
+            "objective_worker_url": "",
+            "objective_certificate_arn": (
+                "arn:aws:acm:us-east-1:123456789012:certificate/"
+                "abcdef01-2345-6789-abcd-ef0123456789"
+            ),
+        }
+    )
+    stack_template.resource_count_is("AWS::ECS::Service", 2)
+    load_balancers = stack_template.find_resources("AWS::ElasticLoadBalancingV2::LoadBalancer")
     assert len(load_balancers) == 1
     assert next(iter(load_balancers.values()))["Properties"]["Scheme"] == "internal"
-    task_definitions = template().find_resources("AWS::ECS::TaskDefinition")
+    task_definitions = stack_template.find_resources("AWS::ECS::TaskDefinition")
     objective = [
         value
         for value in task_definitions.values()
@@ -120,16 +118,24 @@ def test_objective_service_is_internal_and_token_authenticated() -> None:
     ]
     assert len(objective) == 1
     assert "OBJECTIVE_AUTH_TOKEN" in json.dumps(objective[0])
-    ingress = template().find_resources("AWS::EC2::SecurityGroupIngress")
+    ingress = stack_template.find_resources("AWS::EC2::SecurityGroupIngress")
     assert ingress
     assert all("CidrIp" not in item["Properties"] for item in ingress.values())
     assert any(
         item["Properties"].get("SourceSecurityGroupId")
         for item in ingress.values()
     )
-    listeners = template().find_resources("AWS::ElasticLoadBalancingV2::Listener")
+    listeners = stack_template.find_resources("AWS::ElasticLoadBalancingV2::Listener")
     assert len(listeners) == 1
-    assert next(iter(listeners.values()))["Properties"]["Port"] == 80
+    assert next(iter(listeners.values()))["Properties"]["Port"] == 443
+
+
+def test_external_objective_url_does_not_create_internal_service() -> None:
+    stack_template = template()
+    stack_template.resource_count_is("AWS::ECS::Service", 1)
+    assert not stack_template.find_resources("AWS::ElasticLoadBalancingV2::LoadBalancer")
+    assert not stack_template.find_resources("AWS::ElasticLoadBalancingV2::Listener")
+    assert len(stack_template.find_resources("AWS::ECS::TaskDefinition")) == 1
 
 
 def test_runtime_task_injects_all_live_readiness_configuration() -> None:
@@ -254,6 +260,15 @@ def test_stack_fails_closed_without_image_digests() -> None:
         template({"backend_image_digest": "latest"})
 
 
+def test_cdk_defaults_are_explicitly_development_only() -> None:
+    config = json.loads((ROOT / "cdk.json").read_text())
+    context = config["context"]
+    assert context["config_note"].startswith("development-only;")
+    assert not any(name.endswith("_image_digest") for name in context)
+    assert "objective_worker_url" not in context
+    assert "objective_certificate_arn" not in context
+
+
 def test_stack_fails_closed_without_https_objective_endpoint() -> None:
     with pytest.raises(ValueError, match="objective_worker_url"):
         template({"objective_worker_url": "http://objective.internal"})
@@ -274,6 +289,54 @@ def test_valid_certificate_can_supply_https_objective_endpoint() -> None:
     )
     assert listener["Properties"]["Protocol"] == "HTTPS"
     assert listener["Properties"]["Port"] == 443
+    serialized = json.dumps(stack_template.to_json())
+    assert "https://" in serialized
+    assert '"DNSName"' in serialized
+
+
+def test_objective_role_can_read_write_versioned_encrypted_artifacts() -> None:
+    stack_template = template(
+        {
+            "objective_worker_url": "",
+            "objective_certificate_arn": (
+                "arn:aws:acm:us-east-1:123456789012:certificate/"
+                "abcdef01-2345-6789-abcd-ef0123456789"
+            ),
+        }
+    )
+    policies = stack_template.find_resources("AWS::IAM::Policy")
+    objective_policy = next(
+        item
+        for key, item in policies.items()
+        if key.startswith("ObjectiveTaskRoleDefaultPolicy")
+    )
+    statements = objective_policy["Properties"]["PolicyDocument"]["Statement"]
+    actions = {
+        action
+        for statement in statements
+        for action in (
+            statement.get("Action", [])
+            if isinstance(statement.get("Action", []), list)
+            else [statement.get("Action")]
+        )
+    }
+    assert {
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObject",
+        "s3:ListBucketVersions",
+        "s3:GetBucketVersioning",
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey*",
+    } <= actions
+    object_statements = [
+        statement
+        for statement in statements
+        if "/post-training/*" in json.dumps(statement.get("Resource"))
+    ]
+    assert object_statements
+    assert all("s3:DeleteObject" not in json.dumps(statement) for statement in statements)
 
 
 def test_configured_s3_inputs_must_match_named_bucket_and_prefix() -> None:
@@ -287,7 +350,15 @@ def test_configured_s3_inputs_must_match_named_bucket_and_prefix() -> None:
 
 
 def test_task_roles_do_not_read_runtime_secrets() -> None:
-    policies = template().find_resources("AWS::IAM::Policy")
+    policies = template(
+        {
+            "objective_worker_url": "",
+            "objective_certificate_arn": (
+                "arn:aws:acm:us-east-1:123456789012:certificate/"
+                "abcdef01-2345-6789-abcd-ef0123456789"
+            ),
+        }
+    ).find_resources("AWS::IAM::Policy")
     coordinator_policy = next(
         item
         for key, item in policies.items()
