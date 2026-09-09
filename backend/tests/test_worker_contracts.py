@@ -13,6 +13,8 @@ from app.objective.models import DatasetManifest, DatasetRow, ObjectiveSplit
 from workers.evaluator.evaluate import (
     EvaluationMetrics,
     EvaluationWorkerError,
+    InvalidModelAction,
+    _decode_actions,
     build_evaluation_report,
     parse_evaluation_inputs,
     render_action_prompt,
@@ -327,8 +329,14 @@ def test_training_and_evaluation_share_action_prompt_serialization() -> None:
         ),
     }
     example = format_sft_example(row)
-    assert example["completion"] == '[{"arguments":{"service":"api"},"tool":"run_healthcheck"}]'
-    assert json.loads(example["prompt"])["task_id"] == "replay-1"
+    assert example["completion"] == (
+        "<start_function_call>call:run_healthcheck{service:<escape>api<escape>}"
+        "<end_function_call>"
+    )
+    prompt_payload = json.loads(example["prompt"])
+    assert prompt_payload["task_id"] == "replay-1"
+    assert prompt_payload["messages"][0]["role"] == "developer"
+    assert prompt_payload["tools"][0]["type"] == "function"
     task = ServiceRecoveryEngine(seed=7, sealed=True).reset(
         split=ObjectiveSplit.HIDDEN, task_id="hidden-1"
     )
@@ -436,3 +444,89 @@ def test_training_admission_rejects_untrusted_source_type(tmp_path: Path) -> Non
     )
     with pytest.raises(TrainingWorkerError, match=r"source|verified"):
         load_training_dataset(inputs)
+
+
+def test_artifact_id_is_bound_to_verified_content_digest(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    manifest_path = write_training_manifest(
+        train,
+        output_dir=checkpoint,
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=_dataset_digest(train),
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        qlora_config=_qlora_config(),
+    )
+    payload = json.loads(manifest_path.read_text())
+    payload["artifact_id"] = "checkpoint://approved-but-wrong"
+    payload["manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in payload.items() if key != "manifest_sha256"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(payload))
+    with pytest.raises(TrainingWorkerError, match="content-bound"):
+        verify_parent_adapter(checkpoint)
+
+
+def test_evaluator_rejects_unlisted_duplicate_and_symlink_files(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    manifest_path = write_training_manifest(
+        train,
+        output_dir=checkpoint,
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=_dataset_digest(train),
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        qlora_config=_qlora_config(),
+    )
+    (checkpoint / "unlisted.bin").write_bytes(b"unlisted")
+    with pytest.raises(EvaluationWorkerError, match="complete"):
+        verify_checkpoint_artifact(checkpoint)
+    (checkpoint / "unlisted.bin").unlink()
+    (checkpoint / "link.bin").symlink_to(checkpoint / "adapter_model.safetensors")
+    with pytest.raises(EvaluationWorkerError, match="symlink"):
+        verify_checkpoint_artifact(checkpoint)
+    (checkpoint / "link.bin").unlink()
+    payload = json.loads(manifest_path.read_text())
+    payload["artifact_files"].append(payload["artifact_files"][0])
+    payload["manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in payload.items() if key != "manifest_sha256"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(payload))
+    with pytest.raises(EvaluationWorkerError, match="duplicate"):
+        verify_checkpoint_artifact(checkpoint)
+
+
+def test_functiongemma_special_call_parser_rejects_unknown_tools() -> None:
+    calls = _decode_actions(
+        "<start_function_call>call:get_logs{service:<escape>api<escape>}"
+        "<end_function_call>"
+    )
+    assert calls[0].tool == "get_logs"
+    assert calls[0].arguments == {"service": "api"}
+    with pytest.raises(InvalidModelAction, match="unknown"):
+        _decode_actions(
+            "<start_function_call>call:unknown_tool{}<end_function_call>"
+        )
+
+
+def test_evaluation_metrics_reject_impossible_aggregate() -> None:
+    with pytest.raises(EvaluationWorkerError, match="exceed"):
+        EvaluationMetrics(task_count=1, successful_tasks=2)

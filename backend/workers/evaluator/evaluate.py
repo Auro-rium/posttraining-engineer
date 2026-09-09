@@ -24,6 +24,9 @@ from app.objective.models import ObjectiveSplit, Task, ToolCall
 
 EVALUATION_SUITE = "AgentGym/AgentEval"
 EVALUATION_SUITE_VERSION = "agent-eval-v1"
+FUNCTION_START = "<start_function_call>"
+FUNCTION_END = "<end_function_call>"
+FUNCTION_ESCAPE = "<escape>"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-fA-F]{40}$")
 _CHANNELS = frozenset({"candidate", "champion", "sealed"})
@@ -35,6 +38,14 @@ class EvaluationWorkerError(ValueError):
 
 class EvaluationArtifactError(EvaluationWorkerError):
     """A checkpoint or sealed evaluation artifact is absent or invalid."""
+
+
+class EvaluationRuntimeError(EvaluationWorkerError):
+    """The model/runtime/environment prevented a trustworthy evaluation."""
+
+
+class InvalidModelAction(EvaluationWorkerError):
+    """A deterministic model output violated the tool-call protocol."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,12 +67,15 @@ class EvaluationMetrics:
     successful_tasks: int
     task_successes: tuple[bool, ...] = ()
     task_environments: tuple[str, ...] = ()
+    invalid_action_tasks: int = 0
 
     def __post_init__(self) -> None:
         if self.task_count < 0 or self.successful_tasks < 0:
             raise EvaluationWorkerError("evaluation counts cannot be negative")
         if self.successful_tasks > self.task_count:
             raise EvaluationWorkerError("successful task count cannot exceed task count")
+        if self.invalid_action_tasks < 0 or self.invalid_action_tasks > self.task_count:
+            raise EvaluationWorkerError("invalid action count is outside task count")
         if self.task_successes and len(self.task_successes) != self.task_count:
             raise EvaluationWorkerError("evaluation task outcomes do not match task count")
         if self.task_successes and sum(self.task_successes) != self.successful_tasks:
@@ -214,6 +228,8 @@ def verify_checkpoint_artifact(checkpoint_dir: Path) -> Mapping[str, Any]:
         payload["base_model_revision"]
     ):
         raise EvaluationArtifactError("checkpoint base model revision is absent or mutable")
+    if payload.get("artifact_id") != f"checkpoint://{artifact_digest}":
+        raise EvaluationArtifactError("checkpoint artifact ID is not content-bound")
     unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
     expected_manifest = hashlib.sha256(
         json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
@@ -221,13 +237,20 @@ def verify_checkpoint_artifact(checkpoint_dir: Path) -> Mapping[str, Any]:
     if expected_manifest != manifest_digest:
         raise EvaluationArtifactError("checkpoint manifest checksum does not match content")
     checked: list[dict[str, Any]] = []
+    listed_paths: set[str] = set()
     for entry in files:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             raise EvaluationArtifactError("checkpoint manifest contains an invalid file entry")
         relative = Path(entry["path"])
         if relative.is_absolute() or ".." in relative.parts or relative.name == "manifest.json":
             raise EvaluationArtifactError("checkpoint manifest contains an unsafe file path")
+        canonical_path = relative.as_posix()
+        if canonical_path in listed_paths:
+            raise EvaluationArtifactError("checkpoint manifest contains duplicate file paths")
+        listed_paths.add(canonical_path)
         file_path = directory / relative
+        if file_path.is_symlink():
+            raise EvaluationArtifactError("checkpoint manifest contains a symlink")
         try:
             file_path.resolve().relative_to(directory)
         except ValueError as exc:
@@ -239,13 +262,23 @@ def verify_checkpoint_artifact(checkpoint_dir: Path) -> Mapping[str, Any]:
             raise EvaluationArtifactError(f"checkpoint checksum mismatch for {relative}")
         checked.append(
             {
-                "path": relative.as_posix(),
+                "path": canonical_path,
                 "size_bytes": file_path.stat().st_size,
                 "sha256": digest,
             }
         )
     if _artifact_digest(checked) != artifact_digest:
         raise EvaluationArtifactError("checkpoint artifact checksum does not match content")
+    all_entries = list(directory.rglob("*"))
+    if any(item.is_symlink() for item in all_entries):
+        raise EvaluationArtifactError("checkpoint directory contains a symlink")
+    actual_paths = {
+        item.relative_to(directory).as_posix()
+        for item in all_entries
+        if item.is_file() and item.name != "manifest.json"
+    }
+    if actual_paths != listed_paths:
+        raise EvaluationArtifactError("checkpoint manifest is not complete for directory contents")
     return payload
 
 
@@ -315,11 +348,119 @@ def render_action_prompt(task: Task, observations: Sequence[Mapping[str, Any]] =
             "objective": task.objective,
             "service": task.service_name,
             "observations": [dict(item) for item in observations],
-            "output": "JSON array of {tool, arguments} objects",
+            "output": "FunctionGemma function call",
+            "messages": _canonical_messages(task, observations),
+            "tools": function_tool_schemas(),
         },
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def function_tool_schemas() -> list[dict[str, Any]]:
+    """Return the objective tools in FunctionGemma's schema format."""
+
+    from app.objective.models import ALLOWED_TOOLS
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"Service-recovery tool: {name}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "service": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "additionalProperties": True,
+                },
+            },
+        }
+        for name in ALLOWED_TOOLS
+    ]
+
+
+def _canonical_messages(
+    task: Task, observations: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build the canonical FunctionGemma chat/tool input for one turn."""
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "developer",
+            "content": "Use the provided service-recovery functions one call at a time.",
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "task_id": task.task_id,
+                    "objective": task.objective,
+                    "service": task.service_name,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+    messages.extend(
+        {
+            "role": "tool",
+            "content": json.dumps(dict(observation), sort_keys=True, separators=(",", ":")),
+        }
+        for observation in observations
+    )
+    return messages
+
+
+def _parse_function_call(text: str) -> ToolCall:
+    """Parse FunctionGemma's ``<start_function_call>call:...`` format."""
+
+    start = text.find(FUNCTION_START)
+    end = text.find(FUNCTION_END, start + len(FUNCTION_START))
+    if start < 0 or end < 0:
+        raise InvalidModelAction("model output is not a FunctionGemma function call")
+    value = text[start + len(FUNCTION_START) : end].strip()
+    if not value.startswith("call:") or "{" not in value or not value.endswith("}"):
+        raise InvalidModelAction("malformed FunctionGemma function call")
+    name, body = value[5:].split("{", 1)
+    name = name.strip()
+    body = body[:-1].strip()
+    if not name:
+        raise InvalidModelAction("function call name is empty")
+    arguments: dict[str, Any] = {}
+    if body:
+        cursor = 0
+        while cursor < len(body):
+            separator = body.find(":", cursor)
+            if separator <= cursor:
+                raise InvalidModelAction("malformed FunctionGemma arguments")
+            key = body[cursor:separator].strip()
+            cursor = separator + 1
+            if body.startswith(FUNCTION_ESCAPE, cursor):
+                begin = cursor + len(FUNCTION_ESCAPE)
+                finish = body.find(FUNCTION_ESCAPE, begin)
+                if finish < 0:
+                    raise InvalidModelAction("unterminated escaped function argument")
+                arguments[key] = body[begin:finish]
+                cursor = finish + len(FUNCTION_ESCAPE)
+            else:
+                next_separator = body.find(",", cursor)
+                raw = body[cursor:] if next_separator < 0 else body[cursor:next_separator]
+                raw = raw.strip()
+                try:
+                    arguments[key] = json.loads(raw)
+                except json.JSONDecodeError:
+                    arguments[key] = raw
+                cursor = len(body) if next_separator < 0 else next_separator + 1
+            while cursor < len(body) and body[cursor] in " ,":
+                cursor += 1
+    try:
+        return ToolCall(tool=name, arguments=arguments)
+    except Exception as exc:
+        raise InvalidModelAction("FunctionGemma emitted an unknown or invalid tool") from exc
 
 
 def _decode_actions(text: str) -> tuple[ToolCall, ...]:
@@ -330,21 +471,23 @@ def _decode_actions(text: str) -> tuple[ToolCall, ...]:
     failed task without crossing the sealed boundary.
     """
 
+    if FUNCTION_START in text:
+        return (_parse_function_call(text),)
     try:
         value = json.loads(text)
-    except json.JSONDecodeError:
-        return ()
+    except json.JSONDecodeError as exc:
+        raise InvalidModelAction("model output is not a supported function call") from exc
     values = value if isinstance(value, list) else [value]
     if not values:
-        return ()
+        raise InvalidModelAction("model output contains no function call")
     actions: list[ToolCall] = []
     for item in values:
         if not isinstance(item, dict) or not isinstance(item.get("tool"), str):
-            raise EvaluationWorkerError("model output contains an invalid tool call")
+            raise InvalidModelAction("model output contains an invalid tool call")
         try:
             actions.append(ToolCall(tool=item["tool"], arguments=item.get("arguments", {})))
         except Exception as exc:
-            raise EvaluationWorkerError("model output contains an unknown or invalid tool") from exc
+            raise InvalidModelAction("model output contains an unknown or invalid tool") from exc
     return tuple(actions)
 
 
@@ -356,10 +499,10 @@ def _model_policy(
         from peft import PeftModel  # type: ignore[import-not-found]
         from transformers import (  # type: ignore[import-not-found]
             AutoModelForCausalLM,
-            AutoTokenizer,
+            AutoProcessor,
         )
     except ImportError as exc:
-        raise EvaluationWorkerError(
+        raise EvaluationRuntimeError(
             "Transformers/PEFT evaluation dependencies are unavailable"
         ) from exc
     model_id = manifest.get("base_model_id")
@@ -369,30 +512,36 @@ def _model_policy(
         or not isinstance(revision, str)
         or not _REVISION.fullmatch(revision)
     ):
-        raise EvaluationWorkerError(
+        raise EvaluationRuntimeError(
             "checkpoint manifest does not pin the FunctionGemma base revision"
         )
     try:
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, trust_remote_code=False)
+        processor = AutoProcessor.from_pretrained(checkpoint_dir, trust_remote_code=False)
         base = AutoModelForCausalLM.from_pretrained(
             model_id, revision=revision, trust_remote_code=False
         )
         model = PeftModel.from_pretrained(base, checkpoint_dir)
         model.eval()
     except Exception as exc:
-        raise EvaluationWorkerError(
+        raise EvaluationRuntimeError(
             f"real checkpoint loading failed: {type(exc).__name__}"
         ) from exc
 
     def policy(
         task: Task, observations: Sequence[Mapping[str, Any]] = ()
     ) -> tuple[ToolCall, ...]:
-        prompt = render_action_prompt(task, observations)
         try:
-            encoded = tokenizer(prompt, return_tensors="pt")
+            encoded = processor.apply_chat_template(
+                _canonical_messages(task, observations),
+                tools=function_tool_schemas(),
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
             input_ids = encoded.get("input_ids")
             if input_ids is None:
-                return ()
+                raise EvaluationRuntimeError("model tokenizer returned no input IDs")
             device = getattr(model, "device", None)
             if device is None:
                 device = next(model.parameters()).device
@@ -402,13 +551,16 @@ def _model_policy(
             }
             generated = model.generate(**encoded, max_new_tokens=256)
             completion = generated[0, input_ids.shape[-1] :]
-            text = tokenizer.decode(completion, skip_special_tokens=True)
-        except Exception:
-            return ()
-        try:
-            return _decode_actions(text)[:1]
-        except EvaluationWorkerError:
-            return ()
+            text = processor.decode(completion, skip_special_tokens=False)
+        except InvalidModelAction:
+            raise
+        except EvaluationRuntimeError:
+            raise
+        except Exception as exc:
+            raise EvaluationRuntimeError(
+                f"model generation/runtime failed: {type(exc).__name__}"
+            ) from exc
+        return _decode_actions(text)[:1]
 
     return policy
 
@@ -428,6 +580,7 @@ def evaluate_checkpoint(
     successes = 0
     task_successes: list[bool] = []
     task_environments: list[str] = []
+    invalid_action_tasks = 0
 
     def invoke(
         selected: Callable[..., ToolCall | Sequence[ToolCall]],
@@ -461,28 +614,45 @@ def evaluate_checkpoint(
         task = engine.reset(split=ObjectiveSplit.HIDDEN, task_id=task_id)
         observations: list[Mapping[str, Any]] = []
         success = False
+        invalid_action = False
         for _ in range(task.max_steps):
             try:
                 raw_action = invoke(selected_policy, task, tuple(observations))
-                actions = (raw_action,) if isinstance(raw_action, ToolCall) else tuple(raw_action)
-            except (EvaluationWorkerError, TypeError, ValueError):
-                actions = ()
+                actions = (
+                    (raw_action,)
+                    if isinstance(raw_action, ToolCall)
+                    else tuple(raw_action)
+                )
+            except InvalidModelAction:
+                invalid_action = True
+                break
+            except EvaluationRuntimeError:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise EvaluationRuntimeError("policy invocation failed") from exc
             if not actions:
+                invalid_action = True
                 break
             # A policy emits one action per observation turn.  Extra actions
             # are rejected instead of being executed with hidden future state.
             if len(actions) != 1:
+                invalid_action = True
+                break
+            if not isinstance(actions[0], ToolCall):
+                invalid_action = True
                 break
             try:
                 action = ToolCall(tool=actions[0].tool, arguments=dict(actions[0].arguments))
                 step = engine.step(action.tool, dict(action.arguments))
-            except (EvaluationWorkerError, TypeError, ValueError):
+            except (TypeError, ValueError):
+                invalid_action = True
                 break
             observations.append(step.observation)
             if step.done:
                 success = bool(step.success and step.reward > 0)
                 break
         successes += int(success)
+        invalid_action_tasks += int(invalid_action)
         task_successes.append(success)
         task_environments.append(task.service_name)
     return EvaluationMetrics(
@@ -490,6 +660,7 @@ def evaluate_checkpoint(
         successful_tasks=successes,
         task_successes=tuple(task_successes),
         task_environments=tuple(task_environments),
+        invalid_action_tasks=invalid_action_tasks,
     )
 
 
@@ -532,11 +703,13 @@ def build_evaluation_report(
         "candidate_task_count": candidate_metrics.task_count,
         "candidate_successful_tasks": candidate_metrics.successful_tasks,
         "candidate_success_rate": candidate_metrics.success_rate,
+        "candidate_invalid_action_tasks": candidate_metrics.invalid_action_tasks,
         "candidate_metrics": {
             "task_count": candidate_metrics.task_count,
-            "successful_tasks": candidate_metrics.successful_tasks,
-            "success_rate": candidate_metrics.success_rate,
-            "by_environment": environment_aggregates(candidate_metrics),
+                "successful_tasks": candidate_metrics.successful_tasks,
+                "success_rate": candidate_metrics.success_rate,
+                "by_environment": environment_aggregates(candidate_metrics),
+                "invalid_action_tasks": candidate_metrics.invalid_action_tasks,
         },
     }
     if champion_metrics is not None:
@@ -549,11 +722,13 @@ def build_evaluation_report(
                 "champion_task_count": champion_metrics.task_count,
                 "champion_successful_tasks": champion_metrics.successful_tasks,
                 "champion_success_rate": champion_metrics.success_rate,
+                "champion_invalid_action_tasks": champion_metrics.invalid_action_tasks,
                 "champion_metrics": {
                     "task_count": champion_metrics.task_count,
                     "successful_tasks": champion_metrics.successful_tasks,
                     "success_rate": champion_metrics.success_rate,
                     "by_environment": environment_aggregates(champion_metrics),
+                    "invalid_action_tasks": champion_metrics.invalid_action_tasks,
                 },
             }
         )

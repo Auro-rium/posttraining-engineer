@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Any
 
 BASE_MODEL_ID = "google/functiongemma-270m-it"
+FUNCTION_START = "<start_function_call>"
+FUNCTION_END = "<end_function_call>"
+FUNCTION_ESCAPE = "<escape>"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-fA-F]{40}$")
 _ALLOWED_SPLITS = frozenset({"train", "replay"})
@@ -159,6 +162,12 @@ def parse_training_inputs(
         _digest(parent_manifest_digest, "APPROVED_PARENT_MANIFEST_SHA256")
     if parent_artifact_digest is not None:
         _digest(parent_artifact_digest, "APPROVED_PARENT_ARTIFACT_SHA256")
+    if parent_path is not None and (
+        not parent_id or not parent_manifest_digest or not parent_artifact_digest
+    ):
+        raise TrainingWorkerError(
+            "approved parent artifact ID and manifest/artifact digests are required"
+        )
     provenance_signature = values.get("DATASET_PROVENANCE_SIGNATURE", "").strip() or None
     if provenance_signature is not None:
         _digest(provenance_signature, "DATASET_PROVENANCE_SIGNATURE")
@@ -202,11 +211,10 @@ def file_sha256(path: Path) -> str:
 def _artifact_files(output_dir: Path) -> list[dict[str, Any]]:
     if not output_dir.exists() or not output_dir.is_dir():
         raise TrainingArtifactError(f"training output directory is absent: {output_dir}")
-    files = sorted(
-        item
-        for item in output_dir.rglob("*")
-        if item.is_file() and item.name != "manifest.json"
-    )
+    entries = list(output_dir.rglob("*"))
+    if any(item.is_symlink() for item in entries):
+        raise TrainingArtifactError("checkpoint output contains a symlink")
+    files = sorted(item for item in entries if item.is_file() and item.name != "manifest.json")
     if not files:
         raise TrainingArtifactError("training produced no checkpoint artifacts")
     return [
@@ -227,6 +235,43 @@ def _artifact_digest(files: list[dict[str, Any]]) -> str:
 def _manifest_digest(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def function_tool_schemas() -> list[dict[str, Any]]:
+    """Return the objective tools in FunctionGemma's schema format."""
+
+    from app.objective.models import ALLOWED_TOOLS
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"Service-recovery tool: {name}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "service": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "additionalProperties": True,
+                },
+            },
+        }
+        for name in ALLOWED_TOOLS
+    ]
+
+
+def _render_function_call(tool: str, arguments: Mapping[str, Any]) -> str:
+    fields: list[str] = []
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            rendered = f"{FUNCTION_ESCAPE}{value}{FUNCTION_ESCAPE}"
+        else:
+            rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        fields.append(f"{key}:{rendered}")
+    body = ",".join(fields)
+    return f"{FUNCTION_START}call:{tool}{{{body}}}{FUNCTION_END}"
 
 
 def _format_sft_examples(row: Mapping[str, Any]) -> tuple[dict[str, str], ...]:
@@ -278,16 +323,34 @@ def _format_sft_examples(row: Mapping[str, Any]) -> tuple[dict[str, str], ...]:
                 "objective": "restore the service and pass its health check",
                 "service": service,
                 "observations": list(previous_observations),
-                "output": "JSON array of {tool, arguments} objects",
+                "output": "FunctionGemma function call",
+                "messages": [
+                    {
+                        "role": "developer",
+                        "content": (
+                            "Use the provided service-recovery functions one call at a time."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "task_id": task_id,
+                                "objective": "restore the service and pass its health check",
+                                "service": service,
+                                "observations": list(previous_observations),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ],
+                "tools": function_tool_schemas(),
             },
             sort_keys=True,
             separators=(",", ":"),
         )
-        completion = json.dumps(
-            [{"tool": call.tool, "arguments": dict(call.arguments)}],
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        completion = _render_function_call(call.tool, call.arguments)
         examples.append({"prompt": prompt, "completion": completion})
         previous_observations.append(dict(observation))
     return tuple(examples)
@@ -341,6 +404,9 @@ def _verify_manifest_directory(directory: Path, *, label: str) -> dict[str, Any]
         raise TrainingWorkerError(f"{label} artifact file list does not match content")
     if _artifact_digest(actual_files) != artifact_digest:
         raise TrainingWorkerError(f"{label} artifact checksum does not match content")
+    canonical_id = f"checkpoint://{artifact_digest}"
+    if payload.get("artifact_id") != canonical_id:
+        raise TrainingWorkerError(f"{label} artifact ID is not content-bound")
     return payload
 
 
@@ -435,6 +501,8 @@ def write_training_manifest(
             parent["artifact_sha256"]
         ):
             raise TrainingWorkerError("parent adapter artifact digest is invalid")
+        if parent["artifact_id"] != f"checkpoint://{parent['artifact_sha256']}":
+            raise TrainingWorkerError("parent adapter artifact ID is not content-bound")
         if parent["base_model_id"] != BASE_MODEL_ID:
             raise TrainingWorkerError("parent adapter base model identity is invalid")
         if not isinstance(parent["base_model_revision"], str) or not _REVISION.fullmatch(
@@ -593,15 +661,13 @@ def run_training(inputs: TrainingInputs) -> Path:
         parent_manifest = verify_parent_adapter(inputs.parent_adapter_dir)
         if not inputs.approved_parent_artifact_id:
             raise TrainingWorkerError("approved parent artifact identity is required")
+        if not inputs.approved_parent_manifest_sha256 or not inputs.approved_parent_artifact_sha256:
+            raise TrainingWorkerError("approved parent manifest and artifact digests are required")
         if parent_manifest.get("artifact_id") != inputs.approved_parent_artifact_id:
             raise TrainingWorkerError("parent adapter is not the approved champion artifact")
-        if inputs.approved_parent_manifest_sha256 and parent_manifest.get(
-            "manifest_sha256"
-        ) != inputs.approved_parent_manifest_sha256:
+        if parent_manifest.get("manifest_sha256") != inputs.approved_parent_manifest_sha256:
             raise TrainingWorkerError("parent adapter manifest is not approved")
-        if inputs.approved_parent_artifact_sha256 and parent_manifest.get(
-            "artifact_sha256"
-        ) != inputs.approved_parent_artifact_sha256:
+        if parent_manifest.get("artifact_sha256") != inputs.approved_parent_artifact_sha256:
             raise TrainingWorkerError("parent adapter artifact is not approved")
         if parent_manifest.get("base_model_revision") != inputs.base_model_revision:
             raise TrainingWorkerError("parent adapter base revision does not match training input")
@@ -616,7 +682,7 @@ def run_training(inputs: TrainingInputs) -> Path:
         )
         from transformers import (  # type: ignore[import-not-found]
             AutoModelForCausalLM,
-            AutoTokenizer,
+            AutoProcessor,
             BitsAndBytesConfig,
             Trainer,
             TrainingArguments,
@@ -627,9 +693,10 @@ def run_training(inputs: TrainingInputs) -> Path:
         ) from exc
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
+        processor = AutoProcessor.from_pretrained(
             inputs.base_model_id, revision=inputs.base_model_revision, trust_remote_code=False
         )
+        tokenizer = getattr(processor, "tokenizer", processor)
         quantization = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -667,7 +734,20 @@ def run_training(inputs: TrainingInputs) -> Path:
         def tokenize(example: Mapping[str, str]) -> dict[str, Any]:
             # Keep labels on assistant/tool-call tokens only.  Prompt tokens
             # are context, not targets, and must be masked with -100.
-            prompt_ids = tokenizer(example["prompt"], add_special_tokens=True)["input_ids"]
+            payload = json.loads(example["prompt"])
+            messages = payload["messages"]
+            tools = payload["tools"]
+            prompt_encoded = processor.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            prompt_ids = prompt_encoded["input_ids"]
+            if hasattr(prompt_ids, "tolist"):
+                prompt_ids = prompt_ids[0].tolist()
             completion_ids = tokenizer(
                 "\n" + example["completion"], add_special_tokens=False
             )["input_ids"]
@@ -759,7 +839,7 @@ def run_training(inputs: TrainingInputs) -> Path:
             json.dumps(metrics, sort_keys=True, separators=(",", ":")) + "\n"
         )
         model.save_pretrained(inputs.model_dir)
-        tokenizer.save_pretrained(inputs.model_dir)
+        processor.save_pretrained(inputs.model_dir)
     except Exception as exc:
         raise TrainingWorkerError(f"real QLoRA training failed: {type(exc).__name__}") from exc
     return write_training_manifest(
