@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 import builtins
 import hashlib
+import io
 import json
+import struct
 from pathlib import Path
 
 import pytest
 
+import scripts.stage_functiongemma_checkpoint as staging
 from scripts.stage_functiongemma_checkpoint import (
     TARGET_MODEL_ID,
     CheckpointStagingError,
@@ -23,13 +26,25 @@ REVISION = "a" * 40
 def _checkpoint(path: Path, *, include_weights: bool = True) -> Path:
     path.mkdir()
     (path / "config.json").write_text(
-        json.dumps({"model_type": "gemma3_text"}, sort_keys=True), encoding="utf-8"
+        json.dumps(
+            {"architectures": ["Gemma3ForCausalLM"], "model_type": "gemma3_text"},
+            sort_keys=True,
+        ),
     )
     (path / "tokenizer.json").write_text("{\"version\": 1}", encoding="utf-8")
     (path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
     if include_weights:
-        (path / "model.safetensors").write_bytes(b"weights")
+        (path / "model.safetensors").write_bytes(_safetensors("weight"))
     return path
+
+
+def _safetensors(*tensor_names: str) -> bytes:
+    header = {
+        name: {"dtype": "F32", "shape": [1], "data_offsets": [index * 4, (index + 1) * 4]}
+        for index, name in enumerate(tensor_names)
+    }
+    encoded = json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return struct.pack("<Q", len(encoded)) + encoded + b"\x00" * (4 * len(tensor_names))
 
 
 def test_revision_is_required_to_be_an_immutable_commit(tmp_path: Path) -> None:
@@ -48,6 +63,40 @@ def test_only_functiongemma_target_model_can_be_staged(tmp_path: Path) -> None:
             revision=REVISION,
             model_id="google/gemma-3-4b-it",
         )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"architectures": ["Gemma3ForCausalLM"], "model_type": "other"},
+        {"architectures": ["OtherForCausalLM"], "model_type": "gemma3_text"},
+        {"model_type": "gemma3_text"},
+    ],
+)
+def test_exact_functiongemma_config_identity_is_required(
+    tmp_path: Path, config: dict[str, object]
+) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(CheckpointStagingError, match=r"FunctionGemma|architecture|model_type"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+def test_malformed_safetensors_weight_is_rejected(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "model.safetensors").write_bytes(b"not-a-safetensors-file")
+
+    with pytest.raises(CheckpointStagingError, match="safetensors"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+def test_pytorch_weight_format_is_rejected_closed(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint", include_weights=False)
+    (checkpoint / "pytorch_model.bin").write_bytes(b"not-a-pytorch-archive")
+
+    with pytest.raises(CheckpointStagingError, match="PyTorch"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
 
 
 def test_missing_required_checkpoint_file_fails_closed(tmp_path: Path) -> None:
@@ -132,6 +181,7 @@ def test_indexed_weights_require_supported_shard_map(
     tmp_path: Path, mapped_value: object
 ) -> None:
     checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "model.safetensors").unlink()
     (checkpoint / "model-00001-of-00001.safetensors").write_bytes(b"shard")
     (checkpoint / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"weight": mapped_value}}), encoding="utf-8"
@@ -146,8 +196,8 @@ def test_indexed_weights_require_supported_shard_map(
 def _indexed_checkpoint(path: Path) -> Path:
     checkpoint = _checkpoint(path)
     (checkpoint / "model.safetensors").unlink()
-    (checkpoint / "model-00001-of-00002.safetensors").write_bytes(b"shard-1")
-    (checkpoint / "model-00002-of-00002.safetensors").write_bytes(b"shard-2")
+    (checkpoint / "model-00001-of-00002.safetensors").write_bytes(_safetensors("layer.0"))
+    (checkpoint / "model-00002-of-00002.safetensors").write_bytes(_safetensors("layer.1"))
     (checkpoint / "model.safetensors.index.json").write_text(
         json.dumps(
             {
@@ -195,8 +245,8 @@ def test_sharded_safetensors_require_an_index(tmp_path: Path) -> None:
 def test_indexed_safetensors_require_a_complete_numbered_set(tmp_path: Path) -> None:
     checkpoint = _checkpoint(tmp_path / "checkpoint")
     (checkpoint / "model.safetensors").unlink()
-    (checkpoint / "model-00001-of-00003.safetensors").write_bytes(b"shard-1")
-    (checkpoint / "model-00003-of-00003.safetensors").write_bytes(b"shard-3")
+    (checkpoint / "model-00001-of-00003.safetensors").write_bytes(_safetensors("layer.0"))
+    (checkpoint / "model-00003-of-00003.safetensors").write_bytes(_safetensors("layer.2"))
     (checkpoint / "model.safetensors.index.json").write_text(
         json.dumps(
             {
@@ -211,6 +261,51 @@ def test_indexed_safetensors_require_a_complete_numbered_set(tmp_path: Path) -> 
 
     with pytest.raises(CheckpointStagingError, match=r"complete|missing"):
         validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+def test_index_tensor_map_must_match_safetensors_headers(tmp_path: Path) -> None:
+    checkpoint = _indexed_checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "layer.0": "model-00001-of-00002.safetensors",
+                    "wrong": "model-00002-of-00002.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CheckpointStagingError, match=r"tensor|header"):
+        validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+def test_bundle_uses_the_same_bytes_as_validation_and_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    original = staging._read_regular_file
+    original_weight = (checkpoint / "model.safetensors").read_bytes()
+    changed_weight = _safetensors("changed")
+
+    def mutate_after_read(path: Path) -> bytes:
+        data = original(path)
+        if path.name == "model.safetensors":
+            path.write_bytes(changed_weight)
+        return data
+
+    monkeypatch.setattr(staging, "_read_regular_file", mutate_after_read)
+    bundle = build_deterministic_bundle(checkpoint, revision=REVISION)
+
+    manifest_weight = next(item for item in bundle.files if item.path == "model.safetensors")
+    assert manifest_weight.sha256 == hashlib.sha256(original_weight).hexdigest()
+    with staging.tarfile.open(
+        fileobj=io.BytesIO(staging.gzip.decompress(bundle.data)), mode="r:"
+    ) as archive:
+        member = archive.extractfile("model.safetensors")
+        assert member is not None
+        assert member.read() == original_weight
 
 
 @pytest.mark.parametrize("filename", ["metadata.json", "report.json", "manifest.json"])

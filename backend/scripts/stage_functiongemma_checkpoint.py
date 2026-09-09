@@ -16,7 +16,9 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import re
+import struct
 import tarfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -24,6 +26,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 TARGET_MODEL_ID = "google/functiongemma-270m-it"
+EXPECTED_MODEL_TYPE = "gemma3_text"
+EXPECTED_ARCHITECTURES = ("Gemma3ForCausalLM",)
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _WEIGHT_NAMES = (
@@ -52,6 +56,26 @@ _SHARD_RE = {
     ".safetensors": re.compile(r"^model-(\d{5})-of-(\d{5})\.safetensors$"),
     ".bin": re.compile(r"^pytorch_model-(\d{5})-of-(\d{5})\.bin$"),
 }
+_SAFETENSORS_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "I16": 2,
+    "U16": 2,
+    "I32": 4,
+    "U32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "F16": 2,
+    "BF16": 2,
+    "F32": 4,
+    "F64": 8,
+    "C64": 8,
+    "C128": 16,
+}
+_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
 
 class CheckpointStagingError(ValueError):
@@ -79,6 +103,14 @@ class CheckpointFile:
             "sha256": self.sha256,
             "size_bytes": self.size_bytes,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointSnapshot:
+    """One read-only byte snapshot used for all validation and archive writes."""
+
+    files: tuple[CheckpointFile, ...]
+    contents: Mapping[str, bytes]
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +235,20 @@ def _relative_files(root: Path) -> list[Path]:
     return paths
 
 
+def _read_regular_file(path: Path) -> bytes:
+    """Read one regular file without following a symlink introduced in a race."""
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise CheckpointStagingError(f"could not read checkpoint file: {path}") from exc
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            return stream.read()
+    except OSError as exc:
+        raise CheckpointStagingError(f"could not read checkpoint file: {path}") from exc
+
+
 def _truthy_restricted_flag(value: object) -> bool:
     if isinstance(value, bool):
         return value
@@ -224,36 +270,39 @@ def _contains_restricted_flag(value: object) -> bool:
     return False
 
 
+def _parse_json(data: bytes, relative: str) -> dict[str, object]:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckpointStagingError(f"invalid checkpoint JSON metadata: {relative}") from exc
+    if not isinstance(value, dict):
+        raise CheckpointStagingError(
+            f"checkpoint JSON metadata/report must be an object: {relative}"
+        )
+    return value
+
+
 def _reject_gated_metadata(
-    paths: list[Path], root: Path, *, revision: str, model_id: str
+    contents: Mapping[str, bytes], *, revision: str, model_id: str
 ) -> None:
-    for path in paths:
-        if path.suffix.lower() != ".json":
+    for relative, data in contents.items():
+        if not relative.lower().endswith(".json"):
             continue
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CheckpointStagingError(
-                f"invalid checkpoint JSON metadata: {path.relative_to(root)}"
-            ) from exc
-        if not isinstance(value, dict):
-            raise CheckpointStagingError(
-                f"checkpoint JSON metadata/report must be an object: {path.relative_to(root)}"
-            )
+        value = _parse_json(data, relative)
         if _contains_restricted_flag(value):
             raise CheckpointStagingError(
-                f"checkpoint metadata is gated/private/restricted: {path.relative_to(root)}"
+                f"checkpoint metadata is gated/private/restricted: {relative}"
             )
         _validate_hf_metadata_identity(
             value,
-            path.relative_to(root).as_posix(),
+            relative,
             revision=revision,
             model_id=model_id,
         )
 
 
 def _validate_hf_metadata_identity(
-    value: dict[object, object],
+    value: Mapping[str, object],
     relative: str,
     *,
     revision: str,
@@ -295,7 +344,7 @@ def _validate_hf_metadata_identity(
             raise CheckpointStagingError(f"HF revision is unavailable: {relative}")
 
 
-def _validate_required_files(paths: list[Path], root: Path) -> None:
+def _validate_required_files_legacy(paths: list[Path], root: Path) -> None:
     names = {path.relative_to(root).as_posix() for path in paths}
     required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
     missing = sorted(required - names)
@@ -463,14 +512,179 @@ def _validate_required_files(paths: list[Path], root: Path) -> None:
                 raise CheckpointStagingError(f"model weight file is empty: {shard_name}")
 
 
-def validate_checkpoint_directory(
-    checkpoint_dir: str | Path,
-    *,
-    revision: str,
-    model_id: str = TARGET_MODEL_ID,
-) -> tuple[CheckpointFile, ...]:
-    """Validate a local checkpoint and return sorted per-file digests."""
+def _parse_safetensors_header(data: bytes, relative: str) -> frozenset[str]:
+    if len(data) < 8:
+        raise CheckpointStagingError(f"invalid safetensors header: {relative}")
+    (header_size,) = struct.unpack("<Q", data[:8])
+    if header_size > _MAX_SAFETENSORS_HEADER_BYTES or header_size > len(data) - 8:
+        raise CheckpointStagingError(f"invalid safetensors header: {relative}")
+    try:
+        header_value = json.loads(data[8 : 8 + header_size].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckpointStagingError(f"invalid safetensors header: {relative}") from exc
+    if not isinstance(header_value, dict):
+        raise CheckpointStagingError(f"invalid safetensors header: {relative}")
+    metadata = header_value.get("__metadata__")
+    if metadata is not None and (
+        not isinstance(metadata, dict)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in metadata.items()
+        )
+    ):
+        raise CheckpointStagingError(f"invalid safetensors metadata: {relative}")
+    payload_size = len(data) - 8 - header_size
+    ranges: list[tuple[int, int]] = []
+    tensor_names: set[str] = set()
+    for tensor_name, descriptor in header_value.items():
+        if tensor_name == "__metadata__":
+            continue
+        if not isinstance(tensor_name, str) or not tensor_name or not isinstance(descriptor, dict):
+            raise CheckpointStagingError(f"invalid safetensors tensor header: {relative}")
+        dtype = descriptor.get("dtype")
+        shape = descriptor.get("shape")
+        offsets = descriptor.get("data_offsets")
+        element_size = _SAFETENSORS_DTYPE_BYTES.get(dtype) if isinstance(dtype, str) else None
+        if element_size is None or not isinstance(shape, list) or not isinstance(offsets, list):
+            raise CheckpointStagingError(f"invalid safetensors tensor header: {relative}")
+        if any(isinstance(dim, bool) or not isinstance(dim, int) or dim < 0 for dim in shape):
+            raise CheckpointStagingError(f"invalid safetensors tensor shape: {relative}")
+        if len(offsets) != 2 or any(
+            isinstance(offset, bool) or not isinstance(offset, int) for offset in offsets
+        ):
+            raise CheckpointStagingError(f"invalid safetensors tensor offsets: {relative}")
+        start, end = offsets
+        if start < 0 or end < start or end > payload_size:
+            raise CheckpointStagingError(f"invalid safetensors tensor offsets: {relative}")
+        expected_size = element_size
+        for dimension in shape:
+            expected_size *= dimension
+        if end - start != expected_size:
+            raise CheckpointStagingError(f"safetensors tensor size mismatch: {relative}")
+        ranges.append((start, end))
+        tensor_names.add(tensor_name)
+    if not tensor_names:
+        raise CheckpointStagingError(f"safetensors file has no tensors: {relative}")
+    cursor = 0
+    for start, end in sorted(ranges):
+        if start != cursor:
+            raise CheckpointStagingError(f"safetensors tensor ranges are incomplete: {relative}")
+        cursor = end
+    if cursor != payload_size:
+        raise CheckpointStagingError(f"safetensors tensor ranges are incomplete: {relative}")
+    return frozenset(tensor_names)
 
+
+def _validate_required_files(contents: Mapping[str, bytes]) -> None:
+    names = set(contents)
+    required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
+    missing = sorted(required - names)
+    if missing:
+        raise CheckpointStagingError(
+            "checkpoint is incomplete; missing required file(s): " + ", ".join(missing)
+        )
+    required_json = {filename: _parse_json(contents[filename], filename) for filename in required}
+    config = required_json["config.json"]
+    if config.get("model_type") != EXPECTED_MODEL_TYPE:
+        raise CheckpointStagingError("config.json is not the exact FunctionGemma model_type")
+    if config.get("architectures") != list(EXPECTED_ARCHITECTURES):
+        raise CheckpointStagingError("config.json has an unexpected FunctionGemma architecture")
+    if "_name_or_path" in config and config["_name_or_path"] not in {"", TARGET_MODEL_ID}:
+        raise CheckpointStagingError("config.json has an unexpected model identity")
+    if not isinstance(required_json["tokenizer.json"].get("version"), (str, int, float)):
+        raise CheckpointStagingError("required checkpoint JSON has no version: tokenizer.json")
+
+    safetensor_shards = {
+        name for name in names if _parse_shard_name(name, ".safetensors") is not None
+    }
+    invalid_shards = {
+        name for name in names if name.startswith("model-") and name.endswith(".safetensors")
+    } - safetensor_shards
+    if invalid_shards:
+        raise CheckpointStagingError(
+            "checkpoint contains an invalid weight shard name: " + ", ".join(sorted(invalid_shards))
+        )
+    pytorch_weights = {
+        name
+        for name in names
+        if name == "pytorch_model.bin"
+        or (name.startswith("pytorch_model-") and name.endswith(".bin"))
+    }
+    if pytorch_weights:
+        raise CheckpointStagingError("PyTorch weight format is unsupported; use safetensors")
+    if "model.safetensors" not in names and not safetensor_shards:
+        raise CheckpointStagingError(
+            "checkpoint is incomplete; missing model weight file model.safetensors"
+        )
+    if "model.safetensors" in names and safetensor_shards:
+        raise CheckpointStagingError("checkpoint mixes unsharded and sharded safetensors")
+
+    index_name = "model.safetensors.index.json"
+    if "model.safetensors" in names:
+        if index_name in names:
+            raise CheckpointStagingError("unsharded safetensors must not have a weight index")
+        _parse_safetensors_header(contents["model.safetensors"], "model.safetensors")
+        return
+    if not safetensor_shards or index_name not in names:
+        raise CheckpointStagingError("sharded safetensors require a weight index")
+
+    index = _parse_json(contents[index_name], index_name)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise CheckpointStagingError(f"weight index has no weight_map: {index_name}")
+    index_metadata = index.get("metadata")
+    if index_metadata is not None and not isinstance(index_metadata, dict):
+        raise CheckpointStagingError(f"weight index metadata has an invalid shape: {index_name}")
+    mapped_shards: set[str] = set()
+    mapped_tensors: dict[str, str] = {}
+    shard_tensors: dict[str, frozenset[str]] = {}
+    parsed_shards: list[tuple[int, int]] = []
+    for parameter, value in weight_map.items():
+        if not isinstance(parameter, str) or not parameter:
+            raise CheckpointStagingError(
+                f"weight index contains an invalid parameter name: {index_name}"
+            )
+        if not isinstance(value, str) or not value:
+            raise CheckpointStagingError(f"weight index contains a non-string shard: {index_name}")
+        shard = PurePosixPath(value)
+        shard_parts = _parse_shard_name(value, ".safetensors")
+        if shard.name != value or shard_parts is None:
+            raise CheckpointStagingError(f"weight index contains an invalid shard name: {value}")
+        shard_number, declared_total = shard_parts
+        if shard_number > declared_total:
+            raise CheckpointStagingError(f"weight index contains an invalid shard name: {value}")
+        if value not in contents:
+            raise CheckpointStagingError(
+                f"checkpoint is incomplete; missing weight shard(s): {value}"
+            )
+        if value not in shard_tensors:
+            shard_tensors[value] = _parse_safetensors_header(contents[value], value)
+        if parameter in mapped_tensors:
+            raise CheckpointStagingError(f"weight index contains a duplicate tensor: {parameter}")
+        mapped_tensors[parameter] = value
+        mapped_shards.add(value)
+        parsed_shards.append((shard_number, declared_total))
+    if mapped_shards != safetensor_shards:
+        raise CheckpointStagingError("weight index does not match available model shards")
+    declared_totals = {total for _, total in parsed_shards}
+    expected_total = next(iter(declared_totals))
+    if len(declared_totals) != 1 or expected_total != len(mapped_shards):
+        raise CheckpointStagingError(f"weight index has an incomplete shard set: {index_name}")
+    if {number for number, _ in parsed_shards} != set(range(1, expected_total + 1)):
+        raise CheckpointStagingError(f"weight index has an incomplete shard set: {index_name}")
+    all_tensors = set().union(*shard_tensors.values())
+    if all_tensors != set(mapped_tensors):
+        raise CheckpointStagingError("weight index tensor map does not match safetensors headers")
+    for tensor_name, shard_name in mapped_tensors.items():
+        if tensor_name not in shard_tensors[shard_name]:
+            raise CheckpointStagingError(
+                f"weight index tensor is absent from shard header: {tensor_name}"
+            )
+
+
+def _checkpoint_snapshot(
+    checkpoint_dir: str | Path, *, revision: str, model_id: str
+) -> _CheckpointSnapshot:
     if model_id != TARGET_MODEL_ID:
         raise CheckpointStagingError(
             f"only the pinned target model {TARGET_MODEL_ID!r} may be staged"
@@ -478,21 +692,30 @@ def validate_checkpoint_directory(
     validate_immutable_revision(revision)
     root = Path(checkpoint_dir).expanduser()
     paths = _relative_files(root)
-    _reject_gated_metadata(paths, root, revision=revision, model_id=model_id)
-    _validate_required_files(paths, root)
-    if not paths:
+    contents = {
+        path.relative_to(root).as_posix(): _read_regular_file(path) for path in paths
+    }
+    if not contents:
         raise CheckpointStagingError("checkpoint directory is empty")
-    result: list[CheckpointFile] = []
-    for path in paths:
-        data = path.read_bytes()
-        result.append(
-            CheckpointFile(
-                path=path.relative_to(root).as_posix(),
-                sha256=hashlib.sha256(data).hexdigest(),
-                size_bytes=len(data),
-            )
-        )
-    return tuple(result)
+    _reject_gated_metadata(contents, revision=revision, model_id=model_id)
+    _validate_required_files(contents)
+    files = tuple(
+        CheckpointFile(path=name, sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data))
+        for name, data in contents.items()
+    )
+    return _CheckpointSnapshot(files=files, contents=contents)
+
+
+def validate_checkpoint_directory(
+    checkpoint_dir: str | Path,
+    *,
+    revision: str,
+    model_id: str = TARGET_MODEL_ID,
+) -> tuple[CheckpointFile, ...]:
+    """Validate a local checkpoint and return sorted per-file digests."""
+    return _checkpoint_snapshot(
+        checkpoint_dir, revision=revision, model_id=model_id
+    ).files
 
 
 # Compatibility alias for callers that use the shorter name.
@@ -507,12 +730,12 @@ def build_deterministic_bundle(
 ) -> DeterministicBundle:
     """Build reproducible gzip/tar bytes from a validated local checkpoint."""
 
-    root = Path(checkpoint_dir).expanduser()
-    files = validate_checkpoint_directory(root, revision=revision, model_id=model_id)
+    snapshot = _checkpoint_snapshot(checkpoint_dir, revision=revision, model_id=model_id)
+    files = snapshot.files
     tar_bytes = io.BytesIO()
     with tarfile.open(fileobj=tar_bytes, mode="w", format=tarfile.PAX_FORMAT) as archive:
         for item in files:
-            data = (root / PurePosixPath(item.path)).read_bytes()
+            data = snapshot.contents[item.path]
             info = tarfile.TarInfo(item.path)
             info.size = len(data)
             info.mode = 0o644
