@@ -8,6 +8,7 @@ is valid.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable
 from typing import Any, Protocol
@@ -61,13 +62,45 @@ class AutonomousRunDispatcher:
             except LeaseConflictError:
                 continue
             try:
-                await _await(self.supervisor.run_optimization(candidate.run_id))
+                await self._run_with_lease(candidate.run_id)
                 processed.append(candidate.run_id)
             finally:
                 current = self.repository.get(candidate.run_id)
                 if current is not None and current.lease_owner == self.owner:
                     self.repository.release_lease(candidate.run_id, self.owner)
         return processed
+
+    async def _run_with_lease(self, run_id: str) -> None:
+        """Run with a bounded heartbeat; cancel work if ownership is lost."""
+
+        interval = max(0.05, self.lease_ttl_seconds / 3)
+        lost = asyncio.Event()
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    self.repository.renew_lease(
+                        run_id, self.owner, ttl_seconds=self.lease_ttl_seconds
+                    )
+                except Exception:
+                    lost.set()
+                    return
+
+        work = asyncio.create_task(_await(self.supervisor.run_optimization(run_id)))
+        beat = asyncio.create_task(heartbeat())
+        lost_wait = asyncio.create_task(lost.wait())
+        try:
+            done, _ = await asyncio.wait({work, lost_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if lost_wait in done and lost.is_set():
+                work.cancel()
+                await asyncio.gather(work, return_exceptions=True)
+                raise LeaseConflictError("dispatcher lease was lost")
+            await work
+        finally:
+            beat.cancel()
+            lost_wait.cancel()
+            await asyncio.gather(beat, lost_wait, return_exceptions=True)
 
     async def run_once(self) -> list[str]:
         """Compatibility alias for queue workers."""

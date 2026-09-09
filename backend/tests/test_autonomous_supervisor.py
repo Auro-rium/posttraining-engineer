@@ -31,9 +31,16 @@ from app.autonomous.supervisor import (
     CheckpointArtifact,
     EvaluationEvidence,
 )
+from app.autonomous.telemetry import DurableTelemetryBridge
 from app.posttraining.models import Evidence, EvidenceKind, EvidenceLabel
 from app.posttraining.multi_run_gate import MultiRunEvaluation
-from app.providers.sagemaker import EvaluationJobRequest, JobResult, JobStatus, TrainingJobRequest
+from app.providers.sagemaker import (
+    EvaluationJobRequest,
+    JobResult,
+    JobStatus,
+    TrainingJobRequest,
+    TransientProviderError,
+)
 
 REVISION = "a" * 40
 MANIFEST = "b" * 64
@@ -517,6 +524,113 @@ async def test_failed_training_job_is_failed_not_stopped() -> None:
     provider.submit_training = submit_failed  # type: ignore[method-assign]
     result = await supervisor.run_optimization("run-1")
     assert result.status is AutonomousRunStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_persisted_expiry_blocks_without_verifier() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(store)
+    current = store.get("run-1")
+    assert current is not None
+    store.update_state(
+        "run-1",
+        expected_version=current.version,
+        updates={"approval_expires_at": datetime(2020, 1, 1, tzinfo=UTC)},
+    )
+    result = await supervisor.run_optimization("run-1")
+    assert result.status is AutonomousRunStatus.BLOCKED
+    assert result.stop_reason == "approval expired"
+    assert provider.training_submits == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_requested_during_design_prevents_provider_submission() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(store)
+    original = supervisor.agents.design_qlora
+
+    def design_and_cancel(plan: CuratedDatasetPlan, history: tuple[Any, ...] = ()) -> QLoRAConfig:
+        current = store.get("run-1")
+        assert current is not None
+        store.update_state(
+            "run-1", expected_version=current.version, updates={"cancellation_requested": True}
+        )
+        return original(plan, history)
+
+    supervisor.agents.design_qlora = design_and_cancel  # type: ignore[method-assign]
+    result = await supervisor.run_optimization("run-1")
+    assert result.status is AutonomousRunStatus.CANCELLED
+    assert provider.training_submits == 0
+
+
+@pytest.mark.asyncio
+async def test_in_progress_terminal_cost_is_reconciled_exactly() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(store, budget=5.0)
+    original = provider.submit_training
+
+    def submit_in_progress(request: TrainingJobRequest) -> JobResult:
+        result = original(request)
+        return JobResult(
+            result.job_name,
+            result.provider_job_id,
+            JobStatus.IN_PROGRESS,
+            result.artifact_uri,
+            raw_response={"cost_usd": 0.0},
+        )
+
+    provider.submit_training = submit_in_progress  # type: ignore[method-assign]
+    provider.get_training_status = lambda name: JobResult(  # type: ignore[method-assign]
+        name,
+        f"train://{name}",
+        JobStatus.COMPLETED,
+        "s3://artifacts/checkpoint",
+        raw_response={"actual_cost_usd": 4.5},
+    )
+    result = await supervisor.run_optimization("run-1")
+    assert result.status is AutonomousRunStatus.BLOCKED
+    assert result.stop_reason == "budget exhausted"
+    assert result.spent_budget_usd == pytest.approx(4.5)
+
+
+@pytest.mark.asyncio
+async def test_transient_status_failure_remains_recoverable() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(store)
+    original = provider.get_training_status
+    attempts = 0
+
+    def transient_once(name: str) -> JobResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TransientProviderError("timeout", job_name=name, operation="describe")
+        return original(name)
+
+    def submit_in_progress(request: TrainingJobRequest) -> JobResult:
+        provider.training_submits += 1
+        return JobResult(request.job_name, f"train://{request.job_name}", JobStatus.IN_PROGRESS)
+
+    provider.submit_training = submit_in_progress  # type: ignore[method-assign]
+    provider.get_training_status = transient_once  # type: ignore[method-assign]
+    first = await supervisor.run_optimization("run-1")
+    assert first.status is AutonomousRunStatus.RUNNING
+    second = await supervisor.run_optimization("run-1")
+    assert second.status is AutonomousRunStatus.SUCCEEDED
+    assert provider.training_submits == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_telemetry_events_are_persisted_by_supervisor() -> None:
+    store = _StateStore()
+    supervisor, _ = _supervisor(store)
+    supervisor.telemetry = DurableTelemetryBridge(store)
+    result = await supervisor.run_optimization("run-1")
+    assert result.status is AutonomousRunStatus.SUCCEEDED
+    events = store.list_events("run-1").items
+    assert any(event.event_type == "job.submitted" for event in events)
+    assert any(event.event_type == "job.completed" for event in events)
+    assert any(event.event_type == "promotion.decided" for event in events)
 
 
 @pytest.mark.asyncio
