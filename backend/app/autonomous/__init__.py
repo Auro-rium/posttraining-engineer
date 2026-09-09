@@ -9,6 +9,7 @@ from .models import (
     RunOperation,
     RunOperationStatus,
     RunPhase,
+    validate_event_reason,
 )
 from .repository import (
     ApprovalAlreadyConsumedError,
@@ -44,4 +45,5 @@ __all__ = [
     "RunOperation",
     "RunOperationStatus",
     "RunPhase",
+    "validate_event_reason",
 ]
