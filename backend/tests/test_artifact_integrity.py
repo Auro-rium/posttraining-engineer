@@ -141,6 +141,76 @@ def test_verify_immutable_checks_version_metadata_location_size_and_download() -
     ]
 
 
+@pytest.mark.parametrize("write_method", ["put_bytes", "put_json"])
+def test_runtime_put_rejects_missing_version_id(
+    write_method: str,
+) -> None:
+    class UnversionedPut(_VersionedS3):
+        def put_object(self, **kwargs: object) -> dict[str, str]:
+            self.calls.append(("put_object", kwargs))
+            return {}
+
+    client = UnversionedPut()
+    store = S3ArtifactStore("artifacts", client=client, prefix="runs")
+
+    with pytest.raises(ArtifactIntegrityError, match="immutable VersionId"):
+        if write_method == "put_bytes":
+            store.put_bytes("run-1/model.json", b'{"ok":true}')
+        else:
+            store.put_json("run-1/model.json", {"ok": True})
+
+    assert [name for name, _ in client.calls] == ["put_object"]
+
+
+def test_runtime_put_verifies_the_exact_uploaded_version_before_returning() -> None:
+    data = b'{"ok":true}'
+    client = _VersionedS3()
+    store = S3ArtifactStore("artifacts", client=client, prefix="runs")
+
+    ref = store.put_bytes("run-1/model.json", data, content_type="application/json")
+
+    assert ref.version_id == "retained-v1"
+    assert ref.sha256 == hashlib.sha256(data).hexdigest()
+    assert ref.size_bytes == len(data)
+    assert [name for name, _ in client.calls] == [
+        "put_object",
+        "head_object",
+        "get_object",
+    ]
+    assert client.calls[1][1]["VersionId"] == "retained-v1"
+    assert client.calls[2][1]["VersionId"] == "retained-v1"
+
+
+@pytest.mark.parametrize("corruption", ["metadata", "bytes", "version"])
+def test_runtime_put_rejects_remote_integrity_mismatch(corruption: str) -> None:
+    data = b'{"ok":true}'
+
+    class CorruptingPut(_VersionedS3):
+        def put_object(self, **kwargs: object) -> dict[str, str]:
+            response = super().put_object(**kwargs)
+            version_id = str(response["VersionId"])
+            object_key = (str(kwargs["Bucket"]), str(kwargs["Key"]), version_id)
+            stored_data, stored_metadata = self.objects[object_key]
+            if corruption == "metadata":
+                stored_metadata["sha256"] = "0" * 64
+            elif corruption == "bytes":
+                stored_data = b'{"no":true}'
+            self.objects[object_key] = (stored_data, stored_metadata)
+            return response
+
+        def get_object(self, **kwargs: object) -> dict[str, object]:
+            response = super().get_object(**kwargs)
+            if corruption == "version":
+                response["VersionId"] = "different-version"
+            return response
+
+    client = CorruptingPut()
+    store = S3ArtifactStore("artifacts", client=client, prefix="runs")
+
+    with pytest.raises(ArtifactIntegrityError):
+        store.put_bytes("run-1/model.json", data)
+
+
 @pytest.mark.parametrize(
     ("metadata", "expected_size", "expected_message"),
     [

@@ -44,6 +44,19 @@ class FakeS3:
         self.objects[key] = (bytes(kwargs["Body"]), dict(kwargs["Metadata"]))
         return {"VersionId": version_id, "ETag": '"etag"'}
 
+    def head_object(self, **kwargs: object) -> dict[str, object]:
+        version_id = str(kwargs["VersionId"])
+        data, metadata = self.objects[
+            (str(kwargs["Bucket"]), str(kwargs["Key"]), version_id)
+        ]
+        return {
+            "VersionId": version_id,
+            "ContentLength": len(data),
+            "Metadata": metadata,
+            "ContentType": "application/jsonl",
+            "ETag": '"etag"',
+        }
+
     def get_object(self, **kwargs: object) -> dict[str, object]:
         version_id = str(kwargs.get("VersionId", "v-1"))
         value, metadata = self.objects[(str(kwargs["Bucket"]), str(kwargs["Key"]), version_id)]

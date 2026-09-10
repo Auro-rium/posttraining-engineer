@@ -214,14 +214,22 @@ class S3ArtifactStore:
         if content_type:
             kwargs["ContentType"] = content_type
         response = self._client_or_create().put_object(**kwargs)
-        return ArtifactRef(
+        version_id = self._required_version(
+            response.get("VersionId"), context="uploaded artifact"
+        )
+        uploaded = ArtifactRef(
             bucket=self.bucket,
             key=kwargs["Key"],
             sha256=digest,
             size_bytes=len(data),
-            version_id=(str(response["VersionId"]) if response.get("VersionId") else None),
+            version_id=version_id,
             content_type=content_type,
             etag=(str(response["ETag"]) if response.get("ETag") else None),
+        )
+        return self.verify_immutable(
+            uploaded,
+            expected_sha256=digest,
+            expected_size_bytes=len(data),
         )
 
     def put_json(
@@ -457,16 +465,19 @@ class S3ArtifactStore:
                 "downloaded output archive size does not match expected size"
             )
         retained_key = f"{clean_prefix}/{digest}.tar.gz"
-        retained = self.put_bytes(
-            retained_key,
-            data,
-            content_type="application/gzip",
-            metadata={
-                "source-uri": output_uri,
-                "source-version-id": resolved_version,
-                "sha256": digest,
-            },
-        )
+        try:
+            retained = self.put_bytes(
+                retained_key,
+                data,
+                content_type="application/gzip",
+                metadata={
+                    "source-uri": output_uri,
+                    "source-version-id": resolved_version,
+                    "sha256": digest,
+                },
+            )
+        except ArtifactIntegrityError as exc:
+            raise ArtifactIntegrityError(f"retained artifact upload failed: {exc}") from exc
         self._required_version(retained.version_id, context="retained artifact")
         return self.verify_immutable(
             retained,
