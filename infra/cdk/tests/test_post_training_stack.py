@@ -30,12 +30,12 @@ def template(extra_context: dict[str, str] | None = None) -> Template:
     app = App(
         context=context
     )
-    PostTrainingStack(
+    stack = PostTrainingStack(
         app,
         "AutonomousPostTrainingStack",
         env=Environment(account="123456789012", region="us-east-1"),
     )
-    return Template.from_stack(app.node.find_child("AutonomousPostTrainingStack"))
+    return Template.from_stack(stack)
 
 
 def test_has_three_immutable_ecr_repositories() -> None:
@@ -101,6 +101,9 @@ def test_objective_service_is_internal_and_token_authenticated() -> None:
                 "arn:aws:acm:us-east-1:123456789012:certificate/"
                 "abcdef01-2345-6789-abcd-ef0123456789"
             ),
+            "objective_private_dns_name": "objective.internal.example.test",
+            "objective_private_hosted_zone_name": "internal.example.test",
+            "objective_certificate_san": "objective.internal.example.test",
         }
     )
     stack_template.resource_count_is("AWS::ECS::Service", 2)
@@ -282,6 +285,9 @@ def test_valid_certificate_can_supply_https_objective_endpoint() -> None:
                 "arn:aws:acm:us-east-1:123456789012:certificate/"
                 "abcdef01-2345-6789-abcd-ef0123456789"
             ),
+            "objective_private_dns_name": "objective.internal.example.test",
+            "objective_private_hosted_zone_name": "internal.example.test",
+            "objective_certificate_san": "objective.internal.example.test",
         }
     )
     listener = next(
@@ -294,6 +300,60 @@ def test_valid_certificate_can_supply_https_objective_endpoint() -> None:
     assert '"DNSName"' in serialized
 
 
+def test_certificate_only_objective_uses_private_alias_matching_certificate_san() -> None:
+    stack_template = template(
+        {
+            "objective_worker_url": "",
+            "objective_certificate_arn": (
+                "arn:aws:acm:us-east-1:123456789012:certificate/"
+                "abcdef01-2345-6789-abcd-ef0123456789"
+            ),
+            "objective_private_dns_name": "objective.internal.example.test",
+            "objective_private_hosted_zone_name": "internal.example.test",
+            "objective_certificate_san": "objective.internal.example.test",
+        }
+    )
+    zones = stack_template.find_resources("AWS::Route53::HostedZone")
+    assert len(zones) == 1
+    assert next(iter(zones.values()))["Properties"]["Name"] == "internal.example.test."
+    records = stack_template.find_resources("AWS::Route53::RecordSet")
+    assert len(records) == 1
+    record = next(iter(records.values()))["Properties"]
+    assert record["Name"] == "objective.internal.example.test."
+    assert record["Type"] == "A"
+    coordinator = next(
+        value
+        for value in stack_template.find_resources("AWS::ECS::TaskDefinition").values()
+        if any(
+            container.get("Name") == "Backend"
+            for container in value["Properties"]["ContainerDefinitions"]
+        )
+    )
+    environment = {
+        item["Name"]: item["Value"] for item in coordinator["Properties"]["ContainerDefinitions"][0]["Environment"]
+    }
+    assert environment["OBJECTIVE_WORKER_URL"] == "https://objective.internal.example.test"
+
+
+def test_certificate_only_objective_fails_closed_on_missing_or_mismatched_dns_contract() -> None:
+    certificate = (
+        "arn:aws:acm:us-east-1:123456789012:certificate/"
+        "abcdef01-2345-6789-abcd-ef0123456789"
+    )
+    with pytest.raises(ValueError, match="objective_private_dns_name"):
+        template({"objective_worker_url": "", "objective_certificate_arn": certificate})
+    with pytest.raises(ValueError, match="must match objective_certificate_san"):
+        template(
+            {
+                "objective_worker_url": "",
+                "objective_certificate_arn": certificate,
+                "objective_private_dns_name": "objective.internal.example.test",
+                "objective_private_hosted_zone_name": "internal.example.test",
+                "objective_certificate_san": "other.internal.example.test",
+            }
+        )
+
+
 def test_objective_role_can_read_write_versioned_encrypted_artifacts() -> None:
     stack_template = template(
         {
@@ -302,6 +362,9 @@ def test_objective_role_can_read_write_versioned_encrypted_artifacts() -> None:
                 "arn:aws:acm:us-east-1:123456789012:certificate/"
                 "abcdef01-2345-6789-abcd-ef0123456789"
             ),
+            "objective_private_dns_name": "objective.internal.example.test",
+            "objective_private_hosted_zone_name": "internal.example.test",
+            "objective_certificate_san": "objective.internal.example.test",
         }
     )
     policies = stack_template.find_resources("AWS::IAM::Policy")
@@ -339,6 +402,31 @@ def test_objective_role_can_read_write_versioned_encrypted_artifacts() -> None:
     assert all("s3:DeleteObject" not in json.dumps(statement) for statement in statements)
 
 
+def test_task_role_has_only_scoped_readonly_preflight_permissions() -> None:
+    policies = template().find_resources("AWS::IAM::Policy")
+    coordinator_policy = next(
+        item
+        for key, item in policies.items()
+        if key.startswith("TaskRoleDefaultPolicy")
+    )
+    statements = coordinator_policy["Properties"]["PolicyDocument"]["Statement"]
+    by_sid = {statement["Sid"]: statement for statement in statements if "Sid" in statement}
+    assert set(by_sid["ReadOnlyPreflightS3"]["Action"]) == {
+        "s3:GetBucketLocation",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketVersioning",
+    }
+    assert by_sid["ReadOnlyPreflightIam"]["Action"] == "iam:GetRole"
+    assert by_sid["ReadOnlyPreflightEcr"]["Action"] == "ecr:DescribeImages"
+    assert by_sid["ReadOnlyPreflightServiceQuota"]["Action"] == "servicequotas:GetServiceQuota"
+    assert by_sid["ReadOnlyPreflightServiceQuota"]["Resource"] == "*"
+    assert by_sid["ReadOnlyPreflightS3"]["Resource"]["Fn::GetAtt"][1] == "Arn"
+    assert by_sid["ReadOnlyPreflightIam"]["Resource"]["Fn::GetAtt"][1] == "Arn"
+    ecr_resources = by_sid["ReadOnlyPreflightEcr"]["Resource"]
+    assert len(ecr_resources) == 2
+    assert all(resource["Fn::GetAtt"][1] == "Arn" for resource in ecr_resources)
+
+
 def test_configured_s3_inputs_must_match_named_bucket_and_prefix() -> None:
     with pytest.raises(ValueError, match="training_input_s3_uri"):
         template(
@@ -357,6 +445,9 @@ def test_task_roles_do_not_read_runtime_secrets() -> None:
                 "arn:aws:acm:us-east-1:123456789012:certificate/"
                 "abcdef01-2345-6789-abcd-ef0123456789"
             ),
+            "objective_private_dns_name": "objective.internal.example.test",
+            "objective_private_hosted_zone_name": "internal.example.test",
+            "objective_certificate_san": "objective.internal.example.test",
         }
     ).find_resources("AWS::IAM::Policy")
     coordinator_policy = next(

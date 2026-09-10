@@ -22,6 +22,8 @@ from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_logs as logs
+from aws_cdk import aws_route53 as route53
+from aws_cdk import aws_route53_targets as route53_targets
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_secretsmanager as secretsmanager
 from constructs import Construct
@@ -110,7 +112,50 @@ class PostTrainingStack(Stack):
         ):
             raise ValueError("objective_certificate_arn must be a valid ACM certificate ARN")
 
-    def __init__(self, scope: Construct, construct_id: str, **kwargs: object) -> None:
+    def _private_dns_contract(self) -> tuple[str, str]:
+        """Validate the private DNS and certificate SAN contract.
+
+        ACM certificates are imported by ARN and their SANs are not available
+        to CloudFormation at synth time.  The configured SAN is therefore an
+        explicit deployment contract: the operator must provide the exact
+        private hostname (or a single-label wildcard that covers it).  The
+        Route 53 zone is created in this stack and attached to the runtime VPC,
+        so the coordinator never receives the ALB-generated AWS hostname.
+        """
+
+        hostname = self._text("objective_private_dns_name").strip().rstrip(".").lower()
+        zone_name = self._text("objective_private_hosted_zone_name").strip().rstrip(".").lower()
+        certificate_san = self._text("objective_certificate_san").strip().rstrip(".").lower()
+        label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        hostname_pattern = re.compile(rf"^(?:{label})(?:\.(?:{label})){{0,126}}$")
+        for name, value in (
+            ("objective_private_dns_name", hostname),
+            ("objective_private_hosted_zone_name", zone_name),
+        ):
+            if not value or not hostname_pattern.fullmatch(value):
+                raise ValueError(f"{name} must be a valid private DNS hostname")
+        san_to_validate = certificate_san.removeprefix("*.")
+        if not certificate_san or not hostname_pattern.fullmatch(san_to_validate):
+            raise ValueError("objective_certificate_san must be a valid DNS SAN")
+        if hostname != zone_name and not hostname.endswith("." + zone_name):
+            raise ValueError(
+                "objective_private_dns_name must be within objective_private_hosted_zone_name"
+            )
+        if certificate_san.startswith("*."):
+            wildcard_suffix = certificate_san[2:]
+            wildcard_matches = (
+                hostname.endswith("." + wildcard_suffix)
+                and hostname.count(".") == wildcard_suffix.count(".") + 1
+            )
+        else:
+            wildcard_matches = hostname == certificate_san
+        if not wildcard_matches:
+            raise ValueError(
+                "objective_private_dns_name must match objective_certificate_san"
+            )
+        return hostname, zone_name
+
+    def __init__(self, scope: Construct, construct_id: str, **kwargs: Any) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         prefix = self._text("artifact_prefix", "post-training").strip("/") or "post-training"
@@ -334,6 +379,43 @@ class PostTrainingStack(Stack):
                 conditions={"StringEquals": {"iam:PassedToService": "sagemaker.amazonaws.com"}},
             )
         )
+        # These are the coordinator's bounded, read-only readiness probes.
+        # Keep each resource set narrow: the S3 bucket, the SageMaker role,
+        # and only the two worker repositories created above.  Service Quotas
+        # does not support resource-level authorization, so that one action
+        # necessarily uses the documented wildcard resource.
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadOnlyPreflightS3",
+                actions=[
+                    "s3:GetBucketLocation",
+                    "s3:GetEncryptionConfiguration",
+                    "s3:GetBucketVersioning",
+                ],
+                resources=[artifacts.bucket_arn],
+            )
+        )
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadOnlyPreflightIam",
+                actions=["iam:GetRole"],
+                resources=[training_role.role_arn],
+            )
+        )
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadOnlyPreflightEcr",
+                actions=["ecr:DescribeImages"],
+                resources=[trainer_repository.repository_arn, evaluator_repository.repository_arn],
+            )
+        )
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadOnlyPreflightServiceQuota",
+                actions=["servicequotas:GetServiceQuota"],
+                resources=["*"],
+            )
+        )
 
         objective_role = (
             iam.Role(
@@ -400,6 +482,14 @@ class PostTrainingStack(Stack):
 
         objective_service: ecs_patterns.ApplicationLoadBalancedFargateService | None = None
         if internal_objective:
+            private_dns_name, private_zone_name = self._private_dns_contract()
+            private_zone = route53.PrivateHostedZone(
+                self,
+                "ObjectivePrivateHostedZone",
+                zone_name=private_zone_name,
+                vpc=vpc,
+                comment="Private TLS hostname for the objective worker",
+            )
             # Certificate-only mode is the private, in-stack objective
             # deployment. It is always TLS; there is no HTTP fallback.
             objective_execution_role = iam.Role(
@@ -468,11 +558,19 @@ class PostTrainingStack(Stack):
                 ec2.Port.tcp(8080),
                 "Allow the internal load balancer to reach the objective worker",
             )
-            # The DNS name is a CloudFormation token and resolves to the real
-            # private ALB endpoint after the stack is created.
-            objective_worker_url = (
-                "https://" + objective_service.load_balancer.load_balancer_dns_name
+            route53.ARecord(
+                self,
+                "ObjectivePrivateAlias",
+                zone=private_zone,
+                record_name=private_dns_name,
+                target=route53.RecordTarget.from_alias(
+                    route53_targets.LoadBalancerTarget(objective_service.load_balancer)
+                ),
             )
+            # The coordinator uses the certificate SAN, which is also bound to
+            # the private alias above.  Never use the ALB-generated DNS name:
+            # it is not covered by the configured certificate.
+            objective_worker_url = "https://" + private_dns_name
         coordinator_security_group = ec2.SecurityGroup(
             self,
             "CoordinatorSecurityGroup",

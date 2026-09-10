@@ -23,3 +23,11 @@ cdk deploy -c image_tag=latest \
 The stack is infrastructure only. The application still requires the durable
 DynamoDB/S3/provider orchestration path to be wired before a live training or
 promotion result can be claimed. Local fixtures remain `EXPLANATION` evidence.
+
+An external objective worker must be configured with an explicit HTTPS
+`objective_worker_url`. For an in-stack private objective worker, supply
+`objective_certificate_arn`, `objective_private_dns_name`,
+`objective_private_hosted_zone_name`, and `objective_certificate_san` together.
+The stack creates a private Route 53 zone and ALB alias for that hostname and
+fails closed unless the configured certificate SAN covers it; the ALB-generated
+AWS DNS name is never used for coordinator TLS.
