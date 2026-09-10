@@ -10,11 +10,13 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
+from urllib.parse import parse_qs, urlparse
 
 
 class OptionalDependencyError(RuntimeError):
@@ -93,6 +95,12 @@ class EvaluationJobRequest:
     output_s3_uri: str
     instance_type: str
     model_s3_uri: str | None = None
+    # ProcessingInput names become SM_CHANNEL_* variables in the evaluator.
+    # Keep the legacy fields as aliases while allowing the live path to state
+    # all three independently and bind each to one exact S3 reference.
+    candidate_s3_uri: str | None = None
+    champion_s3_uri: str | None = None
+    sealed_s3_uri: str | None = None
     instance_count: int = 1
     volume_size_gb: int = 30
     max_runtime_seconds: int = 3600
@@ -208,6 +216,9 @@ def request_fingerprint(request: TrainingJobRequest | EvaluationJobRequest) -> s
             "output_s3_uri": request.output_s3_uri,
             "instance_type": request.instance_type,
             "model_s3_uri": request.model_s3_uri,
+            "candidate_s3_uri": request.candidate_s3_uri,
+            "champion_s3_uri": request.champion_s3_uri,
+            "sealed_s3_uri": request.sealed_s3_uri,
             "instance_count": request.instance_count,
             "volume_size_gb": request.volume_size_gb,
             "max_runtime_seconds": request.max_runtime_seconds,
@@ -366,15 +377,98 @@ def _safe_raw_response(
         safe[status_key] = status.value
     if "FailureReason" in response:
         safe["FailureReason"] = _safe_failure_reason(response.get("FailureReason"))
+    # Keep known billing/timing metadata under stable, metadata-only keys.
+    # Reject malformed values instead of silently accounting a terminal job as
+    # zero cost in the supervisor budget ledger.
+    cost_value: object = None
+    for key in (
+        "actual_cost_usd",
+        "ActualCostUsd",
+        "ActualCostUSD",
+        "cost_usd",
+        "CostUsd",
+        "CostUSD",
+        "cost",
+        "Cost",
+    ):
+        if key in response:
+            cost_value = response[key]
+            break
+    if cost_value is not None:
+        if (
+            isinstance(cost_value, bool)
+            or not isinstance(cost_value, (int, float))
+            or not math.isfinite(float(cost_value))
+            or float(cost_value) < 0
+        ):
+            raise ProviderResponseError("SageMaker response contained invalid cost metadata")
+        safe["actual_cost_usd"] = float(cost_value)
+    for key in (
+        "BillableTimeInSeconds",
+        "TrainingTimeInSeconds",
+        "ProcessingTimeInSeconds",
+    ):
+        if key in response:
+            value = response[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ProviderResponseError("SageMaker response contained invalid timing metadata")
+            safe[key] = float(value)
+    for key in (
+        "TrainingStartTime",
+        "TrainingEndTime",
+        "ProcessingStartTime",
+        "ProcessingEndTime",
+    ):
+        if key in response:
+            value = response[key]
+            isoformat = getattr(value, "isoformat", None)
+            if callable(isoformat):
+                value = isoformat()
+            if isinstance(value, str) and value.strip():
+                safe[key] = value[:128]
     return safe
 
 
 def _validate_artifact_uri(value: object) -> str:
-    if not isinstance(value, str) or not value.startswith("s3://"):
+    if not isinstance(value, str):
         raise ProviderResponseError("SageMaker response contained an invalid artifact URI")
-    if len(value) > 2_048 or any(character.isspace() or ord(character) < 32 for character in value):
+    parsed = urlparse(value)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+        raise ProviderResponseError("SageMaker response contained an invalid artifact URI")
+    if (
+        len(value) > 2_048
+        or any(character.isspace() or ord(character) < 32 for character in value)
+        or parsed.fragment
+    ):
+        raise ProviderResponseError("SageMaker response contained an invalid artifact URI")
+    versions = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
+    if len(versions) > 1 or (versions and not versions[0].strip()):
         raise ProviderResponseError("SageMaker response contained an invalid artifact URI")
     return value
+
+
+def _validate_input_uri(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be an S3 URI")
+    parsed = urlparse(value)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+        raise ValueError(f"{name} must be a non-empty S3 URI")
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise ValueError(f"{name} must be a valid S3 URI")
+    return value
+
+
+def _validate_versioned_input_uri(value: object, name: str) -> str:
+    uri = _validate_input_uri(value, name)
+    versions = parse_qs(urlparse(uri).query, keep_blank_values=True).get("versionId", [])
+    if len(versions) != 1 or not versions[0].strip() or versions[0].lower() == "null":
+        raise ValueError(f"{name} must contain exactly one immutable VersionId")
+    return uri
 
 
 def _status(value: object) -> JobStatus:
@@ -426,6 +520,8 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         ):
             _require(value, name)
         _validate_job_name(request.job_name)
+        _validate_input_uri(request.input_s3_uri, "input_s3_uri")
+        _validate_input_uri(request.output_s3_uri, "output_s3_uri")
         if (
             request.instance_count < 1
             or request.volume_size_gb < 1
@@ -445,8 +541,17 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         ):
             _require(value, name)
         _validate_job_name(request.job_name)
+        _validate_input_uri(request.input_s3_uri, "input_s3_uri")
+        _validate_input_uri(request.output_s3_uri, "output_s3_uri")
         if request.model_s3_uri is not None:
             _require(request.model_s3_uri, "model_s3_uri")
+            _validate_input_uri(request.model_s3_uri, "model_s3_uri")
+        if request.candidate_s3_uri is not None:
+            _validate_versioned_input_uri(request.candidate_s3_uri, "candidate_s3_uri")
+        if request.champion_s3_uri is not None:
+            _validate_versioned_input_uri(request.champion_s3_uri, "champion_s3_uri")
+        if request.sealed_s3_uri is not None:
+            _validate_input_uri(request.sealed_s3_uri, "sealed_s3_uri")
         if (
             request.instance_count < 1
             or request.volume_size_gb < 1
@@ -563,7 +668,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         artifact_uri: str | None = None
         if kind == "training":
             model_artifacts = response.get("ModelArtifacts")
-            if isinstance(model_artifacts, Mapping) and model_artifacts.get("S3ModelArtifacts"):
+            if isinstance(model_artifacts, Mapping) and "S3ModelArtifacts" in model_artifacts:
                 artifact_uri = _validate_artifact_uri(model_artifacts["S3ModelArtifacts"])
         else:
             outputs = response.get("ProcessingOutputConfig")
@@ -571,7 +676,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                 listed = outputs.get("Outputs", [])
                 if isinstance(listed, list) and listed and isinstance(listed[0], Mapping):
                     s3_output = listed[0].get("S3Output")
-                    if isinstance(s3_output, Mapping) and s3_output.get("S3Uri"):
+                    if isinstance(s3_output, Mapping) and "S3Uri" in s3_output:
                         artifact_uri = _validate_artifact_uri(s3_output["S3Uri"])
         failure_reason = None
         if status in {JobStatus.FAILED, JobStatus.STOPPED}:
@@ -670,7 +775,8 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                 },
                 InputDataConfig=[
                     {
-                        "ChannelName": "training",
+                        # The trainer accepts exactly SM_CHANNEL_TRAIN.
+                        "ChannelName": "train",
                         "DataSource": {
                             "S3DataSource": {
                                 "S3DataType": "S3Prefix",
@@ -748,34 +854,48 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         reconciled = self.reconcile_evaluation(request)
         if reconciled is not None:
             return reconciled
-        app_spec: dict[str, Any] = {"ImageUri": request.image_uri}
-        if request.command:
-            app_spec["ContainerEntrypoint"] = request.command
+        # Processing input names become SM_CHANNEL_* variables.  The
+        # evaluator rejects every name except candidate/champion/sealed.
+        candidate_uri = request.candidate_s3_uri or request.model_s3_uri or request.input_s3_uri
+        sealed_uri = request.sealed_s3_uri or request.input_s3_uri
+        input_specs: list[tuple[str, str, str]] = [
+            ("candidate", candidate_uri, "/opt/ml/processing/input/candidate"),
+            ("sealed", sealed_uri, "/opt/ml/processing/input/sealed"),
+        ]
+        if request.champion_s3_uri:
+            input_specs.insert(
+                1,
+                ("champion", request.champion_s3_uri, "/opt/ml/processing/input/champion"),
+            )
         processing_inputs = [
             {
-                "InputName": "evaluation",
+                "InputName": input_name,
                 "S3Input": {
-                    "S3Uri": request.input_s3_uri,
-                    "LocalPath": "/opt/ml/processing/input",
+                    # Keep a versioned checkpoint reference intact.  The
+                    # evaluator entrypoint extracts the resulting tar.gz into
+                    # this worker-required directory before parsing it.
+                    "S3Uri": uri,
+                    "LocalPath": local_path,
                     "S3DataType": "S3Prefix",
                     "S3InputMode": "File",
                     "S3CompressionType": "None",
                 },
             }
+            for input_name, uri, local_path in input_specs
         ]
-        if request.model_s3_uri:
-            processing_inputs.append(
-                {
-                    "InputName": "model",
-                    "S3Input": {
-                        "S3Uri": request.model_s3_uri,
-                        "LocalPath": "/opt/ml/processing/model",
-                        "S3DataType": "S3Prefix",
-                        "S3InputMode": "File",
-                        "S3CompressionType": "None",
-                    },
-                }
-            )
+        app_spec: dict[str, Any] = {"ImageUri": request.image_uri}
+        app_spec["ContainerEntrypoint"] = request.command or [
+            "python",
+            "-c",
+            (
+                "import pathlib,runpy,tarfile; "
+                "[tarfile.open(str(a), 'r:*').extractall(str(root), filter='data') "
+                "for root in (pathlib.Path('/opt/ml/processing/input/candidate'), "
+                "pathlib.Path('/opt/ml/processing/input/champion')) if root.is_dir() "
+                "for a in root.rglob('*.tar.gz')]; "
+                "runpy.run_path('/opt/ml/code/evaluate.py', run_name='__main__')"
+            ),
+        ]
         tags = [
             tag
             for tag in request.tags

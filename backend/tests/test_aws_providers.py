@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import ClassVar, cast
 
 import pytest
@@ -21,9 +22,12 @@ from app.providers.repository import (
 )
 from app.providers.sagemaker import (
     EvaluationJobRequest,
+    ProviderResponseError,
     SageMakerProvider,
     TrainingJobRequest,
 )
+from workers.evaluator.evaluate import parse_evaluation_inputs
+from workers.trainer.train import parse_training_inputs
 
 
 class FakeBody:
@@ -512,3 +516,167 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
     assert client.calls[0][1]["HyperParameters"] == {"epochs": "1"}
     training_tags = cast(list[dict[str, str]], client.calls[0][1]["Tags"])
     assert training_tags[-1]["Key"] == "request-fingerprint"
+
+
+def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
+    tmp_path: Path,
+) -> None:
+    """Native SageMaker channel/env payloads must boot both audited workers."""
+
+    class _NotFound(Exception):
+        def __init__(self, name: object) -> None:
+            super().__init__(str(name))
+            self.response = {
+                "Error": {"Code": "ResourceNotFoundException", "Message": "not found"}
+            }
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def describe_training_job(self, **kwargs: object) -> dict[str, object]:
+            raise _NotFound(kwargs["TrainingJobName"])
+
+        def describe_processing_job(self, **kwargs: object) -> dict[str, object]:
+            raise _NotFound(kwargs["ProcessingJobName"])
+
+        def create_training_job(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append(("training", kwargs))
+            return {"TrainingJobArn": "arn:aws:sagemaker:us-east-1:123:training-job/train"}
+
+        def create_processing_job(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append(("evaluation", kwargs))
+            return {
+                "ProcessingJobArn": "arn:aws:sagemaker:us-east-1:123:processing-job/eval"
+            }
+
+    client = _Client()
+    provider = SageMakerProvider(client=client)
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    model_dir = tmp_path / "model"
+    training_environment = {
+        "RUN_ID": "run-1",
+        "EXPERIMENT_ID": "exp-1",
+        "DATASET_ID": "dataset-1",
+        "DATASET_SHA256": "a" * 64,
+        "BASE_MODEL_ID": "google/functiongemma-270m-it",
+        "BASE_MODEL_REVISION": "b" * 40,
+        "SM_MODEL_DIR": str(model_dir),
+    }
+    provider.submit_training(
+        TrainingJobRequest(
+            job_name="train-contract",
+            role_arn="arn:role",
+            image_uri="123.dkr.ecr/train@sha256:" + "c" * 64,
+            input_s3_uri="s3://bucket/dataset/run-1?versionId=dataset-v1",
+            output_s3_uri="s3://bucket/output/run-1",
+            instance_type="ml.g5.xlarge",
+            environment=training_environment,
+        )
+    )
+    training_payload = client.calls[0][1]
+    assert training_payload["InputDataConfig"][0]["ChannelName"] == "train"
+    parser_environment = dict(training_payload["Environment"])
+    parser_environment["SM_CHANNEL_TRAIN"] = str(train_dir)
+    parsed_training = parse_training_inputs(parser_environment)
+    assert parsed_training.dataset_id == "dataset-1"
+    assert parsed_training.base_model_revision == "b" * 40
+
+    candidate_uri = "s3://bucket/checkpoints/candidate.tar.gz?versionId=candidate-v1"
+    champion_uri = "s3://bucket/checkpoints/champion.tar.gz?versionId=champion-v1"
+    sealed_uri = "s3://bucket/evaluation/sealed?versionId=sealed-v1"
+    sealed_dir = tmp_path / "sealed"
+    sealed_dir.mkdir()
+    evaluation_environment = {
+        "RUN_ID": "run-1",
+        "EXPERIMENT_ID": "exp-1",
+        "EVALUATION_MANIFEST_SHA256": "d" * 64,
+        "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+        "OBJECTIVE_SEED": "7",
+        "SM_OUTPUT_DATA_DIR": str(tmp_path / "evaluation-output"),
+    }
+    provider.submit_evaluation(
+        EvaluationJobRequest(
+            job_name="eval-contract",
+            role_arn="arn:role",
+            image_uri="123.dkr.ecr/eval@sha256:" + "e" * 64,
+            input_s3_uri=sealed_uri,
+            sealed_s3_uri=sealed_uri,
+            candidate_s3_uri=candidate_uri,
+            champion_s3_uri=champion_uri,
+            output_s3_uri="s3://bucket/evaluation/output",
+            instance_type="ml.g5.xlarge",
+            environment=evaluation_environment,
+        )
+    )
+    evaluation_payload = client.calls[1][1]
+    input_names = {
+        item["InputName"]: item for item in evaluation_payload["ProcessingInputs"]
+    }
+    assert set(input_names) == {"candidate", "champion", "sealed"}
+    assert input_names["candidate"]["S3Input"]["S3Uri"] == candidate_uri
+    assert input_names["champion"]["S3Input"]["S3Uri"] == champion_uri
+    assert input_names["sealed"]["S3Input"]["S3Uri"] == sealed_uri
+    entrypoint = evaluation_payload["AppSpecification"]["ContainerEntrypoint"]
+    assert entrypoint[:2] == ["python", "-c"]
+    assert "extractall" in entrypoint[2]
+    assert "evaluate.py" in entrypoint[2]
+    evaluator_environment = dict(evaluation_payload["Environment"])
+    for name, item in input_names.items():
+        native_path = Path(item["S3Input"]["LocalPath"])
+        assert native_path == Path(f"/opt/ml/processing/input/{name}")
+        parser_path = tmp_path / name
+        parser_path.mkdir(parents=True, exist_ok=True)
+        evaluator_environment[f"SM_CHANNEL_{name.upper()}"] = str(parser_path)
+    parsed_evaluation = parse_evaluation_inputs(evaluator_environment)
+    assert parsed_evaluation.candidate_dir == (tmp_path / "candidate").resolve()
+    assert parsed_evaluation.champion_dir == (tmp_path / "champion").resolve()
+    assert parsed_evaluation.sealed_dir == (tmp_path / "sealed").resolve()
+
+
+def test_sagemaker_terminal_result_preserves_actual_cost_and_billable_time() -> None:
+    class _Client:
+        def describe_training_job(self, **kwargs: object) -> dict[str, object]:
+            return {
+                "TrainingJobName": kwargs["TrainingJobName"],
+                "TrainingJobArn": "arn:aws:sagemaker:us-east-1:123:training-job/train",
+                "TrainingJobStatus": "Completed",
+                "ActualCostUsd": 1.25,
+                "BillableTimeInSeconds": 600,
+            }
+
+    result = SageMakerProvider(client=_Client()).get_training_status("train-cost")
+
+    assert result.raw_response["actual_cost_usd"] == pytest.approx(1.25)
+    assert result.raw_response["BillableTimeInSeconds"] == 600
+
+
+def test_sagemaker_rejects_empty_s3_artifact_uri() -> None:
+    class _Client:
+        def describe_training_job(self, **kwargs: object) -> dict[str, object]:
+            return {
+                "TrainingJobName": kwargs["TrainingJobName"],
+                "TrainingJobArn": "arn:aws:sagemaker:us-east-1:123:training-job/train",
+                "TrainingJobStatus": "Completed",
+                "ModelArtifacts": {"S3ModelArtifacts": "s3://"},
+            }
+
+    with pytest.raises(ProviderResponseError, match="invalid artifact URI"):
+        SageMakerProvider(client=_Client()).get_training_status("train-empty-artifact")
+
+
+def test_sagemaker_rejects_empty_processing_output_uri() -> None:
+    class _Client:
+        def describe_processing_job(self, **kwargs: object) -> dict[str, object]:
+            return {
+                "ProcessingJobName": kwargs["ProcessingJobName"],
+                "ProcessingJobArn": "arn:aws:sagemaker:us-east-1:123:processing-job/eval",
+                "ProcessingJobStatus": "Completed",
+                "ProcessingOutputConfig": {
+                    "Outputs": [{"S3Output": {"S3Uri": "s3://"}}]
+                },
+            }
+
+    with pytest.raises(ProviderResponseError, match="invalid artifact URI"):
+        SageMakerProvider(client=_Client()).get_evaluation_status("eval-empty-artifact")
