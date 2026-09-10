@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import stat
 import struct
 import tarfile
 from collections.abc import Mapping
@@ -198,55 +199,120 @@ def validate_immutable_revision(revision: str) -> str:
     return revision
 
 
-def _relative_files(root: Path) -> list[Path]:
-    if root.is_symlink():
-        raise CheckpointStagingError(f"checkpoint root must not be a symlink: {root}")
-    if not root.exists() or not root.is_dir():
-        raise CheckpointStagingError(f"checkpoint directory does not exist: {root}")
-    paths: list[Path] = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        relative = path.relative_to(root)
-        parts = tuple(part.lower() for part in relative.parts)
-        name = path.name.lower()
-        if path.is_symlink():
-            raise CheckpointStagingError(f"checkpoint contains unsupported symlink: {relative}")
-        if name in _GATE_MARKERS or "gated" in name:
-            raise CheckpointStagingError(f"checkpoint is gated: {relative}")
-        if (
-            name.endswith((".lock", ".incomplete", ".part"))
-            or name.startswith("lock")
-            or "incomplete" in name
-        ):
-            raise CheckpointStagingError(
-                f"checkpoint contains cache lock/partial input: {relative}"
-            )
-        if any(part in _CACHE_COMPONENTS for part in parts):
-            if "refs" in parts:
-                raise CheckpointStagingError(
-                    f"checkpoint contains mutable cache reference: {relative}"
-                )
-            raise CheckpointStagingError(f"checkpoint contains mutable cache artifact: {relative}")
-        if any(part in {".locks", "locks"} or part.startswith(".lock") for part in parts):
-            raise CheckpointStagingError(f"checkpoint contains cache lock directory: {relative}")
-        if path.is_file():
-            paths.append(path)
-        elif not path.is_dir():
-            raise CheckpointStagingError(f"checkpoint contains unsupported file type: {relative}")
-    return paths
+def _directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def _read_regular_file(path: Path) -> bytes:
-    """Read one regular file without following a symlink introduced in a race."""
+def _open_directory(path: str | Path, *, dir_fd: int | None = None) -> int:
+    """Open one directory component without following a symlink."""
 
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        return os.open(path, _directory_flags(), dir_fd=dir_fd)
+    except OSError as exc:
+        raise CheckpointStagingError(f"could not open checkpoint directory: {path}") from exc
+
+
+def _read_regular_file(path: Path, *, dir_fd: int | None = None) -> bytes:
+    """Read a regular file, optionally anchored to its already-open parent directory."""
+
+    open_path: str | Path = path.name if dir_fd is not None else path
+    try:
+        fd = os.open(open_path, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
     except OSError as exc:
         raise CheckpointStagingError(f"could not read checkpoint file: {path}") from exc
     try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise CheckpointStagingError(f"checkpoint file is not regular: {path}")
         with os.fdopen(fd, "rb") as stream:
-            return stream.read()
+            data = stream.read()
+            after = os.fstat(stream.fileno())
+        if before.st_size != after.st_size:
+            raise CheckpointStagingError(f"checkpoint file changed while reading: {path}")
+        return data
+    except CheckpointStagingError:
+        raise
     except OSError as exc:
         raise CheckpointStagingError(f"could not read checkpoint file: {path}") from exc
+
+
+def _read_checkpoint_files(root: Path, root_fd: int) -> dict[str, bytes]:
+    """Walk and read a checkpoint through directory FDs anchored at ``root_fd``.
+
+    Every descendant directory is opened relative to its parent FD with
+    ``O_DIRECTORY|O_NOFOLLOW``. File reads likewise use ``openat`` against the
+    parent FD, so replacing the user-supplied root pathname cannot redirect a
+    later read to a different tree.
+    """
+
+    contents: dict[str, bytes] = {}
+
+    def walk(directory_fd: int, components: tuple[str, ...]) -> None:
+        try:
+            with os.scandir(directory_fd) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            relative = "/".join(components) or "."
+            raise CheckpointStagingError(
+                f"could not enumerate checkpoint directory: {relative}"
+            ) from exc
+
+        for entry in entries:
+            relative_parts = (*components, entry.name)
+            relative = PurePosixPath(*relative_parts).as_posix()
+            lowered_parts = tuple(part.lower() for part in relative_parts)
+            name = entry.name.lower()
+            if entry.is_symlink():
+                raise CheckpointStagingError(
+                    f"checkpoint contains unsupported symlink: {relative}"
+                )
+            if name in _GATE_MARKERS or "gated" in name:
+                raise CheckpointStagingError(f"checkpoint is gated: {relative}")
+            if (
+                name.endswith((".lock", ".incomplete", ".part"))
+                or name.startswith("lock")
+                or "incomplete" in name
+            ):
+                raise CheckpointStagingError(
+                    f"checkpoint contains cache lock/partial input: {relative}"
+                )
+            if any(part in _CACHE_COMPONENTS for part in lowered_parts):
+                if "refs" in lowered_parts:
+                    raise CheckpointStagingError(
+                        f"checkpoint contains mutable cache reference: {relative}"
+                    )
+                raise CheckpointStagingError(
+                    f"checkpoint contains mutable cache artifact: {relative}"
+                )
+            if any(
+                part in {".locks", "locks"} or part.startswith(".lock")
+                for part in lowered_parts
+            ):
+                raise CheckpointStagingError(
+                    f"checkpoint contains cache lock directory: {relative}"
+                )
+
+            path = root.joinpath(*relative_parts)
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise CheckpointStagingError(
+                    f"could not inspect checkpoint entry: {relative}"
+                ) from exc
+            if stat.S_ISREG(entry_stat.st_mode):
+                contents[relative] = _read_regular_file(path, dir_fd=directory_fd)
+                continue
+            if stat.S_ISDIR(entry_stat.st_mode):
+                child_fd = _open_directory(entry.name, dir_fd=directory_fd)
+                try:
+                    walk(child_fd, relative_parts)
+                finally:
+                    os.close(child_fd)
+                continue
+            raise CheckpointStagingError(f"checkpoint contains unsupported file type: {relative}")
+
+    walk(root_fd, ())
+    return contents
 
 
 def _truthy_restricted_flag(value: object) -> bool:
@@ -691,10 +757,13 @@ def _checkpoint_snapshot(
         )
     validate_immutable_revision(revision)
     root = Path(checkpoint_dir).expanduser()
-    paths = _relative_files(root)
-    contents = {
-        path.relative_to(root).as_posix(): _read_regular_file(path) for path in paths
-    }
+    if root.is_symlink():
+        raise CheckpointStagingError(f"checkpoint root must not be a symlink: {root}")
+    root_fd = _open_directory(root)
+    try:
+        contents = _read_checkpoint_files(root, root_fd)
+    finally:
+        os.close(root_fd)
     if not contents:
         raise CheckpointStagingError("checkpoint directory is empty")
     _reject_gated_metadata(contents, revision=revision, model_id=model_id)

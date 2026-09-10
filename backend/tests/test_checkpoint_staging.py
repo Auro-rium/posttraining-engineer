@@ -289,8 +289,8 @@ def test_bundle_uses_the_same_bytes_as_validation_and_provenance(
     original_weight = (checkpoint / "model.safetensors").read_bytes()
     changed_weight = _safetensors("changed")
 
-    def mutate_after_read(path: Path) -> bytes:
-        data = original(path)
+    def mutate_after_read(path: Path, **kwargs: object) -> bytes:
+        data = original(path, **kwargs)
         if path.name == "model.safetensors":
             path.write_bytes(changed_weight)
         return data
@@ -306,6 +306,38 @@ def test_bundle_uses_the_same_bytes_as_validation_and_provenance(
         member = archive.extractfile("model.safetensors")
         assert member is not None
         assert member.read() == original_weight
+
+
+def test_bundle_snapshot_does_not_follow_a_replaced_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    outside = _checkpoint(tmp_path / "outside")
+    original_weight = (checkpoint / "model.safetensors").read_bytes()
+    outside_weight = _safetensors("outside")
+    (outside / "model.safetensors").write_bytes(outside_weight)
+    original = staging._read_regular_file
+    replaced = False
+
+    def replace_root_after_first_read(path: Path, **kwargs: object) -> bytes:
+        nonlocal replaced
+        data = original(path, **kwargs)
+        if not replaced:
+            checkpoint.rename(tmp_path / "original-checkpoint")
+            checkpoint.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return data
+
+    monkeypatch.setattr(staging, "_read_regular_file", replace_root_after_first_read)
+    bundle = build_deterministic_bundle(checkpoint, revision=REVISION)
+
+    with staging.tarfile.open(
+        fileobj=io.BytesIO(staging.gzip.decompress(bundle.data)), mode="r:"
+    ) as archive:
+        member = archive.extractfile("model.safetensors")
+        assert member is not None
+        assert member.read() == original_weight
+    assert outside_weight != original_weight
 
 
 @pytest.mark.parametrize("filename", ["metadata.json", "report.json", "manifest.json"])
