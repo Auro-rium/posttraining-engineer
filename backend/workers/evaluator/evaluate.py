@@ -198,7 +198,12 @@ def _artifact_digest(files: Sequence[Mapping[str, Any]]) -> str:
     ).hexdigest()
 
 
-def verify_checkpoint_artifact(checkpoint_dir: Path) -> Mapping[str, Any]:
+def verify_checkpoint_artifact(
+    checkpoint_dir: Path,
+    *,
+    run_id: str | None = None,
+    experiment_id: str | None = None,
+) -> Mapping[str, Any]:
     """Verify a trainer manifest and every referenced checkpoint file."""
 
     directory = _path(checkpoint_dir, "checkpoint")
@@ -230,6 +235,12 @@ def verify_checkpoint_artifact(checkpoint_dir: Path) -> Mapping[str, Any]:
         raise EvaluationArtifactError("checkpoint base model revision is absent or mutable")
     if payload.get("artifact_id") != f"checkpoint://{artifact_digest}":
         raise EvaluationArtifactError("checkpoint artifact ID is not content-bound")
+    if run_id is not None and payload.get("run_id") != run_id:
+        raise EvaluationArtifactError("checkpoint run identity does not match evaluation input")
+    if experiment_id is not None and payload.get("experiment_id") != experiment_id:
+        raise EvaluationArtifactError(
+            "checkpoint experiment identity does not match evaluation input"
+        )
     unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
     expected_manifest = hashlib.sha256(
         json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
@@ -286,6 +297,8 @@ def _sealed_manifest(inputs: EvaluationInputs) -> tuple[Mapping[str, Any], list[
     manifest_path = inputs.sealed_dir / "manifest.json"
     if not manifest_path.is_file():
         raise EvaluationArtifactError("sealed evaluation manifest.json is absent")
+    if manifest_path.is_symlink():
+        raise EvaluationArtifactError("sealed evaluation manifest must not be a symlink")
     try:
         manifest = json.loads(manifest_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -294,6 +307,14 @@ def _sealed_manifest(inputs: EvaluationInputs) -> tuple[Mapping[str, Any], list[
         raise EvaluationArtifactError("sealed evaluation manifest must be a JSON object")
     if manifest.get("manifest_sha256") != inputs.evaluation_manifest_sha256:
         raise EvaluationArtifactError("sealed evaluation manifest digest does not match job input")
+    if manifest.get("run_id") != inputs.run_id:
+        raise EvaluationArtifactError("sealed evaluation run identity does not match job input")
+    if manifest.get("experiment_id") != inputs.experiment_id:
+        raise EvaluationArtifactError(
+            "sealed evaluation experiment identity does not match job input"
+        )
+    if manifest.get("objective_seed") != inputs.objective_seed:
+        raise EvaluationArtifactError("sealed evaluation seed does not match job input")
     unsigned = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     expected_manifest = hashlib.sha256(
         json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
@@ -314,6 +335,8 @@ def _sealed_manifest(inputs: EvaluationInputs) -> tuple[Mapping[str, Any], list[
     )
     if task_file is None:
         raise EvaluationArtifactError("sealed evaluation task artifact is absent")
+    if task_file.is_symlink():
+        raise EvaluationArtifactError("sealed evaluation task artifact must not be a symlink")
     task_digest = _file_sha256(task_file)
     if manifest.get("task_bundle_sha256") != task_digest:
         raise EvaluationArtifactError("sealed task bundle checksum does not match manifest")
@@ -463,7 +486,7 @@ def _parse_function_call(text: str) -> ToolCall:
         raise InvalidModelAction("FunctionGemma emitted an unknown or invalid tool") from exc
 
 
-def _decode_actions(text: str) -> tuple[ToolCall, ...]:
+def _decode_actions(text: str, *, allow_json: bool = False) -> tuple[ToolCall, ...]:
     """Parse one allow-listed JSON tool call from model output.
 
     Unknown tools are a contract violation, not an unsuccessful action that
@@ -473,6 +496,8 @@ def _decode_actions(text: str) -> tuple[ToolCall, ...]:
 
     if FUNCTION_START in text:
         return (_parse_function_call(text),)
+    if not allow_json:
+        raise InvalidModelAction("model output lacks the FunctionGemma function-call marker")
     try:
         value = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -572,10 +597,14 @@ def evaluate_checkpoint(
     objective_seed: int,
     policy: Callable[..., ToolCall | Sequence[ToolCall]] | None = None,
     manifest: Mapping[str, Any] | None = None,
+    run_id: str | None = None,
+    experiment_id: str | None = None,
 ) -> EvaluationMetrics:
     """Evaluate one verified checkpoint against task IDs without leaking tasks."""
 
-    checkpoint_manifest = verify_checkpoint_artifact(checkpoint_dir)
+    checkpoint_manifest = verify_checkpoint_artifact(
+        checkpoint_dir, run_id=run_id, experiment_id=experiment_id
+    )
     selected_policy = policy or _model_policy(checkpoint_dir, checkpoint_manifest)
     successes = 0
     task_successes: list[bool] = []
@@ -706,10 +735,10 @@ def build_evaluation_report(
         "candidate_invalid_action_tasks": candidate_metrics.invalid_action_tasks,
         "candidate_metrics": {
             "task_count": candidate_metrics.task_count,
-                "successful_tasks": candidate_metrics.successful_tasks,
-                "success_rate": candidate_metrics.success_rate,
-                "by_environment": environment_aggregates(candidate_metrics),
-                "invalid_action_tasks": candidate_metrics.invalid_action_tasks,
+            "successful_tasks": candidate_metrics.successful_tasks,
+            "success_rate": candidate_metrics.success_rate,
+            "by_environment": environment_aggregates(candidate_metrics),
+            "invalid_action_tasks": candidate_metrics.invalid_action_tasks,
         },
     }
     if champion_metrics is not None:
@@ -840,7 +869,9 @@ def run_evaluation(
 ) -> Path:
     """Run sealed evaluation and write a report only after all checks pass."""
 
-    candidate_manifest = verify_checkpoint_artifact(inputs.candidate_dir)
+    candidate_manifest = verify_checkpoint_artifact(
+        inputs.candidate_dir, run_id=inputs.run_id, experiment_id=inputs.experiment_id
+    )
     sealed_manifest, task_ids = _sealed_manifest(inputs)
     candidate_metrics = evaluate_checkpoint(
         inputs.candidate_dir,
@@ -848,17 +879,25 @@ def run_evaluation(
         objective_seed=inputs.objective_seed,
         policy=policy,
         manifest=sealed_manifest,
+        run_id=inputs.run_id,
+        experiment_id=inputs.experiment_id,
     )
     champion_metrics: EvaluationMetrics | None = None
     champion_manifest: Mapping[str, Any] | None = None
     if inputs.champion_dir is not None:
-        champion_manifest = verify_checkpoint_artifact(inputs.champion_dir)
+        champion_manifest = verify_checkpoint_artifact(
+            inputs.champion_dir,
+            run_id=inputs.run_id,
+            experiment_id=inputs.experiment_id,
+        )
         champion_metrics = evaluate_checkpoint(
             inputs.champion_dir,
             sealed_task_ids=task_ids,
             objective_seed=inputs.objective_seed,
             policy=policy,
             manifest=sealed_manifest,
+            run_id=inputs.run_id,
+            experiment_id=inputs.experiment_id,
         )
     payload = build_evaluation_report(
         inputs,

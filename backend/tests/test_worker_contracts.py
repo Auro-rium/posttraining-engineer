@@ -392,6 +392,9 @@ def test_sealed_manifest_binds_task_bytes_and_rejects_duplicates(tmp_path: Path)
     task_bytes = b'{"tasks":["hidden-1"]}\n'
     (sealed / "tasks.json").write_bytes(task_bytes)
     unsigned = {
+        "run_id": "run-1",
+        "experiment_id": "exp-1",
+        "objective_seed": 7,
         "suite": "AgentGym/AgentEval",
         "suite_version": "agent-eval-v1",
         "task_bundle_sha256": hashlib.sha256(task_bytes).hexdigest(),
@@ -530,3 +533,80 @@ def test_functiongemma_special_call_parser_rejects_unknown_tools() -> None:
 def test_evaluation_metrics_reject_impossible_aggregate() -> None:
     with pytest.raises(EvaluationWorkerError, match="exceed"):
         EvaluationMetrics(task_count=1, successful_tasks=2)
+
+
+def test_evaluator_binds_checkpoint_run_and_experiment_before_scoring(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    write_training_manifest(
+        train,
+        output_dir=checkpoint,
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=_dataset_digest(train),
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        qlora_config=_qlora_config(),
+    )
+    with pytest.raises(EvaluationWorkerError, match="run identity"):
+        verify_checkpoint_artifact(checkpoint, run_id="other-run", experiment_id="exp-1")
+    with pytest.raises(EvaluationWorkerError, match="experiment identity"):
+        verify_checkpoint_artifact(checkpoint, run_id="run-1", experiment_id="other-exp")
+
+
+def test_evaluator_binds_sealed_manifest_seed_and_run_identity(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    write_training_manifest(
+        train,
+        output_dir=checkpoint,
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=_dataset_digest(train),
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        qlora_config=_qlora_config(),
+    )
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    task_bytes = b'{"tasks":["hidden-1"]}\n'
+    (sealed / "tasks.json").write_bytes(task_bytes)
+    unsigned = {
+        "run_id": "run-1",
+        "experiment_id": "exp-1",
+        "objective_seed": 7,
+        "suite": "AgentGym/AgentEval",
+        "suite_version": "agent-eval-v1",
+        "task_bundle_sha256": hashlib.sha256(task_bytes).hexdigest(),
+        "task_count": 1,
+    }
+    digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    (sealed / "manifest.json").write_text(
+        json.dumps({**unsigned, "manifest_sha256": digest})
+    )
+    inputs = parse_evaluation_inputs(
+        {
+            "RUN_ID": "run-1",
+            "EXPERIMENT_ID": "exp-1",
+            "EVALUATION_MANIFEST_SHA256": digest,
+            "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+            "OBJECTIVE_SEED": "8",
+            "SM_OUTPUT_DATA_DIR": str(tmp_path / "output"),
+        },
+        {"candidate": checkpoint, "sealed": sealed},
+    )
+    with pytest.raises(EvaluationWorkerError, match="seed"):
+        run_evaluation(inputs, policy=lambda task: ())
+
+
+def test_real_model_decoder_rejects_unmarked_json_protocol() -> None:
+    with pytest.raises(InvalidModelAction, match="marker"):
+        _decode_actions('[{"tool":"get_logs","arguments":{}}]')
