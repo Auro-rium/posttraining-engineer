@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -26,6 +26,15 @@ ALLOWED_TOOLS: tuple[str, ...] = (
     "run_healthcheck",
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def deterministic_dataset_created_at(dataset_id: str, sha256: str) -> datetime:
+    """Return restart-stable metadata for a content-addressed dataset."""
+
+    digest = hashlib.sha256(f"{dataset_id}:{sha256}".encode()).hexdigest()
+    return datetime(2026, 1, 1, tzinfo=UTC) + timedelta(
+        seconds=int(digest[:12], 16) % (100 * 365 * 24 * 60 * 60)
+    )
 
 
 class ObjectiveSplit(StrEnum):

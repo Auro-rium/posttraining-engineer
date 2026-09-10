@@ -18,16 +18,31 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
+from threading import RLock
 from typing import Any, cast
 from urllib.parse import unquote
 
 from app.providers.artifacts import ArtifactRef
 
-from .models import Dataset, DatasetManifest, ObjectiveSplit, Trajectory, TrajectoryReference
+from .models import (
+    Dataset,
+    DatasetManifest,
+    DatasetRow,
+    ObjectiveSplit,
+    Trajectory,
+    TrajectoryReference,
+    deterministic_dataset_created_at,
+)
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _PUBLIC_SPLITS = frozenset({ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY, ObjectiveSplit.VALIDATION})
+_PUBLIC_SPLIT_ORDER = (
+    ObjectiveSplit.TRAIN,
+    ObjectiveSplit.REPLAY,
+    ObjectiveSplit.VALIDATION,
+)
 _CURATION_SPLITS = frozenset({ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY})
 
 
@@ -141,6 +156,28 @@ def _is_missing(exc: BaseException) -> bool:
     return False
 
 
+def _is_precondition_failed(exc: BaseException) -> bool:
+    """Recognize S3's conditional-write conflict without hiding other errors."""
+
+    response = getattr(exc, "response", None)
+    if isinstance(response, Mapping):
+        error = response.get("Error")
+        if isinstance(error, Mapping) and str(error.get("Code", "")) in {
+            "409",
+            "412",
+            "PreconditionFailed",
+        }:
+            return True
+    return False
+
+
+def _stable_created_at(dataset: Dataset) -> datetime:
+    """Derive restart-stable metadata from the immutable dataset identity."""
+    return deterministic_dataset_created_at(
+        dataset.manifest.dataset_id, dataset.manifest.sha256
+    )
+
+
 class S3ObjectiveArtifactStore:
     """Persist verified public trajectories and curation-safe datasets in S3.
 
@@ -157,6 +194,7 @@ class S3ObjectiveArtifactStore:
         self.bucket = _validate_bucket(bucket)
         self.prefix = _validate_path(prefix, name="artifact prefix", allow_empty=True)
         self._client = client
+        self._write_lock = RLock()
 
     @staticmethod
     def sha256(data: bytes) -> str:
@@ -282,13 +320,12 @@ class S3ObjectiveArtifactStore:
         }
         if split is not None:
             metadata["split"] = split.value
-        # A deterministic key plus an integrity-checked existing version makes
-        # retries idempotent and prevents a later writer from rebinding an ID.
-        try:
-            head = self._head(key)
-        except ObjectiveArtifactNotFound:
-            head = None
-        if head is not None:
+
+        def existing_or_raise() -> ArtifactRef | None:
+            try:
+                head = self._head(key)
+            except ObjectiveArtifactNotFound:
+                return None
             existing = self._ref_from_head(key, head, context="existing artifact")
             if existing.sha256 != digest or existing.size_bytes != len(data):
                 raise ObjectiveArtifactIntegrityError(
@@ -296,32 +333,47 @@ class S3ObjectiveArtifactStore:
                 )
             self._read_bytes(existing, context="existing artifact")
             return existing
-        try:
-            response = dict(
-                self._client_or_create().put_object(
-                    Bucket=self.bucket,
-                    Key=key,
-                    Body=data,
-                    ContentType="application/json",
-                    Metadata=metadata,
+
+        # The local lock makes the injected test client thread-safe.  The S3
+        # conditional write below provides the same reconcile-on-conflict
+        # behavior across independently scaled objective workers.
+        with self._write_lock:
+            existing = existing_or_raise()
+            if existing is not None:
+                return existing
+            try:
+                response = dict(
+                    self._client_or_create().put_object(
+                        Bucket=self.bucket,
+                        Key=key,
+                        Body=data,
+                        ContentType="application/json",
+                        Metadata=metadata,
+                        IfNoneMatch="*",
+                    )
                 )
+            except Exception as exc:
+                if _is_precondition_failed(exc):
+                    reconciled = existing_or_raise()
+                    if reconciled is not None:
+                        return reconciled
+                raise ObjectiveArtifactError(
+                    f"S3 upload failed for objective artifact: {key}"
+                ) from exc
+            version = _required_version(response.get("VersionId"), context="S3 upload")
+            ref = ArtifactRef(
+                bucket=self.bucket,
+                key=key,
+                sha256=digest,
+                size_bytes=len(data),
+                version_id=version,
+                content_type="application/json",
+                etag=(str(response["ETag"]) if response.get("ETag") else None),
             )
-        except Exception as exc:
-            raise ObjectiveArtifactError(f"S3 upload failed for objective artifact: {key}") from exc
-        version = _required_version(response.get("VersionId"), context="S3 upload")
-        ref = ArtifactRef(
-            bucket=self.bucket,
-            key=key,
-            sha256=digest,
-            size_bytes=len(data),
-            version_id=version,
-            content_type="application/json",
-            etag=(str(response["ETag"]) if response.get("ETag") else None),
-        )
-        # Verify the provider committed exactly what was returned before the
-        # reference can cross the objective-worker boundary.
-        self._read_bytes(ref, context="uploaded artifact")
-        return ref
+            # Verify the provider committed exactly what was returned before the
+            # reference can cross the objective-worker boundary.
+            self._read_bytes(ref, context="uploaded artifact")
+            return ref
 
     def _write_index(self, key: str, payload: Mapping[str, Any]) -> ArtifactRef:
         return self._put_bytes(key, _canonical_json(payload), kind="index", split=None)
@@ -440,55 +492,123 @@ class S3ObjectiveArtifactStore:
 
     get = get_trajectory
 
-    def resolve_trajectory_reference(self, reference: TrajectoryReference) -> Trajectory:
+    def resolve_trajectory_reference(
+        self, reference: TrajectoryReference, *, allow_validation: bool = False
+    ) -> Trajectory:
+        """Resolve using the durable index, never caller flags as authority.
+
+        The reference's split and ``verified`` bit are claims to compare with
+        persisted index metadata.  They do not grant validation access; that
+        requires an explicit evaluator-only argument at the storage boundary.
+        """
+
         if not reference.verified:
             raise ObjectiveArtifactIntegrityError("trajectory reference is not verified")
         if reference.split is ObjectiveSplit.HIDDEN:
             raise ObjectiveArtifactIntegrityError("hidden trajectories cannot be resolved")
+        trajectory_id = _validate_identifier(reference.trajectory_id, name="trajectory_id")
+        trusted_index: dict[str, Any] | None = None
+        trusted_split: ObjectiveSplit | None = None
+        for candidate_split in _PUBLIC_SPLIT_ORDER:
+            index = self._index_for(trajectory_id, split=candidate_split)
+            if index is None:
+                continue
+            raw_split = index.get("split")
+            if not isinstance(raw_split, str):
+                raise ObjectiveArtifactIntegrityError("trajectory index contains an invalid split")
+            try:
+                indexed_split = ObjectiveSplit(raw_split)
+            except ValueError as exc:
+                raise ObjectiveArtifactIntegrityError(
+                    "trajectory index contains an invalid split"
+                ) from exc
+            if indexed_split is not candidate_split:
+                raise ObjectiveArtifactIntegrityError(
+                    "trajectory index provenance does not match its key"
+                )
+            trusted_index = index
+            trusted_split = indexed_split
+            break
+        if trusted_index is None or trusted_split is None:
+            raise ObjectiveArtifactIntegrityError("trajectory reference is not resolvable")
+        if trusted_split is ObjectiveSplit.VALIDATION and not allow_validation:
+            raise ObjectiveArtifactIntegrityError(
+                "validation retrieval requires explicit evaluator scope"
+            )
+        if (
+            trusted_index.get("trajectory_id") != trajectory_id
+            or trusted_index.get("task_id") != reference.task_id
+            or trusted_split is not reference.split
+            or trusted_index.get("verified") is not True
+        ):
+            raise ObjectiveArtifactIntegrityError(
+                "trajectory reference metadata does not match trusted index"
+            )
         trajectory = self.get_trajectory(
-            reference.trajectory_id,
-            split=reference.split,
-            allow_validation=reference.split is ObjectiveSplit.VALIDATION,
+            trajectory_id, split=trusted_split, allow_validation=allow_validation
         )
-        if trajectory is None or trajectory.task_id != reference.task_id:
+        if trajectory is None:
             raise ObjectiveArtifactIntegrityError("trajectory reference is not resolvable")
         return trajectory
 
     def put_dataset(self, dataset: Dataset) -> DatasetManifest:
         if not dataset.rows:
             raise ObjectiveArtifactIntegrityError("dataset requires at least one row")
+        row_splits = {row.split for row in dataset.rows}
+        if len(row_splits) != 1:
+            raise ObjectiveArtifactIntegrityError("dataset rows must use one curation split")
         for row in dataset.rows:
             if row.split not in _CURATION_SPLITS:
                 raise ObjectiveArtifactIntegrityError(
                     "validation and hidden rows cannot enter training datasets"
                 )
-            if not row.verifier_confirmed:
-                raise ObjectiveArtifactIntegrityError("dataset rows must be verifier-confirmed")
+            if not row.verifier_confirmed or row.source_type != "verified_replay":
+                raise ObjectiveArtifactIntegrityError(
+                    "dataset rows must carry verifier-confirmed replay evidence"
+                )
         if (
             tuple(row.source_trajectory_id for row in dataset.rows)
             != dataset.manifest.source_trajectory_ids
         ):
             raise ObjectiveArtifactIntegrityError("dataset manifest provenance does not match rows")
+        for row in dataset.rows:
+            source = self.get_trajectory(row.source_trajectory_id, split=row.split)
+            if source is None or source.task_id != row.task_id or not source.verified:
+                raise ObjectiveArtifactIntegrityError(
+                    "dataset row source is not present in the trusted trajectory index"
+                )
         dataset_id = _validate_identifier(dataset.manifest.dataset_id, name="dataset_id")
         run_id = _validate_identifier(dataset.manifest.run_id, name="run_id")
         experiment_id = _validate_identifier(dataset.manifest.experiment_id, name="experiment_id")
         payload_digest = _required_sha(dataset.manifest.sha256, context="dataset manifest")
-        key = self._key(
-            "datasets",
-            run_id,
-            experiment_id,
-            f"{payload_digest}.json",
+        expected_dataset_id = (
+            "dataset-"
+            + hashlib.sha256(f"{run_id}:{experiment_id}:{payload_digest}".encode()).hexdigest()[:24]
         )
+        if dataset_id != expected_dataset_id:
+            raise ObjectiveArtifactIntegrityError(
+                "dataset ID is not deterministically bound to its run, experiment, and content"
+            )
+        jsonl_payload = "\n".join(row.canonical_json() for row in dataset.rows).encode("utf-8")
+        if _digest(jsonl_payload) != payload_digest:
+            raise ObjectiveArtifactIntegrityError("dataset rows do not match manifest digest")
+        key = self._key("datasets", run_id, experiment_id, f"{payload_digest}.jsonl")
+        artifact = self._put_bytes(key, jsonl_payload, kind="dataset-jsonl", split=None)
         payload_manifest = dataset.manifest.model_copy(
-            update={"s3_uri": f"s3://{self.bucket}/{key}"}
-        )
-        payload = _canonical_json(
-            {
-                "manifest": payload_manifest.model_dump(mode="json"),
-                "rows": [row.model_dump(mode="json") for row in dataset.rows],
+            update={
+                "created_at": _stable_created_at(dataset),
+                "s3_uri": artifact.version_ref,
             }
         )
-        artifact = self._put_bytes(key, payload, kind="dataset", split=None)
+        manifest_key = self._key(
+            "datasets", run_id, experiment_id, f"{payload_digest}.manifest.json"
+        )
+        manifest_artifact = self._put_bytes(
+            manifest_key,
+            _canonical_json(payload_manifest.model_dump(mode="json")),
+            kind="dataset-manifest",
+            split=None,
+        )
         index_key = self._key("dataset-index", f"{dataset_id}.json")
         self._write_index(
             index_key,
@@ -496,7 +616,8 @@ class S3ObjectiveArtifactStore:
                 "dataset_id": dataset_id,
                 "run_id": run_id,
                 "experiment_id": experiment_id,
-                "artifact": artifact.to_dict(),
+                "dataset_artifact": artifact.to_dict(),
+                "manifest_artifact": manifest_artifact.to_dict(),
             },
         )
         # The returned URI is the exact immutable version that a trainer may
@@ -512,29 +633,45 @@ class S3ObjectiveArtifactStore:
             return None
         if index.get("dataset_id") != dataset_id:
             raise ObjectiveArtifactIntegrityError("dataset index provenance does not match request")
-        raw_ref = index.get("artifact")
-        if not isinstance(raw_ref, Mapping):
-            raise ObjectiveArtifactIntegrityError("dataset index lacks an artifact reference")
+        raw_dataset_ref = index.get("dataset_artifact")
+        raw_manifest_ref = index.get("manifest_artifact")
+        if not isinstance(raw_dataset_ref, Mapping) or not isinstance(raw_manifest_ref, Mapping):
+            raise ObjectiveArtifactIntegrityError(
+                "dataset index lacks immutable artifact references"
+            )
         try:
-            ref = ArtifactRef.from_dict(raw_ref)
-            value = json.loads(self._read_bytes(ref, context="dataset").decode("utf-8"))
-            dataset = Dataset.model_validate(value)
+            dataset_ref = ArtifactRef.from_dict(raw_dataset_ref)
+            manifest_ref = ArtifactRef.from_dict(raw_manifest_ref)
+            manifest_value = json.loads(
+                self._read_bytes(manifest_ref, context="dataset manifest").decode("utf-8")
+            )
+            if not isinstance(manifest_value, Mapping):
+                raise TypeError("dataset manifest must be an object")
+            manifest = DatasetManifest.model_validate(manifest_value)
+            row_lines = self._read_bytes(dataset_ref, context="dataset JSONL").decode(
+                "utf-8"
+            ).split("\n")
+            rows = tuple(DatasetRow.model_validate(json.loads(line)) for line in row_lines if line)
+            dataset = Dataset(manifest=manifest, rows=rows)
         except ObjectiveArtifactError:
             raise
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ObjectiveArtifactIntegrityError("stored dataset is malformed") from exc
         if dataset.manifest.dataset_id != dataset_id:
             raise ObjectiveArtifactIntegrityError("stored dataset ID does not match index")
+        if dataset.manifest.s3_uri != dataset_ref.version_ref:
+            raise ObjectiveArtifactIntegrityError(
+                "stored dataset manifest does not point to its immutable JSONL artifact"
+            )
+        if index.get("run_id") != dataset.manifest.run_id or index.get(
+            "experiment_id"
+        ) != dataset.manifest.experiment_id:
+            raise ObjectiveArtifactIntegrityError("dataset index scope does not match manifest")
         if any(row.split not in _CURATION_SPLITS for row in dataset.rows):
             raise ObjectiveArtifactIntegrityError(
                 "stored dataset crosses the sealed evaluation boundary"
             )
-        # Rehydrate the manifest with the exact immutable locator recovered
-        # from the durable index so a restarted trainer never falls back to a
-        # mutable unversioned S3 URI.
-        return dataset.model_copy(
-            update={"manifest": dataset.manifest.model_copy(update={"s3_uri": ref.version_ref})}
-        )
+        return dataset
 
     def get_dataset_for_curation(self, dataset_id: str) -> Dataset | None:
         """Curation-facing alias that can never retrieve validation/hidden data."""

@@ -14,6 +14,11 @@ from typing import Any, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
+from .artifacts import (
+    ObjectiveArtifactError,
+    ObjectiveArtifactIntegrityError,
+    ObjectiveArtifactNotFound,
+)
 from .engine import ServiceRecoveryEngine
 from .models import (
     BenchmarkExecutionResult,
@@ -21,8 +26,11 @@ from .models import (
     BenchmarkResponse,
     CurationRequest,
     CurationResponse,
+    Dataset,
+    DatasetManifest,
     Trajectory,
     TrajectoryReference,
+    deterministic_dataset_created_at,
 )
 
 
@@ -43,18 +51,26 @@ class TrajectoryArtifactStore(Protocol):
 
     def get(self, trajectory_id: str) -> Trajectory | None: ...
 
+    def resolve_trajectory_reference(self, reference: TrajectoryReference) -> Trajectory: ...
+
+    def put_dataset(self, dataset: Dataset) -> DatasetManifest: ...
+
 
 class InMemoryTrajectoryArtifactStore:
     """Thread-safe local artifact registry for contract tests and development."""
 
     def __init__(self) -> None:
         self._items: dict[str, Trajectory] = {}
+        self._datasets: dict[str, Dataset] = {}
         self._lock = RLock()
 
     def put(self, trajectory: Trajectory) -> TrajectoryReference:
         if not trajectory.verified:
             raise ValueError("only verified trajectories may be stored")
         with self._lock:
+            existing = self._items.get(trajectory.trajectory_id)
+            if existing is not None and existing != trajectory:
+                raise ValueError("trajectory ID is already bound to other bytes")
             self._items[trajectory.trajectory_id] = trajectory.model_copy(deep=True)
         return TrajectoryReference(
             trajectory_id=trajectory.trajectory_id,
@@ -67,6 +83,59 @@ class InMemoryTrajectoryArtifactStore:
         with self._lock:
             trajectory = self._items.get(trajectory_id)
             return trajectory.model_copy(deep=True) if trajectory is not None else None
+
+    def resolve_trajectory_reference(self, reference: TrajectoryReference) -> Trajectory:
+        """Resolve against the stored identity, not caller metadata or flags."""
+
+        if not reference.verified:
+            raise ValueError("trajectory reference is not verified")
+        if reference.split.value == "validation":
+            raise ValueError("validation retrieval requires explicit evaluator scope")
+        with self._lock:
+            trajectory = self._items.get(reference.trajectory_id)
+            if trajectory is None:
+                raise KeyError(reference.trajectory_id)
+            if (
+                trajectory.task_id != reference.task_id
+                or trajectory.split is not reference.split
+                or not trajectory.verified
+            ):
+                raise ValueError("trajectory reference metadata does not match trusted index")
+            return trajectory.model_copy(deep=True)
+
+    def put_dataset(self, dataset: Dataset) -> DatasetManifest:
+        """Persist the local test dataset with a stable immutable locator."""
+
+        if not dataset.rows or any(
+            not row.verifier_confirmed or row.source_type != "verified_replay"
+            for row in dataset.rows
+        ):
+            raise ValueError("dataset rows must carry verifier-confirmed replay evidence")
+        version = dataset.manifest.sha256[:16]
+        manifest = dataset.manifest.model_copy(
+            update={
+                "s3_uri": (
+                    f"s3://in-memory/objective/datasets/{dataset.manifest.dataset_id}.jsonl"
+                    f"?versionId={version}"
+                ),
+                "created_at": deterministic_dataset_created_at(
+                    dataset.manifest.dataset_id, dataset.manifest.sha256
+                ),
+            }
+        )
+        persisted = dataset.model_copy(update={"manifest": manifest}, deep=True)
+        with self._lock:
+            for row in persisted.rows:
+                source = self._items.get(row.source_trajectory_id)
+                if source is None or source.task_id != row.task_id or source.split is not row.split:
+                    raise ValueError(
+                        "dataset row source is not present in the trusted trajectory index"
+                    )
+            existing = self._datasets.get(dataset.manifest.dataset_id)
+            if existing is not None and existing != persisted:
+                raise ValueError("dataset ID is already bound to other bytes")
+            self._datasets[dataset.manifest.dataset_id] = persisted
+        return manifest
 
 
 class ObjectiveService:
@@ -165,29 +234,41 @@ class ObjectiveService:
         )
 
     def verify_curation(self, request: CurationRequest) -> CurationResponse:
+        if self.artifact_store is None:
+            raise HTTPException(
+                status_code=503, detail="objective artifact persistence is required"
+            )
         source_trajectories = list(request.trajectories)
         if request.trajectory_references:
-            if self.artifact_store is None:
-                raise HTTPException(status_code=422, detail="trajectory artifact store is required")
+            resolver = getattr(self.artifact_store, "resolve_trajectory_reference", None)
+            if not callable(resolver):
+                raise HTTPException(
+                    status_code=503, detail="objective artifact reference resolver is unavailable"
+                )
             for reference in request.trajectory_references:
-                if not reference.verified:
-                    raise HTTPException(
-                        status_code=422, detail="trajectory reference is not verified"
-                    )
-                trajectory = self.artifact_store.get(reference.trajectory_id)
-                if trajectory is None:
-                    raise HTTPException(
-                        status_code=422, detail="trajectory reference is not resolvable"
-                    )
-                if (
-                    trajectory.task_id != reference.task_id
-                    or trajectory.split is not reference.split
-                    or not trajectory.verified
-                ):
+                try:
+                    # The persisted index decides whether this identity is
+                    # authorized.  Caller-provided ``verified`` is only a
+                    # claim that the resolver compares with that index.
+                    trajectory = resolver(reference)
+                except (
+                    ObjectiveArtifactIntegrityError,
+                    ObjectiveArtifactNotFound,
+                    KeyError,
+                    ValueError,
+                ) as exc:
                     raise HTTPException(
                         status_code=422,
-                        detail="trajectory reference metadata does not match stored artifact",
-                    )
+                        detail="trajectory reference is not trusted or resolvable",
+                    ) from exc
+                except ObjectiveArtifactError as exc:
+                    raise HTTPException(
+                        status_code=503, detail="objective artifact lookup is unavailable"
+                    ) from exc
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503, detail="objective artifact lookup is unavailable"
+                    ) from exc
                 source_trajectories.append(trajectory)
         confirmed = []
         for trajectory in source_trajectories:
@@ -206,7 +287,57 @@ class ObjectiveService:
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return dataset
+        trajectory_persister = getattr(self.artifact_store, "put", None)
+        if not callable(trajectory_persister):
+            raise HTTPException(
+                status_code=503, detail="objective trajectory persistence is unavailable"
+            )
+        for trajectory in confirmed:
+            try:
+                trajectory_persister(trajectory)
+            except ObjectiveArtifactIntegrityError as exc:
+                raise HTTPException(
+                    status_code=422, detail="objective trajectory failed integrity checks"
+                ) from exc
+            except ObjectiveArtifactError as exc:
+                raise HTTPException(
+                    status_code=503, detail="objective trajectory persistence is unavailable"
+                ) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503, detail="objective trajectory persistence is unavailable"
+                ) from exc
+        persister = getattr(self.artifact_store, "put_dataset", None)
+        if not callable(persister):
+            raise HTTPException(
+                status_code=503, detail="objective dataset persistence is unavailable"
+            )
+        try:
+            persisted_manifest = persister(dataset)
+            if not isinstance(persisted_manifest, DatasetManifest):
+                raise TypeError("objective dataset persistence returned an invalid manifest")
+            persisted = Dataset(
+                manifest=persisted_manifest,
+                rows=dataset.rows,
+            )
+        except ObjectiveArtifactIntegrityError as exc:
+            raise HTTPException(
+                status_code=422, detail="objective dataset failed integrity checks"
+            ) from exc
+        except ObjectiveArtifactError as exc:
+            raise HTTPException(
+                status_code=503, detail="objective dataset persistence is unavailable"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="objective dataset persistence returned invalid data",
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail="objective dataset persistence is unavailable"
+            ) from exc
+        return persisted
 
 
 def _auth_dependency(expected_token: str) -> Callable[[str | None, str | None], None]:

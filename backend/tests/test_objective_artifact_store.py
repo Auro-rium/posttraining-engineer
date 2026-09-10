@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any, cast
 
@@ -13,7 +14,7 @@ from app.objective.artifacts import (
     S3ObjectiveArtifactStore,
 )
 from app.objective.engine import ServiceRecoveryEngine
-from app.objective.models import ObjectiveSplit, ToolCall, Trajectory
+from app.objective.models import ObjectiveSplit, ToolCall, Trajectory, TrajectoryReference
 
 
 class _VersionedS3:
@@ -212,6 +213,7 @@ def test_dataset_store_excludes_validation_and_hidden_rows_and_returns_exact_uri
     client = _VersionedS3()
     store = S3ObjectiveArtifactStore("objective-artifacts", client=client, prefix="objective")
     trajectory = _trajectory()
+    store.put(trajectory)
     engine = ServiceRecoveryEngine(seed=7)
     dataset = engine.build_dataset([trajectory], run_id="run-1", experiment_id="exp-1")
 
@@ -255,3 +257,62 @@ def test_s3_provider_errors_are_not_treated_as_missing() -> None:
 
     with pytest.raises(ObjectiveArtifactError, match="S3 head failed"):
         S3ObjectiveArtifactStore("objective-artifacts", client=Denied()).get("replay-001")
+
+
+def test_concurrent_identical_puts_reconcile_to_one_immutable_reference() -> None:
+    client = _VersionedS3()
+    store = S3ObjectiveArtifactStore("objective-artifacts", client=client)
+    trajectory = _trajectory()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        references = list(pool.map(lambda _: store.put(trajectory), range(8)))
+
+    assert all(reference == references[0] for reference in references)
+    assert len(
+        [
+            call
+            for name, call in client.calls
+            if name == "put_object" and "trajectories/" in str(call["Key"])
+        ]
+    ) == 1
+
+
+def test_dataset_writes_jsonl_and_manifest_and_normalizes_restart_metadata() -> None:
+    client = _VersionedS3()
+    store = S3ObjectiveArtifactStore("objective-artifacts", client=client)
+    engine = ServiceRecoveryEngine(seed=7)
+    trajectory = _trajectory()
+    store.put(trajectory)
+    first_dataset = engine.build_dataset([trajectory], run_id="run-1", experiment_id="exp-1")
+    second_dataset = engine.build_dataset([trajectory], run_id="run-1", experiment_id="exp-1")
+    first = store.put_dataset(first_dataset)
+    second = store.put_dataset(second_dataset)
+
+    assert first == second
+    dataset_puts = [
+        call
+        for name, call in client.calls
+        if name == "put_object" and "datasets/" in str(call["Key"])
+    ]
+    assert len(dataset_puts) == 2
+    assert any(str(call["Key"]).endswith(".jsonl") for call in dataset_puts)
+    assert any(str(call["Key"]).endswith(".manifest.json") for call in dataset_puts)
+    restored = store.get_dataset(first_dataset.manifest.dataset_id)
+    assert restored is not None
+    assert restored.manifest.s3_uri == first.s3_uri
+
+
+def test_reference_resolution_never_uses_validation_flag_as_authorization() -> None:
+    client = _VersionedS3()
+    store = S3ObjectiveArtifactStore("objective-artifacts", client=client)
+    reference = store.put_trajectory(_trajectory(split=ObjectiveSplit.VALIDATION))
+
+    with pytest.raises(ObjectiveArtifactIntegrityError, match="evaluator scope"):
+        store.resolve_trajectory_reference(
+            TrajectoryReference(
+                trajectory_id=reference.trajectory_id,
+                task_id=reference.task_id,
+                split=ObjectiveSplit.VALIDATION,
+                verified=True,
+            )
+        )

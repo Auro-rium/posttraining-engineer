@@ -445,7 +445,13 @@ def test_curation_endpoint_returns_a_content_addressed_dataset_for_replay_scope(
         "split": "replay",
         "trajectories": [trajectory.model_dump(mode="json")],
     }
-    client = TestClient(create_objective_app(engine, auth_token="secret"))
+    client = TestClient(
+        create_objective_app(
+            engine,
+            auth_token="secret",
+            artifact_store=InMemoryTrajectoryArtifactStore(),
+        )
+    )
     response = client.post(
         "/v1/verify-curation", json=payload, headers={"x-objective-token": "secret"}
     )
@@ -455,3 +461,31 @@ def test_curation_endpoint_returns_a_content_addressed_dataset_for_replay_scope(
     assert body["manifest"]["row_count"] == 1
     assert len(body["manifest"]["sha256"]) == 64
     assert "failure_mode" not in response.text
+    repeated = client.post(
+        "/v1/verify-curation", json=payload, headers={"x-objective-token": "secret"}
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["manifest"] == body["manifest"]
+
+
+def test_curation_requires_durable_dataset_persistence() -> None:
+    engine = ServiceRecoveryEngine(seed=9)
+    trajectory = engine.run_episode(
+        "train-001",
+        [ToolCall(tool="inspect_service", arguments={"service": "api"})],
+        split=ObjectiveSplit.REPLAY,
+    )
+    client = TestClient(create_objective_app(engine, auth_token="secret"))
+    response = client.post(
+        "/v1/verify-curation",
+        json={
+            "run_id": "run-1",
+            "experiment_id": "exp-1",
+            "split": "replay",
+            "trajectories": [trajectory.model_dump(mode="json")],
+        },
+        headers={"x-objective-token": "secret"},
+    )
+
+    assert response.status_code == 503
+    assert "persistence" in response.text
