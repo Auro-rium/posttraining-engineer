@@ -33,6 +33,7 @@ class AutonomousEventType(StrEnum):
     RUN_QUEUED = "run.queued"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
+    RUN_BLOCKED = "run.blocked"
     RUN_CANCEL_REQUESTED = "run.cancel_requested"
     RUN_CANCELLED = "run.cancelled"
     RUN_SAFE_STOP_REQUESTED = "run.safe_stop_requested"
@@ -59,6 +60,7 @@ CANONICAL_EVENT_TYPES: Final[dict[AutonomousEventType, ObserverEventType]] = {
     AutonomousEventType.RUN_QUEUED: ObserverEventType.RUN_STARTED,
     AutonomousEventType.RUN_COMPLETED: ObserverEventType.RUN_COMPLETED,
     AutonomousEventType.RUN_FAILED: ObserverEventType.RUN_FAILED,
+    AutonomousEventType.RUN_BLOCKED: ObserverEventType.RUN_FAILED,
     AutonomousEventType.RUN_CANCEL_REQUESTED: ObserverEventType.RUN_FAILED,
     AutonomousEventType.RUN_CANCELLED: ObserverEventType.RUN_COMPLETED,
     AutonomousEventType.RUN_SAFE_STOP_REQUESTED: ObserverEventType.RUN_FAILED,
@@ -133,6 +135,7 @@ SAFE_METADATA_KEYS: Final[frozenset[str]] = frozenset(
         "approval_digest",
         "artifact_id",
         "cost_usd",
+        "durable_event_type",
         "evidence_label",
         "event_id",
         "experiment_id",
@@ -196,6 +199,7 @@ for _terminal_event in (
     AutonomousEventType.RUN_QUEUED,
     AutonomousEventType.RUN_COMPLETED,
     AutonomousEventType.RUN_FAILED,
+    AutonomousEventType.RUN_BLOCKED,
     AutonomousEventType.RUN_CANCEL_REQUESTED,
     AutonomousEventType.RUN_CANCELLED,
     AutonomousEventType.RUN_SAFE_STOP_REQUESTED,
@@ -271,6 +275,10 @@ def validate_safe_metadata(
                 raise ValueError(f"event {key} metadata must use a known autonomous value")
         if key == "evidence_label" and value not in _ALLOWED_LABELS:
             raise ValueError("evidence_label must be LIVE, PRIOR_VERIFIED_RUN, or EXPLANATION")
+        if key == "durable_event_type" and value not in {
+            event.value for event in AutonomousEventType
+        }:
+            raise ValueError("durable_event_type must use the autonomous event vocabulary")
         normalized[key] = value
     return normalized
 
@@ -662,6 +670,7 @@ class DurableTelemetryBridge:
         observer_type: ObserverEventType | str
         observer_type = CANONICAL_EVENT_TYPES[event_type]
         mirrored_attributes: SafeTelemetryMetadata = dict(attributes)
+        mirrored_attributes["durable_event_type"] = event_type.value
         if event_id is not None:
             mirrored_attributes["event_id"] = event_id
         try:

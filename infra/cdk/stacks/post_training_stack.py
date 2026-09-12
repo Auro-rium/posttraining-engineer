@@ -397,6 +397,13 @@ class PostTrainingStack(Stack):
         )
         task_role.add_to_policy(
             iam.PolicyStatement(
+                sid="ReadOnlyPreflightS3ObjectVersions",
+                actions=["s3:GetObjectVersion"],
+                resources=[f"{artifacts.bucket_arn}/{prefix}/*"],
+            )
+        )
+        task_role.add_to_policy(
+            iam.PolicyStatement(
                 sid="ReadOnlyPreflightIam",
                 actions=["iam:GetRole"],
                 resources=[training_role.role_arn],

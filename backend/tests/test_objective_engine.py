@@ -17,6 +17,9 @@ from app.objective.models import (
     Dataset,
     ObjectiveSplit,
     ToolCall,
+    TrajectoryReference,
+    decode_trajectory_reference,
+    encode_trajectory_reference,
 )
 from app.objective.service import InMemoryTrajectoryArtifactStore, create_objective_app
 
@@ -204,18 +207,18 @@ def test_dataset_contract_recomputes_digest() -> None:
         Dataset(manifest=forged_manifest, rows=dataset.rows)
 
 
-def test_objective_service_requires_auth_and_rejects_hidden_split() -> None:
+def test_objective_service_requires_auth_and_rejects_non_training_splits() -> None:
     client = TestClient(create_objective_app(ServiceRecoveryEngine(seed=1), auth_token="secret"))
     payload = {"run_id": "run-1", "split": "train", "task_ids": ["train-001"]}
 
     assert client.post("/v1/benchmark", json=payload).status_code == 401
-    response = client.post(
-        "/v1/benchmark",
-        json={**payload, "split": "hidden"},
-        headers={"x-objective-token": "secret"},
-    )
-    assert response.status_code == 422
-    assert "hidden" in response.text
+    for split in ("hidden", "baseline", "held_out"):
+        response = client.post(
+            "/v1/benchmark",
+            json={**payload, "split": split},
+            headers={"x-objective-token": "secret"},
+        )
+        assert response.status_code == 422
 
     response = client.post(
         "/v1/benchmark", json=payload, headers={"authorization": "Bearer secret"}
@@ -489,3 +492,67 @@ def test_curation_requires_durable_dataset_persistence() -> None:
 
     assert response.status_code == 503
     assert "persistence" in response.text
+
+
+def test_trajectory_reference_handoff_round_trips_actual_public_provenance() -> None:
+    reference = TrajectoryReference(
+        trajectory_id="traj-real-001",
+        task_id="train-task-001",
+        split=ObjectiveSplit.TRAIN,
+        verified=True,
+    )
+
+    opaque = encode_trajectory_reference(reference)
+
+    assert opaque == "trajectory://train/traj-real-001/train-task-001/verified"
+    assert decode_trajectory_reference(opaque) == reference
+
+
+@pytest.mark.parametrize(
+    "opaque",
+    [
+        "trajectory://hidden/traj-secret/hidden-task/verified",
+        "trajectory://train/traj-real-001/train-task-001/unverified",
+        "trajectory://train/traj-real-001/train-task-001/verified/extra",
+        "trajectory://train/traj-real-001/unknown/verified",
+    ],
+)
+def test_trajectory_reference_handoff_rejects_hidden_or_noncanonical_metadata(
+    opaque: str,
+) -> None:
+    with pytest.raises(ValueError):
+        decode_trajectory_reference(opaque)
+
+
+def test_curation_replays_and_preserves_train_split_metadata() -> None:
+    engine = ServiceRecoveryEngine(seed=7)
+    trajectory = engine.verify(
+        engine.run_episode(
+            "train-task-001",
+            [ToolCall(tool="run_healthcheck", arguments={})],
+            split=ObjectiveSplit.TRAIN,
+        )
+    ).trajectory
+    store = InMemoryTrajectoryArtifactStore()
+    reference = store.put(trajectory)
+    client = TestClient(
+        create_objective_app(engine, auth_token="secret", artifact_store=store)
+    )
+
+    response = client.post(
+        "/v1/verify-curation",
+        json={
+            "run_id": "run-1",
+            "experiment_id": "run-1-1",
+            "split": "train",
+            "trajectory_references": [reference.model_dump(mode="json")],
+        },
+        headers={"authorization": "Bearer secret"},
+    )
+
+    assert response.status_code == 200
+    dataset = Dataset.model_validate(response.json())
+    assert dataset.rows[0].source_trajectory_id == trajectory.trajectory_id
+    assert dataset.rows[0].task_id == "train-task-001"
+    assert dataset.rows[0].split is ObjectiveSplit.TRAIN
+    assert dataset.rows[0].verifier_confirmed is True

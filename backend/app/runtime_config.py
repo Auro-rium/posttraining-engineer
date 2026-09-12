@@ -22,7 +22,7 @@ class RuntimeConfig(BaseSettings):
     )
 
     app_mode: Literal["local", "aws"] = "local"
-    service_role: Literal["coordinator", "research", "execution"] = "coordinator"
+    service_role: Literal["coordinator", "research", "execution", "objective"] = "coordinator"
     aws_region: str = "us-east-1"
     # Keep Bedrock authentication explicit.  SigV4 uses the configured AWS IAM
     # credential chain and is not affected by a stale AWS_BEARER_TOKEN_BEDROCK
@@ -54,6 +54,13 @@ class RuntimeConfig(BaseSettings):
 
     s3_artifact_bucket: str | None = None
     s3_artifact_prefix: str = "post-training"
+    objective_auth_token: str | None = Field(default=None, repr=False)
+    # Objective inference never downloads a mutable Hugging Face model at
+    # runtime.  These optional values pin a complete local FunctionGemma
+    # snapshot; an absent/partial tuple leaves /v1/benchmark fail-closed.
+    objective_model_checkpoint_dir: str | None = None
+    objective_model_revision: str | None = None
+    objective_model_sha256: str | None = None
     dynamodb_table_name: str | None = None
     sagemaker_training_role_arn: str | None = None
     sagemaker_training_image_uri: str | None = None
@@ -71,7 +78,22 @@ class RuntimeConfig(BaseSettings):
             raise ValueError(
                 "telemetry_otlp_endpoint is required when telemetry_exporter=otlp"
             )
-        if self.app_mode == "aws":
+        if self.service_role == "objective":
+            required_objective = {
+                "s3_artifact_bucket": self.s3_artifact_bucket,
+                "objective_auth_token": self.objective_auth_token,
+            }
+            missing_objective = sorted(
+                name
+                for name, value in required_objective.items()
+                if not value or not value.strip()
+            )
+            if missing_objective:
+                raise ValueError(
+                    "Objective service is missing required configuration: "
+                    + ", ".join(missing_objective)
+                )
+        if self.app_mode == "aws" and self.service_role != "objective":
             required = {
                 "s3_artifact_bucket": self.s3_artifact_bucket,
                 "dynamodb_table_name": self.dynamodb_table_name,

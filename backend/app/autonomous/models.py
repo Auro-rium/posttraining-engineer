@@ -6,7 +6,9 @@ model output are deliberately represented by safe IDs or content hashes.
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -24,6 +26,61 @@ _UNSAFE_CONTENT = re.compile(
     re.IGNORECASE,
 )
 _OPAQUE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/#@+\-]{0,511}$")
+_UNSAFE_PAYLOAD_KEY = re.compile(
+    r"^(?:raw[_ -]?(?:prompt|content|output|completion)|prompt|completion|"
+    r"response|answer|content|secret|private|credential|password|token|hidden|held[_ -]?out)$",
+    re.IGNORECASE,
+)
+_UNSAFE_PAYLOAD_TEXT = re.compile(
+    r"(?:BEGIN\s+(?:PROMPT|COMPLETION|HIDDEN)|END\s+(?:PROMPT|COMPLETION|HIDDEN)|"
+    r"raw[_ -]?(?:prompt|content|output|completion))",
+    re.IGNORECASE,
+)
+_MAX_SAFE_PAYLOAD_BYTES = 64 * 1024
+_MAX_SAFE_PAYLOAD_DEPTH = 6
+_MAX_SAFE_PAYLOAD_ITEMS = 128
+_MAX_SAFE_PAYLOAD_STRING = 4 * 1024
+_QLORA_CONFIG_KEYS = frozenset(
+    {
+        "rank",
+        "alpha",
+        "dropout",
+        "learning_rate",
+        "epochs",
+        "sequence_length",
+        "batch_size",
+        "gradient_accumulation_steps",
+        "target_modules",
+        "objective",
+    }
+)
+_APPROVAL_SCOPE_KEYS = frozenset(
+    {
+        "run_id",
+        "run_number",
+        "model_id",
+        "checkpoint_revision",
+        "checkpoint_s3_uri",
+        "checkpoint_sha256",
+        "benchmark_id",
+        "benchmark_suite",
+        "benchmark_version",
+        "seed",
+        "max_experiments",
+        "max_cost_usd",
+        "instance_type",
+        "instance_count",
+        "volume_size_gb",
+        "max_runtime_seconds",
+        "estimated_cost_usd",
+        "baseline_episodes",
+        "held_out_episodes",
+        "packet_sha256",
+    }
+)
+_CURRENT_HYPOTHESIS_KEYS = frozenset(
+    {"hypothesis", "dataset_plan", "qlora_config", "hypothesis_id", "evidence_ids"}
+)
 
 # Reasons are control-plane labels, never an open-ended text field.  Keep this
 # allow-list finite so adding a new reason is an intentional protocol change.
@@ -197,11 +254,76 @@ def _deep_freeze(value: Any) -> Any:
     return value
 
 
+def _validate_safe_payload(
+    value: Mapping[str, Any], *, name: str, allowed_keys: frozenset[str] | None = None
+) -> FrozenDict:
+    """Validate a bounded JSON control-plane payload and freeze its snapshot."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    if allowed_keys is not None and set(value) - allowed_keys:
+        unknown = ", ".join(repr(key) for key in sorted(set(value) - allowed_keys, key=str))
+        raise ValueError(f"{name} contains unsupported keys: {unknown}")
+
+    def visit(item: Any, *, depth: int, path: str) -> Any:
+        if depth > _MAX_SAFE_PAYLOAD_DEPTH:
+            raise ValueError(f"{name} exceeds maximum nesting depth")
+        if isinstance(item, Mapping):
+            if len(item) > _MAX_SAFE_PAYLOAD_ITEMS:
+                raise ValueError(f"{name} contains too many mapping entries")
+            result: dict[str, Any] = {}
+            for key, child in item.items():
+                if not isinstance(key, str) or not key.strip() or len(key) > 128:
+                    raise ValueError(f"{name} keys must be bounded strings")
+                if _UNSAFE_PAYLOAD_KEY.fullmatch(key):
+                    raise ValueError(f"{name} contains a prohibited content field")
+                result[key] = visit(child, depth=depth + 1, path=f"{path}.{key}")
+            return result
+        if isinstance(item, (list, tuple)):
+            if len(item) > _MAX_SAFE_PAYLOAD_ITEMS:
+                raise ValueError(f"{name} contains too many sequence entries")
+            return [visit(child, depth=depth + 1, path=f"{path}[]") for child in item]
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            if isinstance(item, str):
+                if len(item) > _MAX_SAFE_PAYLOAD_STRING or "\x00" in item:
+                    raise ValueError(f"{name} contains an oversized string")
+                if _UNSAFE_PAYLOAD_TEXT.search(item):
+                    raise ValueError(f"{name} contains prohibited raw content")
+            elif isinstance(item, float) and not isfinite(item):
+                raise ValueError(f"{name} contains a non-finite number")
+            return item
+        raise ValueError(f"{name} contains unsupported value at {path}")
+
+    frozen = _deep_freeze(visit(dict(value), depth=0, path=name))
+    try:
+        encoded = json.dumps(frozen, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain only JSON-safe values") from exc
+    if len(encoded.encode("utf-8")) > _MAX_SAFE_PAYLOAD_BYTES:
+        raise ValueError(f"{name} exceeds the durable payload limit")
+    return cast(FrozenDict, frozen)
+
+
+def _validate_training_config(value: dict[str, Any]) -> FrozenDict:
+    if set(value) - _QLORA_CONFIG_KEYS:
+        raise ValueError("training_config may contain only the fixed QLoRA configuration")
+    if value.get("objective", "SFT") != "SFT":
+        raise ValueError("training_config supports SFT with QLoRA only")
+    return _validate_safe_payload(value, name="training_config")
+
+
+def _validate_state_metadata(value: dict[str, str]) -> FrozenDict:
+    if any(not isinstance(key, str) or not isinstance(item, str) for key, item in value.items()):
+        raise ValueError("metadata must contain string keys and values")
+    return _validate_safe_payload(value, name="metadata")
+
+
 _EVENT_METADATA_KEYS = frozenset(
     {
         "approval_digest",
         "artifact_id",
         "cost_usd",
+        "durable_event_type",
         "evidence_label",
         "event_id",
         "experiment_id",
@@ -213,6 +335,37 @@ _EVENT_METADATA_KEYS = frozenset(
         "run_id",
         "run_number",
         "status",
+    }
+)
+
+_RUN_EVENT_TYPES = frozenset(
+    {
+        "approval.consumed",
+        "artifact.recorded",
+        "cleanup.completed",
+        "cleanup.failed",
+        "job.completed",
+        "job.failed",
+        "job.submitted",
+        "operation.completed",
+        "operation.failed",
+        "operation.intent",
+        "operation.submitted",
+        "phase.completed",
+        "phase.failed",
+        "phase.started",
+        "promotion.decided",
+        "run.blocked",
+        "run.cancel_requested",
+        "run.cancelled",
+        "run.completed",
+        "run.failed",
+        "run.queued",
+        "run.safe_stop_requested",
+        "run.started",
+        "run.stopped",
+        # Repository state changes outside the lifecycle bridge remain explicit.
+        "state.transitioned",
     }
 )
 
@@ -342,10 +495,15 @@ class ExperimentRecord(ContractModel):
                 raise ValueError("metrics require non-empty names and finite numeric values")
         return value
 
-    @field_validator("training_config", "metrics", mode="after")
+    @field_validator("metrics", mode="after")
     @classmethod
     def freeze_mappings(cls, value: dict[str, Any]) -> FrozenDict:
         return cast(FrozenDict, _deep_freeze(value))
+
+    @field_validator("training_config", mode="after")
+    @classmethod
+    def validate_training_config(cls, value: dict[str, Any]) -> FrozenDict:
+        return _validate_training_config(value)
 
     @model_validator(mode="after")
     def freeze_nested_values(self) -> ExperimentRecord:
@@ -388,7 +546,7 @@ class RunOperation(ContractModel):
     @field_validator("result", mode="after")
     @classmethod
     def freeze_result(cls, value: dict[str, Any]) -> FrozenDict:
-        return cast(FrozenDict, _deep_freeze(value))
+        return _validate_safe_payload(value, name="operation result")
 
     @model_validator(mode="after")
     def freeze_nested_values(self) -> RunOperation:
@@ -410,6 +568,13 @@ class RunEventRecord(ContractModel):
     reason: str = Field(min_length=1, max_length=2_000)
     metadata: dict[str, str] = Field(default_factory=dict)
     occurred_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("event_type")
+    @classmethod
+    def validate_event_type(cls, value: str) -> str:
+        if value not in _RUN_EVENT_TYPES:
+            raise ValueError("event_type must use the allow-listed lifecycle vocabulary")
+        return value
 
     @field_validator("occurred_at")
     @classmethod
@@ -534,16 +699,15 @@ class AutonomousRunState(ContractModel):
     def freeze_experiments(cls, value: list[ExperimentRecord]) -> tuple[ExperimentRecord, ...]:
         return tuple(value)
 
-    @field_validator(
-        "metadata",
-        "baseline_metrics",
-        "champion_metrics",
-        "approval_scope",
-        mode="after",
-    )
+    @field_validator("baseline_metrics", "champion_metrics", "approval_scope", mode="after")
     @classmethod
     def freeze_state_mappings(cls, value: dict[str, Any]) -> FrozenDict:
         return cast(FrozenDict, _deep_freeze(value))
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def validate_metadata(cls, value: dict[str, str]) -> FrozenDict:
+        return _validate_state_metadata(value)
 
     @model_validator(mode="after")
     def validate_budget_and_scope(self) -> AutonomousRunState:
@@ -557,12 +721,24 @@ class AutonomousRunState(ContractModel):
         object.__setattr__(self, "metadata", _deep_freeze(self.metadata))
         object.__setattr__(self, "baseline_metrics", _deep_freeze(self.baseline_metrics))
         object.__setattr__(self, "champion_metrics", _deep_freeze(self.champion_metrics))
-        object.__setattr__(self, "approval_scope", _deep_freeze(self.approval_scope))
+        object.__setattr__(
+            self,
+            "approval_scope",
+            _validate_safe_payload(
+                self.approval_scope,
+                name="approval_scope",
+                allowed_keys=_APPROVAL_SCOPE_KEYS,
+            ),
+        )
         if self.current_hypothesis is not None:
             object.__setattr__(
                 self,
                 "current_hypothesis",
-                _deep_freeze(self.current_hypothesis),
+                _validate_safe_payload(
+                    self.current_hypothesis,
+                    name="current_hypothesis",
+                    allowed_keys=_CURRENT_HYPOTHESIS_KEYS,
+                ),
             )
         return self
 

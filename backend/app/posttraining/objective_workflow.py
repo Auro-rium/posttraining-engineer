@@ -13,10 +13,11 @@ import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.objective.models import TrajectoryReference
 from app.posttraining.models import (
     ArtifactReference,
     Evidence,
@@ -44,7 +45,7 @@ class ObjectiveBenchmarkRequest(BaseModel):
     suite_version: str = Field(min_length=1)
     seed: int
     num_episodes: int = Field(ge=1)
-    split: str = Field(min_length=1)
+    split: Literal["train", "replay"]
     output_s3_uri: str = Field(min_length=1)
 
 
@@ -62,6 +63,7 @@ class ObjectiveBenchmarkResult(BaseModel):
     split: str = Field(min_length=1)
     metrics: BenchmarkMetrics
     trajectory_artifact: ArtifactReference | None = None
+    trajectory_references: tuple[TrajectoryReference, ...] = Field(default_factory=tuple)
     report_artifact: ArtifactReference | None = None
     manifest_sha256: str | None = None
     evidence_label: EvidenceLabel = EvidenceLabel.EXPLANATION
@@ -78,6 +80,12 @@ class ObjectiveBenchmarkResult(BaseModel):
 
     @model_validator(mode="after")
     def validate_evidence(self) -> ObjectiveBenchmarkResult:
+        references = self.trajectory_references
+        reference_ids = tuple(reference.trajectory_id for reference in references)
+        if len(set(reference_ids)) != len(reference_ids):
+            raise ValueError("trajectory references must have unique trajectory IDs")
+        if any(not reference.verified for reference in references):
+            raise ValueError("trajectory references must be verifier-confirmed")
         if self.evidence_label in {EvidenceLabel.LIVE, EvidenceLabel.PRIOR_VERIFIED_RUN}:
             if not self.verified:
                 raise ValueError("verified objective evidence must set verified=True")
@@ -142,6 +150,10 @@ def execute_objective_benchmark(
         or result.split != request.split
     ):
         raise ValueError("objective result provenance does not match request")
+    if request.split in {"train", "replay"} and any(
+        reference.split.value != request.split for reference in result.trajectory_references
+    ):
+        raise ValueError("objective trajectory reference split does not match request")
     return result
 
 

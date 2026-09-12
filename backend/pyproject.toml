@@ -22,6 +22,11 @@ cloud = [
   "aws-cdk-lib>=2.140,<3",
   "opentelemetry-exporter-otlp>=1.39,<2",
 ]
+objective = [
+  "safetensors>=0.4.5,<1",
+  "torch>=2.6,<3",
+  "transformers>=4.52,<5",
+]
 dev = [
   "mypy>=1.17,<2",
   "pytest>=8.4,<9",
@@ -54,3 +59,11 @@ python_version = "3.12"
 plugins = ["pydantic.mypy"]
 strict = true
 warn_unused_ignores = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

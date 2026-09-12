@@ -295,8 +295,16 @@ def test_dataset_writes_jsonl_and_manifest_and_normalizes_restart_metadata() -> 
         if name == "put_object" and "datasets/" in str(call["Key"])
     ]
     assert len(dataset_puts) == 2
-    assert any(str(call["Key"]).endswith(".jsonl") for call in dataset_puts)
-    assert any(str(call["Key"]).endswith(".manifest.json") for call in dataset_puts)
+    expected_prefix = (
+        f"objective/datasets/run-1/exp-1/{first_dataset.manifest.sha256}"
+    )
+    assert {str(call["Key"]) for call in dataset_puts} == {
+        f"{expected_prefix}/dataset.jsonl",
+        f"{expected_prefix}/manifest.json",
+    }
+    assert first.s3_uri.startswith(
+        f"s3://objective-artifacts/{expected_prefix}/dataset.jsonl?versionId="
+    )
     restored = store.get_dataset(first_dataset.manifest.dataset_id)
     assert restored is not None
     assert restored.manifest.s3_uri == first.s3_uri

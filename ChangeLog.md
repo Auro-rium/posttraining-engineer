@@ -176,3 +176,43 @@ This file is append-only. Entries describe repository changes and the verificati
 - **Affected files and components:** `README.md`, `backend/README.md`, `Flow.md`, `Decisions.md`, `ChangeLog.md`, and `backend/pyproject.toml`.
 - **Verification:** Living-document validation, backend pytest discovery, Ruff, mypy, and diff checks must pass before integration. Documentation does not constitute evidence of live SageMaker training, held-out evaluation, checkpoint improvement, or promotion.
 - **Known limitations and follow-up:** Real live claims still require a successful read-only preflight, pinned checkpoint, objective-worker artifacts, SageMaker job IDs, independent evaluation evidence, and retained telemetry. The browser observer remains read-only and cannot authorize or manufacture execution.
+
+## 2026-09-12 — `TELEMETRY-LIFECYCLE-HARDENING-001`
+
+- **Goal:** Complete the durable run/phase telemetry lifecycle and close unsafe event/metadata contract gaps.
+- **Summary of changes:** Restricted durable event types to the explicit lifecycle vocabulary; tightened observer identifiers and allow-listed string metadata; made the supervisor persist run start, phase start/completion/failure, and terminal events; propagated durable telemetry validation failures as fail-closed supervisor stops; and added durable event ID plus exact autonomous event type to OpenTelemetry spans.
+- **Affected files and components:** Autonomous models, telemetry bridge, supervisor, observer recorder, telemetry/supervisor/repository tests, `Flow.md`, and `Decisions.md`.
+- **Verification:** Focused pytest suite passed; focused Ruff and mypy checks passed; living-document validation and `git diff --check` passed.
+- **Known limitations:** No live AWS training, held-out evaluation, checkpoint improvement, or promotion was performed. Existing persisted event types outside the new allow-list require explicit migration before they can be decoded.
+
+## 2026-09-12 — `AWS-HACKATHON-EVIDENCE-DOCS-001`
+
+- **Goal:** Clarify local coordinator behavior, the checkpoint-backed objective worker, the guarded AWS live API, and the current live-run evidence boundary.
+- **Summary of changes:** Distinguished process-local `/api/runs` `EXPLANATION` output from the isolated FunctionGemma objective adapter and `/api/live` control plane; documented checkpoint identity and objective-worker credential requirements, approval/idempotency gates, the AWS hackathon-only scope, the historical 2026-09-06 Bedrock/S3 smoke boundary, and the operator-reported pending GPU quota request. Added objective-role credential placeholders and a dated live deployment checkpoint to the autonomous backend plan; did not claim a live run completed.
+- **Affected files and components:** `.env.example`, `README.md`, `backend/README.md`, `Flow.md`, `Decisions.md`, and `docs/superpowers/plans/2026-09-08-autonomous-live-backend.md`.
+- **Verification:** `python3 backend/scripts/check_docs_sync.py` passed; objective execution/artifact contract tests passed (26 tests); `git diff --check` passed. These are local checks, not AWS deployment or live model evidence.
+- **Known limitations:** No AWS calls, deployment, checkpoint-backed benchmark, SageMaker job, held-out evaluation, or promotion was performed for this documentation update. The operator-reported SageMaker quota request `9a3453884e2c4230a6e8bb0004c8cca57FuK8VC5` was `PENDING` as of 2026-09-12; recheck before authorizing compute.
+
+## 2026-09-12 — `DOCKER-DEPLOYMENT-PACKAGING-001`
+
+- **Goal:** Reduce backend image build context and align Docker/CDK deployment instructions with digest-pinned runtime images.
+- **Summary of changes:** Added a shared backend `.dockerignore` for local virtualenvs, caches, tests, local environment files, and unused docs/training data; replaced the stale `:latest` CDK example with amd64 image-build commands and a zero-task ECR bootstrap followed by digest-pinned deployment.
+- **Affected files and components:** `backend/.dockerignore` and `infra/cdk/README.md`.
+- **Verification:** All three Dockerfiles passed BuildKit `--check`; `docker compose config --quiet` passed; the backend image built locally and the objective-role app import passed with local-only test settings; CDK stack tests passed (22); documentation sync and `git diff --check` passed.
+- **Known limitations:** The trainer image build was cancelled during its large CUDA/cuDNN dependency download to unblock integration; the evaluator image was not fully built. No image was pushed and no AWS deployment or SageMaker job was attempted.
+
+## 2026-09-12 — `SEALED-PAIRED-EVALUATION-001`
+
+- **Goal:** Remove unsupported baseline benchmark requests and preserve identical held-out provenance for promotion comparisons.
+- **Summary of changes:** The supervisor no longer requests a separate `baseline` objective benchmark. Candidate and active-champion scores must come from one sealed SageMaker evaluator report; the reader validates both checkpoint digests, shared manifest, paired task outcomes, and per-environment metrics. The objective benchmark request type accepts only `train`/`replay`, and other splits fail before worker invocation.
+- **Affected files and components:** Supervisor, live execution adapters and report reader, objective benchmark request contract, focused tests, `Flow.md`, and `Decisions.md`.
+- **Verification:** Focused supervisor/live-execution/objective workflow/service/execution tests passed (104 tests). No AWS deployment or live held-out evaluation was performed by this change.
+- **Known limitations:** Paired evidence can only be produced by the configured SageMaker sealed evaluator. The legacy synchronous live controller's separate baseline/held-out benchmark calls now fail closed; it must not be used as a held-out path.
+
+## 2026-09-12 — `AWS-CDK-VERSIONED-PREFLIGHT-001`
+
+- **Goal:** Allow the coordinator's read-only preflight to validate immutable S3 object versions without widening access beyond the configured artifact prefix.
+- **Summary of changes:** Added a dedicated `s3:GetObjectVersion` permission for objects under the artifact prefix and a direct CDK assertion for its action and resource scope.
+- **Affected files and components:** `infra/cdk/stacks/post_training_stack.py` and `infra/cdk/tests/test_post_training_stack.py`.
+- **Verification:** CDK stack tests passed (22 tests); documentation sync and `git diff --check` were run after this entry was added.
+- **Known limitations:** No AWS deployment or resource mutation was performed.

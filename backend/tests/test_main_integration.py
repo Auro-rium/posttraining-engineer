@@ -10,10 +10,12 @@ from app.main import (
     _create_application_orchestrator,
     _create_run_registry,
     _record_phase_telemetry,
+    _select_application,
     app,
 )
 from app.observability import EventType, TelemetryRecorder
 from app.providers.repository import DynamoDBRunRepository
+from app.runtime_config import RuntimeConfig
 
 
 def test_local_registry_is_process_local_and_bounded() -> None:
@@ -71,6 +73,54 @@ async def test_main_exposes_comparison_and_telemetry_readiness() -> None:
     assert comparison.status_code == 200
     assert comparison.json()["run_count"] == 0
     assert type(app.state.telemetry).__name__ == "TelemetryRecorder"
+
+
+@pytest.mark.anyio
+async def test_objective_role_selects_only_authenticated_objective_routes() -> None:
+    config = RuntimeConfig(
+        _env_file=None,
+        app_mode="aws",
+        service_role="objective",
+        s3_artifact_bucket="objective-artifacts",
+        s3_artifact_prefix="objective",
+        objective_auth_token="objective-secret",
+    )
+    objective_app = _select_application(config, app)
+    paths = {getattr(route, "path", "") for route in objective_app.routes}
+
+    assert {"/health", "/v1/auth-probe", "/v1/benchmark", "/v1/verify-curation"} <= paths
+    assert "/api/runs" not in paths
+
+    async with AsyncClient(
+        transport=ASGITransport(app=objective_app), base_url="http://test"
+    ) as client:
+        health = await client.get("/health")
+        unauthorized = await client.get("/v1/auth-probe")
+        authenticated = await client.get(
+            "/v1/auth-probe", headers={"Authorization": "Bearer objective-secret"}
+        )
+        benchmark = await client.post(
+            "/v1/benchmark",
+            json={"run_id": "readiness-probe", "split": "invalid"},
+            headers={"Authorization": "Bearer objective-secret"},
+        )
+        curation = await client.post(
+            "/v1/verify-curation",
+            json={
+                "run_id": "readiness-probe",
+                "experiment_id": "readiness-probe",
+                "split": "invalid",
+            },
+            headers={"Authorization": "Bearer objective-secret"},
+        )
+
+    assert health.status_code == 200
+    assert unauthorized.status_code == 401
+    assert authenticated.status_code == 200
+    # Invalid split probes establish route+auth capability without running or
+    # exposing any objective tasks.
+    assert benchmark.status_code == 422
+    assert curation.status_code == 422
 
 
 def test_phase_telemetry_covers_jobs_and_promotion_without_model_content() -> None:

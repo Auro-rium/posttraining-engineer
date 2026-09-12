@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -41,7 +42,7 @@ FACTORIES = (
 def test_all_specialists_use_exact_nemotron_model() -> None:
     for factory in FACTORIES:
         specialist = factory()
-        model = specialist.agent.model
+        model = cast(Any, specialist.agent.model)
         assert model.config["model_id"] == NEMOTRON_MODEL_ID
         assert specialist.prompt_metadata["model_id"] == NEMOTRON_MODEL_ID
         assert specialist.prompt_metadata["prompt_version"] == PROMPT_CONTRACT_VERSION
@@ -65,6 +66,8 @@ def test_prompt_contracts_are_explicit_hashed_and_safe() -> None:
         "sealed held-out",
         "status BLOCKED",
         "Never invent",
+        "Evidence labels and run/experiment provenance are coordinator-owned inputs",
+        "Never create or change a promotion",
     )
     for agent_key in AGENT_KEYS:
         contract = get_prompt_contract(agent_key)
@@ -104,6 +107,49 @@ def test_prompt_library_has_one_reviewable_file_per_specialist() -> None:
         source = (PROMPT_LIBRARY_DIR / get_prompt_contract(agent_key).prompt_file).read_text()
         assert source.startswith(f"# {agent_key}\n")
         assert "held-out" in source.lower()
+
+
+def test_adapter_prompt_handoff_schemas_match_typed_contracts() -> None:
+    expected = {
+        "failure_analyst_agent.md": (
+        "trajectory_references",
+        "experiment_history",
+        "input `evidence_class`",
+            "clusters",
+        ),
+        "research_agent.md": (
+            "run_id",
+            "experiment_number",
+            "verified_evidence_references",
+            "verified_evidence_metadata",
+            "evidence_class` set to",
+            "hypotheses",
+        ),
+        "data_curator_agent.md": (
+            "verified_trajectory_references",
+            "verified_trajectory_metadata",
+            "failure_clusters",
+            "`plan`",
+            "selected_trajectory_refs",
+            "target_failure_classes",
+            "worker creates and verifies the dataset artifact after this judgment-only plan",
+        ),
+        "training_designer_agent.md": (
+            "`dataset_plan`",
+            "`config` containing exactly",
+            "gradient_accumulation_steps",
+        ),
+    }
+    for filename, fragments in expected.items():
+        source = (PROMPT_LIBRARY_DIR / filename).read_text(encoding="utf-8")
+        assert all(fragment in source for fragment in fragments), filename
+
+
+def test_champion_manager_prompt_cannot_claim_a_promotion_decision() -> None:
+    prompt = get_prompt_contract("ChampionManagerAgent").prompt
+    assert "deterministic_gate_decision` copied unchanged" in prompt
+    assert "Only deterministic coordinator code may promote a checkpoint" in prompt
+    assert "as an agent recommendation" in prompt
 
 
 def test_model_resolver_accepts_only_pinned_id() -> None:

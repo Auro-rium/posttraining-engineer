@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from .models import AutonomousRunState
 from .repository import AutonomousRunRepository, LeaseConflictError
@@ -50,6 +50,8 @@ class AutonomousRunDispatcher:
         self.owner = owner
         self.lease_ttl_seconds = lease_ttl_seconds
         self.scan_limit = scan_limit
+        if getattr(supervisor, "owner", None) is None:
+            cast(Any, supervisor).owner = owner
 
     async def dispatch_once(self) -> list[str]:
         page = self.repository.scan_recoverable(limit=self.scan_limit)

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Final
 
 NEMOTRON_MODEL_ID: Final[str] = "nvidia.nemotron-super-3-120b"
-PROMPT_CONTRACT_VERSION: Final[str] = "nemotron-120b-contract-v2"
+PROMPT_CONTRACT_VERSION: Final[str] = "nemotron-120b-contract-v3"
 PROMPT_LIBRARY_DIR: Final[Path] = Path(__file__).resolve().parents[2] / "prompts"
 _LIBRARY_SECTIONS: Final[tuple[str, ...]] = (
     "MISSION",
@@ -38,9 +38,9 @@ _HANDOFF_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
         "manifest_hash",
         "trajectory_references",
         "verified_trajectory_references",
-        "verified_dataset_artifact_references",
         "verified_evidence_references",
         "verified_evidence_metadata",
+        "verified_trajectory_metadata",
         "verified",
         "measurement_id",
         "artifact_id",
@@ -84,13 +84,13 @@ _HANDOFF_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
         "batch_size",
         "gradient_accumulation_steps",
         "target_modules",
+        "target_failure_classes",
     }
 )
 _HANDOFF_REFERENCE_KEYS: Final[frozenset[str]] = frozenset(
     {
         "trajectory_references",
         "verified_trajectory_references",
-        "verified_dataset_artifact_references",
         "verified_evidence_references",
         "evidence_refs",
         "artifact_ids",
@@ -221,6 +221,12 @@ EVIDENCE AND SAFETY RULES
 - Allowed evidence labels are LIVE, PRIOR_VERIFIED_RUN, and EXPLANATION. Use LIVE only for measurements
   returned by the current provider execution; use PRIOR_VERIFIED_RUN only for a previously verified artifact;
   use EXPLANATION for reasoning that is not measurement evidence.
+- Evidence labels and run/experiment provenance are coordinator-owned inputs. Never choose, upgrade, or
+  infer an evidence label; copy it only when the exact label is supplied for that artifact. If provenance is
+  absent or contradictory, return BLOCKED rather than inventing a label, run ID, experiment number, or artifact.
+- Your status reports only this agent's own validated response. It never establishes provider job completion,
+  training success, evaluation success, approval, or checkpoint promotion. Never create or change a promotion
+  decision; explain only a deterministic decision already present in the input.
 - Never invent a trajectory, metric, score, provider job ID, checkpoint URI, dataset URI, approval token,
   timestamp, cost, latency, or completion status.
 - Never turn EXPLANATION into training data or promotion evidence.
@@ -287,7 +293,7 @@ def _validate_handoff_metadata(value: Any, *, field: str | None = None) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
             dynamic_reference = (
-                field == "verified_evidence_metadata"
+                field in {"verified_evidence_metadata", "verified_trajectory_metadata"}
                 and isinstance(key, str)
                 and _HANDOFF_REFERENCE_PATTERN.fullmatch(key)
             )
@@ -336,10 +342,10 @@ def _validate_handoff_metadata(value: Any, *, field: str | None = None) -> None:
     ):
         raise ValueError(f"invalid opaque reference: {value!r}")
 
-_COMMON_INPUTS = """Required fields: run_id (string), run_number (integer 1..5), suite (string),
-suite_version (string), seed (integer), manifest_hash (64-character SHA-256 string), and phase (enum).
-Additional fields are listed in the mission-specific contract below. Treat opaque artifact references as
-references; do not load or echo sealed content unless an authorized adapter requires it."""
+_COMMON_INPUTS = """The caller supplies only the role-specific fields listed below; do not assume that
+other fields are present. Any run_id, experiment_number, evidence_class, and opaque references are
+coordinator-owned metadata and must be preserved exactly. Treat artifact references as references; do not
+load or echo sealed content unless an authorized adapter explicitly requires it."""
 
 
 _CONTRACTS: Mapping[str, AgentPromptContract] = {

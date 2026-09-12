@@ -2,6 +2,7 @@
 Main application entry point for the autonomous post-training engineer.
 Updated for AWS Agents for Humans Hackathon with Strands Agents.
 """
+
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -14,12 +15,22 @@ import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
+from app.api.autonomous_live import install_autonomous_live_api
 from app.api.continuous_post_training import install_post_training_api
 from app.api.live_readiness import install_live_readiness_api
 from app.api.run_comparison import install_run_comparison_api
 from app.core.environment import create_service_recovery_environment
 from app.core.orchestrator import create_orchestrator
 from app.core.state import OptimizationRun
+from app.live_execution import (
+    PreflightRunner,
+    config_from_environment,
+    create_autonomous_live_components,
+)
+from app.objective.artifacts import S3TrajectoryArtifactStore
+from app.objective.engine import ServiceRecoveryEngine
+from app.objective.execution import build_benchmark_execution_adapter
+from app.objective.service import create_objective_app
 from app.observability import EventType, TelemetryRecorder
 from app.posttraining.run_history import (
     MAX_RUNS,
@@ -28,8 +39,8 @@ from app.posttraining.run_history import (
     RunLimitExceeded,
     RunRegistry,
 )
-from app.providers.repository import DynamoDBRunRepository
 from app.providers.bedrock import BedrockStrandsModel
+from app.providers.repository import DynamoDBRunRepository
 from app.providers.sagemaker import SageMakerProvider
 from app.runtime_config import get_runtime_config
 
@@ -99,9 +110,48 @@ def _create_run_registry(config: Any) -> RunRegistry:
         repository = _LocalRunHistoryRepository()
     return RunRegistry(repository, max_runs=MAX_RUNS)
 
+
+def _create_objective_application(config: Any) -> FastAPI:
+    """Build the authenticated objective service with durable S3 artifacts."""
+
+    bucket = getattr(config, "s3_artifact_bucket", None)
+    auth_token = getattr(config, "objective_auth_token", None)
+    if not isinstance(bucket, str) or not bucket.strip():
+        raise ValueError("objective service requires s3_artifact_bucket")
+    if not isinstance(auth_token, str) or not auth_token.strip():
+        raise ValueError("objective service requires objective_auth_token")
+    artifact_store = S3TrajectoryArtifactStore(
+        bucket.strip(), prefix=getattr(config, "s3_artifact_prefix", "objective")
+    )
+    execution_adapter = build_benchmark_execution_adapter(
+        {
+            "OBJECTIVE_MODEL_CHECKPOINT_DIR": (
+                getattr(config, "objective_model_checkpoint_dir", None) or ""
+            ),
+            "OBJECTIVE_MODEL_REVISION": getattr(config, "objective_model_revision", None) or "",
+            "OBJECTIVE_MODEL_SHA256": getattr(config, "objective_model_sha256", None) or "",
+        }
+    )
+    return create_objective_app(
+        ServiceRecoveryEngine(),
+        auth_token=auth_token,
+        execution_adapter=execution_adapter,
+        artifact_store=artifact_store,
+    )
+
+
+def _select_application(config: Any, coordinator_app: FastAPI) -> FastAPI:
+    """Select the isolated objective role while preserving coordinator startup."""
+
+    if getattr(config, "service_role", "coordinator") == "objective":
+        return _create_objective_application(config)
+    return coordinator_app
+
+
 # Validate deployment configuration before creating the application. AWS mode
 # fails closed rather than silently running the local simulation.
 settings = get_runtime_config()
+
 
 def _create_application_orchestrator(config: Any) -> Any:
     """Wire configured model/provider dependencies into the coordinator.
@@ -113,9 +163,7 @@ def _create_application_orchestrator(config: Any) -> Any:
     """
 
     provider = (
-        SageMakerProvider(region_name=config.aws_region)
-        if config.app_mode == "aws"
-        else None
+        SageMakerProvider(region_name=config.aws_region) if config.app_mode == "aws" else None
     )
     # Pass a concrete Bedrock model in AWS mode.  This forces the Strands
     # agents through the explicit SigV4 boto session instead of its model-id
@@ -139,7 +187,11 @@ def _create_application_orchestrator(config: Any) -> Any:
 
 # Initialize the orchestrator with the same model and provider configuration
 # advertised by the process health contract.
-orchestrator = _create_application_orchestrator(settings)
+orchestrator: Any = (
+    None
+    if settings.service_role == "objective"
+    else _create_application_orchestrator(settings)
+)
 
 # In-memory store for active runs (would use database in production)
 active_runs: dict[str, OptimizationRun] = {}
@@ -152,10 +204,45 @@ app = FastAPI(
 )
 install_post_training_api(app)
 install_live_readiness_api(app)
-app.state.run_registry = _create_run_registry(settings)
+registry_settings = (
+    settings.model_copy(update={"app_mode": "local"})
+    if settings.service_role == "objective"
+    else settings
+)
+app.state.run_registry = _create_run_registry(registry_settings)
 app.state.telemetry = TelemetryRecorder()
 app.state.run_numbers = {}
+app.state.live_repository = None
+app.state.live_supervisor = None
+app.state.live_dispatcher = None
+app.state.live_config = None
+app.state.live_preflight_runner = None
+if settings.app_mode == "aws" and settings.service_role != "objective":
+    # Live construction is intentionally fail-closed.  Deployment must supply
+    # every immutable artifact, worker URL/token, and approval secret; no
+    # local supervisor or simulated provider is selected when it is absent.
+    try:
+        live_config = config_from_environment()
+        from app.autonomous.repository import DynamoDBAutonomousRunRepository
+
+        live_repository = DynamoDBAutonomousRunRepository(
+            table_name=live_config.dynamodb_table,
+            region_name=live_config.aws_region,
+        )
+        components = create_autonomous_live_components(
+            live_config,
+            repository=live_repository,
+            telemetry=app.state.telemetry,
+        )
+        app.state.live_config = live_config
+        app.state.live_repository = components.repository
+        app.state.live_supervisor = components.supervisor
+        app.state.live_dispatcher = components.dispatcher
+        app.state.live_preflight_runner = PreflightRunner(live_config)
+    except Exception:
+        logger.warning("live autonomous API is blocked by missing configuration/adapters")
 install_run_comparison_api(app, app.state.run_registry)
+install_autonomous_live_api(app)
 
 
 def _record_telemetry(
@@ -206,16 +293,12 @@ def _record_phase_telemetry(
     result = phase_result or {}
     result_status = str(result.get("status", "unknown"))
     event_type = (
-        EventType.PHASE_COMPLETED
-        if result_status == "completed"
-        else EventType.PHASE_FAILED
+        EventType.PHASE_COMPLETED if result_status == "completed" else EventType.PHASE_FAILED
     )
     _record_telemetry(event_type, run, phase=phase, status=result_status)
     if phase in {"execute_training", "evaluate"}:
         job_event = (
-            EventType.JOB_COMPLETED
-            if result_status == "completed"
-            else EventType.JOB_FAILED
+            EventType.JOB_COMPLETED if result_status == "completed" else EventType.JOB_FAILED
         )
         _record_telemetry(job_event, run, phase=phase, status=result_status)
     if phase == "promote_decision" and result_status == "completed":
@@ -231,9 +314,8 @@ def _record_phase_telemetry(
         )
 
 
-
 @app.get("/health")
-async def health_check():
+async def health_check() -> JSONResponse:
     """Health check endpoint."""
     return JSONResponse(
         content={
@@ -256,13 +338,13 @@ async def health_check():
                 "environment": "available",
                 "run_history": "ready",
                 "telemetry": "ready",
-            }
+            },
         }
     )
 
 
 @app.get("/.well-known/agent-card.json")
-async def agent_card():
+async def agent_card() -> dict[str, Any]:
     """Publish a minimal role card for internal service discovery."""
     return {
         "name": f"autonomous-post-training-{settings.service_role}",
@@ -279,8 +361,8 @@ async def create_optimization_run(
     base_checkpoint: str,
     environment: str = "agentgym-service-recovery",
     objective: str = "maximize task success rate",
-    budget: dict | None = None
-):
+    budget: dict[str, Any] | None = None,
+) -> JSONResponse:
     """
     Create a new optimization run.
 
@@ -305,9 +387,7 @@ async def create_optimization_run(
             budget = dict(budget)
         max_experiments = budget.get("maxExperiments", settings.max_experiments)
         max_cost_usd = budget.get("maxCostUSD", settings.max_cost_usd)
-        max_training_time = budget.get(
-            "maxTrainingTimeMin", settings.max_training_time_min
-        )
+        max_training_time = budget.get("maxTrainingTimeMin", settings.max_training_time_min)
         if (
             isinstance(max_experiments, bool)
             or not isinstance(max_experiments, int)
@@ -322,9 +402,7 @@ async def create_optimization_run(
             or not math.isfinite(float(max_cost_usd))
             or not 0 <= float(max_cost_usd) <= settings.max_cost_usd
         ):
-            raise ValueError(
-                f"maxCostUSD must be finite and between 0 and {settings.max_cost_usd}"
-            )
+            raise ValueError(f"maxCostUSD must be finite and between 0 and {settings.max_cost_usd}")
         if (
             isinstance(max_training_time, bool)
             or not isinstance(max_training_time, int)
@@ -342,10 +420,7 @@ async def create_optimization_run(
         )
 
         # Generate a unique run ID and reserve the bounded comparison slot.
-        run_id = (
-            f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_"
-            f"{uuid4().hex[:8]}"
-        )
+        run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
         history_records = app.state.run_registry.list_runs()
         run_number = len(history_records) + 1
         parent_run_id = history_records[-1].run_id if history_records else None
@@ -357,7 +432,7 @@ async def create_optimization_run(
             base_checkpoint=base_checkpoint,
             environment=environment,
             objective=objective,
-            budget=budget
+            budget=budget,
         )
 
         app.state.run_registry.register(
@@ -391,20 +466,23 @@ async def create_optimization_run(
                 "targetModel": target_model,
                 "environment": environment,
                 "createdAt": run.createdAt.isoformat(),
-                "message": "Optimization run created successfully. Use POST /api/runs/{run_id}/step to begin execution."
-            }
+                "message": (
+                    "Optimization run created successfully. Use POST "
+                    "/api/runs/{run_id}/step to begin execution."
+                ),
+            },
         )
 
     except RunLimitExceeded as e:
         logger.warning("Run history limit reached: %s", e)
         raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
-        logger.error(f"Failed to create optimization run: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Failed to create run: {str(e)}")
+        logger.error(f"Failed to create optimization run: {e!s}")
+        raise HTTPException(status_code=400, detail=f"Failed to create run: {e!s}") from e
 
 
 @app.post("/api/runs/{run_id}/step")
-async def execute_next_step(run_id: str):
+async def execute_next_step(run_id: str) -> JSONResponse:
     """
     Execute the next step in the optimization workflow.
 
@@ -418,14 +496,18 @@ async def execute_next_step(run_id: str):
 
     try:
         # Execute exactly one next phase; /auto is reserved for the full loop.
-        current_index = orchestrator.phases.index(run.currentPhase) if run.currentPhase in orchestrator.phases else -1
+        current_index = (
+            orchestrator.phases.index(run.currentPhase)
+            if run.currentPhase in orchestrator.phases
+            else -1
+        )
         if current_index + 1 >= len(orchestrator.phases):
-            return JSONResponse(content={"runId": run_id, "status": run.status, "message": "run is complete"})
+            return JSONResponse(
+                content={"runId": run_id, "status": run.status, "message": "run is complete"}
+            )
         next_phase = orchestrator.phases[current_index + 1]
         _record_phase_telemetry(run, next_phase, None, started=True)
-        updated_run, workflow_result = orchestrator.execute_workflow(
-            run, target_phase=next_phase
-        )
+        updated_run, workflow_result = orchestrator.execute_workflow(run, target_phase=next_phase)
 
         # Update stored run
         active_runs[run_id] = updated_run
@@ -441,17 +523,19 @@ async def execute_next_step(run_id: str):
                 "currentPhase": updated_run.currentPhase,
                 "status": updated_run.status,
                 "workflowResult": workflow_result,
-                "updatedAt": updated_run.updatedAt.isoformat()
+                "updatedAt": updated_run.updatedAt.isoformat(),
             }
         )
 
     except Exception as e:
-        logger.error(f"Failed to execute step for run {run_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to execute step: {str(e)}")
+        logger.error(f"Failed to execute step for run {run_id}: {e!s}")
+        raise HTTPException(status_code=500, detail=f"Failed to execute step: {e!s}") from e
 
 
 @app.post("/api/runs/{run_id}/auto")
-async def execute_auto_workflow(run_id: str, background_tasks: BackgroundTasks):
+async def execute_auto_workflow(
+    run_id: str, background_tasks: BackgroundTasks
+) -> JSONResponse:
     """
     Execute the full optimization workflow automatically.
 
@@ -464,7 +548,7 @@ async def execute_auto_workflow(run_id: str, background_tasks: BackgroundTasks):
     run = active_runs[run_id]
 
     # Add the full workflow execution as a background task
-    def run_full_workflow():
+    def run_full_workflow() -> None:
         try:
             current_index = (
                 orchestrator.phases.index(run.currentPhase)
@@ -488,10 +572,12 @@ async def execute_auto_workflow(run_id: str, background_tasks: BackgroundTasks):
                 else EventType.RUN_FAILED
             )
             _record_telemetry(terminal_event, final_run, status=final_run.status)
-            logger.info(f"Completed auto workflow for run {run_id}: {workflow_result.get('overall_status')}")
+            logger.info(
+                f"Completed auto workflow for run {run_id}: {workflow_result.get('overall_status')}"
+            )
         except Exception as e:
             _record_telemetry(EventType.RUN_FAILED, run, phase=run.currentPhase, status="failed")
-            logger.error(f"Auto workflow failed for run {run_id}: {str(e)}")
+            logger.error(f"Auto workflow failed for run {run_id}: {e!s}")
 
     background_tasks.add_task(run_full_workflow)
 
@@ -500,13 +586,13 @@ async def execute_auto_workflow(run_id: str, background_tasks: BackgroundTasks):
             "runId": run_id,
             "status": "workflow_started",
             "message": "Full optimization workflow started in background",
-            "startedAt": datetime.utcnow().isoformat()
+            "startedAt": datetime.utcnow().isoformat(),
         }
     )
 
 
 @app.get("/api/runs/{run_id}")
-async def get_run_status(run_id: str):
+async def get_run_status(run_id: str) -> JSONResponse:
     """
     Get the current status of an optimization run.
 
@@ -532,13 +618,13 @@ async def get_run_status(run_id: str):
             "championPerformance": run.championPerformance,
             "totalExperiments": len(run.experiments),
             "totalCandidates": len(run.candidates),
-            "championCheckpoint": run.championCheckpoint
+            "championCheckpoint": run.championCheckpoint,
         }
     )
 
 
 @app.get("/api/runs/{run_id}/experiments")
-async def get_run_experiments(run_id: str):
+async def get_run_experiments(run_id: str) -> JSONResponse:
     """
     Get experiment history for an optimization run.
 
@@ -561,13 +647,13 @@ async def get_run_experiments(run_id: str):
             "trajectories": run.trajectories,
             "championCheckpoint": run.championCheckpoint,
             "championPerformance": run.championPerformance,
-            "baselinePerformance": run.baselinePerformance
+            "baselinePerformance": run.baselinePerformance,
         }
     )
 
 
 @app.post("/api/runs/{run_id}/cancel")
-async def cancel_run(run_id: str):
+async def cancel_run(run_id: str) -> JSONResponse:
     """
     Cancel an optimization run.
 
@@ -579,7 +665,7 @@ async def cancel_run(run_id: str):
 
     run = active_runs[run_id]
     run.status = "cancelled"
-    run.update_timestamp()
+    run.update_timestamp()  # type: ignore[no-untyped-call]
     _record_telemetry(EventType.RUN_FAILED, run, status="cancelled")
 
     logger.info(f"Cancelled run {run_id}")
@@ -589,13 +675,13 @@ async def cancel_run(run_id: str):
             "runId": run_id,
             "status": "cancelled",
             "message": "Optimization run cancelled",
-            "cancelledAt": run.updatedAt.isoformat()
+            "cancelledAt": run.updatedAt.isoformat(),
         }
     )
 
 
 @app.post("/api/demo/reset-environment")
-async def reset_environment():
+async def reset_environment() -> JSONResponse:
     """
     Reset the service recovery environment for demonstration purposes.
     """
@@ -608,12 +694,15 @@ async def reset_environment():
                 "message": "Environment reset successfully",
                 "environmentId": "demo-env-001",
                 "initialObservation": observation,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.utcnow().isoformat(),
             }
         )
     except Exception as e:
-        logger.error(f"Failed to reset environment: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to reset environment: {str(e)}")
+        logger.error(f"Failed to reset environment: {e!s}")
+        raise HTTPException(status_code=500, detail=f"Failed to reset environment: {e!s}") from e
+
+
+app = _select_application(settings, app)
 
 
 if __name__ == "__main__":

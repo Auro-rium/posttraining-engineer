@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
+import tarfile
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -15,9 +19,12 @@ from app.live_execution import (
     CheckStatus,
     GpuCapacityStatus,
     GpuQuotaStatus,
+    LiveEvaluationReader,
     LiveExecutionBlocked,
     LiveExecutionConfig,
     LiveExecutionFailed,
+    LiveObjectiveAdapter,
+    LiveRequestFactory,
     ObjectiveWorkerClient,
     PreflightClassification,
     PreflightRunner,
@@ -25,6 +32,14 @@ from app.live_execution import (
     config_from_environment,
     issue_approval_token,
 )
+from app.objective.engine import ServiceRecoveryEngine
+from app.objective.models import (
+    CurationRequest,
+    ObjectiveSplit,
+    ToolCall,
+    TrajectoryReference,
+)
+from app.objective.service import InMemoryTrajectoryArtifactStore, ObjectiveService
 from app.observability import TelemetryRecorder
 from app.posttraining.models import ArtifactKind, ArtifactReference, EvidenceLabel
 from app.posttraining.objective_workflow import ObjectiveBenchmarkRequest, ObjectiveBenchmarkResult
@@ -66,9 +81,131 @@ def test_objective_worker_requires_https() -> None:
         ObjectiveWorkerClient("http://worker.example.com")
 
 
+def test_live_request_factory_pins_worker_inputs_and_query_free_artifacts() -> None:
+    config = _config()
+    dataset_sha = "a" * 64
+    base_sha = "b" * 64
+    dataset = SimpleNamespace(
+        dataset_id="dataset-1",
+        uri=(
+            f"s3://demo-bucket/datasets/run-1/1/{dataset_sha}/dataset.jsonl"
+            "?versionId=dataset-v1"
+        ),
+        sha256=dataset_sha,
+        artifact_id="dataset://dataset-1",
+    )
+    state = SimpleNamespace(
+        run_id="run-1",
+        benchmark_manifest_sha256="d" * 64,
+        benchmark_version="agent-eval-v1",
+        benchmark_seed=7,
+        model_id="google/functiongemma-270m-it",
+        checkpoint_revision="a" * 40,
+        base_checkpoint_uri=f"s3://demo-bucket/checkpoints/{base_sha}.tar.gz?versionId=base-v1",
+        base_checkpoint_sha256=base_sha,
+        approval_scope={
+            "instance_type": config.instance_type,
+            "instance_count": config.instance_count,
+            "volume_size_gb": config.volume_size_gb,
+            "max_runtime_seconds": config.max_runtime_seconds,
+        },
+    )
+    qlora = {
+        "rank": 8,
+        "alpha": 16,
+        "dropout": 0.05,
+        "learning_rate": 0.0002,
+        "epochs": 1,
+        "sequence_length": 512,
+        "batch_size": 1,
+        "gradient_accumulation_steps": 4,
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    }
+    factory = LiveRequestFactory(config)
+
+    training = factory.training(
+        state,
+        experiment_number=1,
+        dataset=dataset,
+        config=SimpleNamespace(model_dump=lambda **_: qlora),
+    )
+    evaluation = factory.evaluation(
+        state,
+        experiment_number=1,
+        candidate=SimpleNamespace(
+            uri=f"s3://demo-bucket/checkpoints/{'c' * 64}.tar.gz?versionId=candidate-v1",
+            sha256="c" * 64,
+            artifact_id="checkpoint://" + "c" * 64,
+        ),
+    )
+
+    assert training.input_s3_uri == f"s3://demo-bucket/datasets/run-1/1/{dataset_sha}"
+    assert "?" not in training.input_s3_uri
+    assert training.environment["RUN_ID"] == "run-1"
+    assert training.environment["EXPERIMENT_ID"] == "run-1-1"
+    assert training.environment["DATASET_ID"] == "dataset-1"
+    assert training.environment["DATASET_SHA256"] == dataset_sha
+    assert training.environment["APPROVED_DATASET_ARTIFACT_ID"] == "dataset://dataset-1"
+    assert training.environment["BASE_MODEL_ID"] == config.target_model
+    assert training.environment["BASE_MODEL_REVISION"] == config.hf_revision
+    assert json.loads(training.environment["QLORA_CONFIG"]) == qlora
+    assert evaluation.candidate_s3_uri == f"s3://demo-bucket/checkpoints/{'c' * 64}.tar.gz"
+    assert evaluation.champion_s3_uri == f"s3://demo-bucket/checkpoints/{base_sha}.tar.gz"
+    assert evaluation.sealed_s3_uri == config.evaluation_input_s3_uri
+    assert evaluation.environment == {
+        "RUN_ID": "run-1",
+        "EXPERIMENT_ID": "run-1-1",
+        "EVALUATION_MANIFEST_SHA256": "d" * 64,
+        "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+        "OBJECTIVE_SEED": "7",
+        "CANDIDATE_ARCHIVE_SHA256": "c" * 64,
+        "CHAMPION_ARCHIVE_SHA256": base_sha,
+    }
+
+
+def test_live_request_factory_blocks_unversioned_or_mismatched_dataset() -> None:
+    config = _config()
+    state = SimpleNamespace(
+        run_id="run-1",
+        approval_scope={
+            "instance_type": config.instance_type,
+            "instance_count": config.instance_count,
+            "volume_size_gb": config.volume_size_gb,
+            "max_runtime_seconds": config.max_runtime_seconds,
+        },
+    )
+    dataset = SimpleNamespace(
+        dataset_id="dataset-1",
+        uri=f"s3://demo-bucket/datasets/run-1/1/{'a' * 64}/dataset.jsonl",
+        sha256="a" * 64,
+        artifact_id="dataset://dataset-1",
+    )
+    qlora = {"model_dump": lambda **_: {}}
+
+    with pytest.raises(LiveExecutionBlocked, match="versioned content-addressed"):
+        LiveRequestFactory(config).training(
+            state,
+            experiment_number=1,
+            dataset=dataset,
+            config=SimpleNamespace(**qlora),
+        )
+
+
 def test_environment_config_fails_closed_when_required_inputs_missing() -> None:
     with pytest.raises(LiveExecutionBlocked, match="missing live configuration"):
         config_from_environment({})
+
+
+def test_preflight_requires_the_configured_approval_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    monkeypatch.delenv(config.approval_secret_env, raising=False)
+
+    check = PreflightRunner(config)._check_approval_secret()
+
+    assert check.status is CheckStatus.BLOCKED
+    assert check.classification is PreflightClassification.BLOCKED_CONFIGURATION
 
 
 def test_gpu_preflight_blocks_instance_outside_explicit_allowlist() -> None:
@@ -175,6 +312,20 @@ def test_approval_token_is_bound_to_packet_and_rejects_tampering() -> None:
     with pytest.raises(LiveExecutionBlocked, match="signature"):
         _decode_approval_token(f"{version}.{tampered_payload}.{signature}", "demo-approval-secret")
 
+
+def test_approval_packet_requires_aware_bounded_timestamps() -> None:
+    with pytest.raises(ValidationError, match="timezone"):
+        _approval_packet(issued_at=datetime.now(), expires_at=datetime.now() + timedelta(minutes=5))
+    with pytest.raises(ValidationError, match="future"):
+        _approval_packet(
+            issued_at=datetime.now(UTC) + timedelta(minutes=1),
+            expires_at=datetime.now(UTC) + timedelta(minutes=6),
+        )
+    with pytest.raises(ValidationError, match="too long"):
+        _approval_packet(
+            issued_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC) + timedelta(days=2),
+        )
 
 def _controller(**overrides: object) -> AutonomousRunController:
     return AutonomousRunController(
@@ -372,9 +523,7 @@ def test_promoted_champion_checkpoint_uri_and_digest_are_selected_from_artifact(
         checkpoint_sha256="c" * 64,
         checkpoint_uri=controller._checkpoint_uri(champion),
     )
-    assert payload["checkpoint_s3_uri"] == (
-        "s3://demo-bucket/champion/model.tar.gz?versionId=v42"
-    )
+    assert payload["checkpoint_s3_uri"] == ("s3://demo-bucket/champion/model.tar.gz?versionId=v42")
 
 
 def test_promoted_champion_must_reference_a_checkpoint_artifact() -> None:
@@ -385,9 +534,7 @@ def test_promoted_champion_must_reference_a_checkpoint_artifact() -> None:
 
 def test_live_benchmark_rejects_result_with_different_manifest() -> None:
     class Worker:
-        def execute_benchmark(
-            self, request: ObjectiveBenchmarkRequest
-        ) -> ObjectiveBenchmarkResult:
+        def execute_benchmark(self, request: ObjectiveBenchmarkRequest) -> ObjectiveBenchmarkResult:
             received = request
             return ObjectiveBenchmarkResult(
                 benchmark_id="benchmark-1",
@@ -415,11 +562,26 @@ def test_live_benchmark_rejects_result_with_different_manifest() -> None:
         controller._benchmark(
             run_id="run-1",
             model_uri="s3://demo-bucket/base/model.tar.gz",
-            split="baseline",
+            split="train",
             episodes=2,
-            output_s3_uri="s3://demo-bucket/run-1/baseline",
+            output_s3_uri="s3://demo-bucket/run-1/train",
             manifest_sha256="f" * 64,
         )
+
+
+def test_live_training_benchmark_rejects_baseline_split_before_worker_call() -> None:
+    class Worker:
+        def execute_benchmark(self, request: ObjectiveBenchmarkRequest) -> ObjectiveBenchmarkResult:
+            raise AssertionError(f"unsupported split reached worker: {request.split}")
+
+    adapter = LiveObjectiveAdapter(Worker(), _config())
+    state = SimpleNamespace(
+        run_id="run-1",
+        base_checkpoint_uri="s3://demo-bucket/base.tar.gz?versionId=base-v1",
+    )
+
+    with pytest.raises(LiveExecutionFailed, match="paired evaluator"):
+        adapter.benchmark(state, split="baseline", experiment_number=0)
 
 
 def test_cleanup_telemetry_contains_provider_job_id_and_phase() -> None:
@@ -450,3 +612,357 @@ def test_cleanup_telemetry_contains_provider_job_id_and_phase() -> None:
     assert events[-1]["event_type"] == "cleanup.completed"
     assert events[-1]["phase"] == "training"
     assert events[-1]["job_id"] == "arn:train-1"
+
+
+def test_live_objective_handoff_preserves_references_across_adapter_restart() -> None:
+    engine = ServiceRecoveryEngine(seed=7)
+    trajectory = engine.verify(
+        engine.run_episode(
+            "train-task-001",
+            [ToolCall(tool="run_healthcheck", arguments={})],
+            split=ObjectiveSplit.TRAIN,
+        )
+    ).trajectory
+    artifact_store = InMemoryTrajectoryArtifactStore()
+    trusted_reference = artifact_store.put(trajectory)
+    service = ObjectiveService(engine, "secret", artifact_store=artifact_store)
+    expected_opaque = "trajectory://train/" + trajectory.trajectory_id + "/train-task-001/verified"
+
+    class Worker:
+        curation_references: tuple[Mapping[str, Any], ...] = ()
+
+        def execute_benchmark(
+            self, request: ObjectiveBenchmarkRequest
+        ) -> ObjectiveBenchmarkResult:
+            return ObjectiveBenchmarkResult(
+                benchmark_id="service-recovery-v1",
+                run_id=request.run_id,
+                suite=request.suite,
+                suite_version=request.suite_version,
+                model_id=request.model_uri,
+                seed=request.seed,
+                split=request.split,
+                metrics=BenchmarkMetrics(aggregate=0.0, per_environment={"api": 0.0}),
+                trajectory_artifact=ArtifactReference(
+                    artifact_id="trajectory-bundle-1",
+                    kind=ArtifactKind.TRAJECTORY,
+                    uri="s3://demo-bucket/trajectory-bundle.tar.gz?versionId=v1",
+                    sha256="a" * 64,
+                ),
+                report_artifact=ArtifactReference(
+                    artifact_id="benchmark-report-1",
+                    kind=ArtifactKind.REPORT,
+                    uri="s3://demo-bucket/benchmark-report.json?versionId=v1",
+                    sha256="b" * 64,
+                ),
+                manifest_sha256="c" * 64,
+                evidence_label=EvidenceLabel.LIVE,
+                verified=True,
+                trajectory_references=(trusted_reference,),
+            )
+
+        def verify_curation(
+            self,
+            *,
+            run_id: str,
+            experiment_id: str,
+            trajectory_references: tuple[TrajectoryReference, ...],
+        ) -> Mapping[str, Any]:
+            serialized = tuple(
+                reference.model_dump(mode="json") for reference in trajectory_references
+            )
+            self.curation_references = serialized
+            request = CurationRequest(
+                run_id=run_id,
+                experiment_id=experiment_id,
+                split=trajectory_references[0].split,
+                trajectory_references=serialized,
+            )
+            return service.verify_curation(request).model_dump(mode="json")
+
+    worker = Worker()
+    state = SimpleNamespace(
+        run_id="run-1",
+        champion_checkpoint_uri=None,
+        base_checkpoint_uri="s3://demo-bucket/base.tar.gz?versionId=base-v1",
+        metadata={},
+    )
+    original = LiveObjectiveAdapter(worker, _config())
+
+    benchmark = original.benchmark(state, split="train", experiment_number=1)
+
+    assert benchmark.trajectory_refs == (expected_opaque,)
+    restored_adapter = LiveObjectiveAdapter(worker, _config())
+    dataset = restored_adapter.build_dataset(
+        state,
+        SimpleNamespace(selected_trajectory_refs=(expected_opaque,)),
+        experiment_number=1,
+    )
+    assert worker.curation_references == (
+        {
+            "trajectory_id": trajectory.trajectory_id,
+            "task_id": "train-task-001",
+            "split": "train",
+            "verified": True,
+        },
+    )
+    assert dataset.dataset_id.startswith("dataset-")
+    assert dataset.sha256
+
+
+def test_objective_worker_curation_sends_actual_split_and_authenticated_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = TrajectoryReference(
+        trajectory_id="traj-real-001",
+        task_id="train-task-001",
+        split=ObjectiveSplit.TRAIN,
+        verified=True,
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def request(url: str, **kwargs: Any) -> Mapping[str, Any]:
+        calls.append((url, kwargs))
+        return {"manifest": {"dataset_id": "dataset-001"}}
+
+    monkeypatch.setattr("app.live_execution._http_json", request)
+    worker = ObjectiveWorkerClient("https://worker.example.com", auth_token="worker-secret")
+
+    worker.verify_curation(
+        run_id="run-1",
+        experiment_id="run-1-1",
+        trajectory_references=(reference,),
+    )
+
+    assert calls[0][0] == "https://worker.example.com/v1/verify-curation"
+    assert calls[0][1]["headers"] == {"Authorization": "Bearer worker-secret"}
+    assert calls[0][1]["payload"] == {
+        "run_id": "run-1",
+        "experiment_id": "run-1-1",
+        "split": "train",
+        "trajectory_references": [
+            {
+                "trajectory_id": "traj-real-001",
+                "task_id": "train-task-001",
+                "split": "train",
+                "verified": True,
+            }
+        ],
+    }
+
+
+def _evaluation_archive(report: Mapping[str, Any]) -> bytes:
+    payload = json.dumps(report, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        item = tarfile.TarInfo("evaluation.json")
+        item.size = len(payload)
+        archive.addfile(item, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
+def _evaluation_report() -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "schema_version": "evaluation-report-v1",
+        "suite": "AgentGym/AgentEval",
+        "suite_version": "agent-eval-v1",
+        "evaluation_manifest_sha256": "a" * 64,
+        "run_id": "run-1",
+        "experiment_id": "run-1-1",
+        "candidate_manifest_sha256": "b" * 64,
+        "candidate_artifact_sha256": "d" * 64,
+        "candidate_task_count": 2,
+        "candidate_successful_tasks": 1,
+        "candidate_success_rate": 0.5,
+        "candidate_invalid_action_tasks": 0,
+        "candidate_metrics": {
+            "task_count": 2,
+            "successful_tasks": 1,
+            "success_rate": 0.5,
+            "invalid_action_tasks": 0,
+            "by_environment": {
+                "api": {"task_count": 2, "successful_tasks": 1, "success_rate": 0.5}
+            },
+        },
+        "champion_manifest_sha256": "c" * 64,
+        "champion_artifact_sha256": "e" * 64,
+        "champion_task_count": 2,
+        "champion_successful_tasks": 0,
+        "champion_success_rate": 0.0,
+        "champion_invalid_action_tasks": 0,
+        "champion_metrics": {
+            "task_count": 2,
+            "successful_tasks": 0,
+            "success_rate": 0.0,
+            "invalid_action_tasks": 0,
+            "by_environment": {
+                "api": {"task_count": 2, "successful_tasks": 0, "success_rate": 0.0}
+            },
+        },
+        "candidate_task_successes": [True, False],
+        "champion_task_successes": [False, False],
+        "candidate_task_environments": ["api", "api"],
+        "champion_task_environments": ["api", "api"],
+        "regression_count": 0,
+        "improvement_count": 1,
+        "unchanged_count": 1,
+        "regression_decision": "IMPROVED",
+    }
+    report["paired_outcomes_sha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                "candidate": report["candidate_task_successes"],
+                "champion": report["champion_task_successes"],
+                "environments": report["candidate_task_environments"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    report["regression_evidence_sha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                "candidate_manifest_sha256": report["candidate_manifest_sha256"],
+                "champion_manifest_sha256": report["champion_manifest_sha256"],
+                "candidate_artifact_sha256": report["candidate_artifact_sha256"],
+                "champion_artifact_sha256": report["champion_artifact_sha256"],
+                "task_count": 2,
+                "regression_count": 0,
+                "improvement_count": 1,
+                "unchanged_count": 1,
+                "candidate_task_successes": report["candidate_task_successes"],
+                "champion_task_successes": report["champion_task_successes"],
+                "candidate_task_environments": report["candidate_task_environments"],
+                "champion_task_environments": report["champion_task_environments"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    report["report_sha256"] = hashlib.sha256(
+        json.dumps(report, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return report
+
+
+def test_live_evaluation_reader_verifies_completed_sagemaker_report_artifact() -> None:
+    from app.providers.artifacts import ArtifactRef
+
+    report_bytes = _evaluation_archive(_evaluation_report())
+    artifact_digest = hashlib.sha256(report_bytes).hexdigest()
+
+    class Store:
+        call: dict[str, Any]
+
+        def __init__(self) -> None:
+            self.call = {}
+
+        def canonicalize_sagemaker_output(self, uri: str, **kwargs: Any) -> ArtifactRef:
+            self.call = {"uri": uri, **kwargs}
+            return ArtifactRef(
+                bucket="demo-bucket",
+                key="post-training/run-1/evaluations/" + artifact_digest + ".tar.gz",
+                sha256=artifact_digest,
+                size_bytes=len(report_bytes),
+                version_id="retained-v1",
+                content_type="application/gzip",
+            )
+
+        def get_bytes(self, reference: ArtifactRef) -> bytes:
+            assert reference.version_id == "retained-v1"
+            assert reference.sha256 == artifact_digest
+            return report_bytes
+
+    store = Store()
+    state = SimpleNamespace(
+        run_id="run-1",
+        current_candidate_uri="s3://demo-bucket/post-training/run-1/checkpoints/candidate.tar.gz?versionId=checkpoint-v1",
+        current_candidate_sha256="d" * 64,
+        base_checkpoint_sha256="e" * 64,
+        benchmark_id="service-recovery-v1",
+        benchmark_manifest_sha256="a" * 64,
+        benchmark_suite="AgentGym/AgentEval",
+        benchmark_version="agent-eval-v1",
+        benchmark_seed=7,
+        model_id="google/functiongemma-270m-it",
+    )
+    job = JobResult(
+        job_name="eval-run-1-1",
+        provider_job_id="arn:aws:sagemaker:us-east-1:123:processing-job/eval-run-1-1",
+        status=JobStatus.COMPLETED,
+        artifact_uri="s3://demo-bucket/post-training/run-1/eval/1/evaluation.tar.gz",
+    )
+
+    evidence = LiveEvaluationReader(store, _config()).read_evaluation(
+        job, state=state, experiment_number=1
+    )
+
+    assert store.call["uri"] == job.artifact_uri
+    assert store.call["allowed_source_prefix"] == "post-training/run-1/eval/1"
+    assert evidence.evaluation.aggregate_score == 0.5
+    assert evidence.evaluation.environment_scores == {"api": 0.5}
+    assert evidence.evaluation.evidence.kind.value == "evaluation"
+    assert evidence.champion_evaluation is not None
+    assert evidence.champion_evaluation.aggregate_score == 0.0
+    assert evidence.evaluation.champion_run_id == evidence.champion_evaluation.run_id
+    assert evidence.artifact_ids == (f"evaluation-report://{artifact_digest}",)
+
+
+@pytest.mark.parametrize("mutation", ["report_hash", "run_id", "manifest", "champion", "paired"])
+def test_live_evaluation_reader_rejects_unverified_or_wrong_scope_report(
+    mutation: str,
+) -> None:
+    from app.providers.artifacts import ArtifactRef
+
+    report = _evaluation_report()
+    if mutation == "report_hash":
+        report["report_sha256"] = "0" * 64
+    elif mutation == "run_id":
+        report["run_id"] = "another-run"
+    elif mutation == "manifest":
+        report["evaluation_manifest_sha256"] = "e" * 64
+    elif mutation == "champion":
+        report["champion_artifact_sha256"] = "f" * 64
+    else:
+        report["paired_outcomes_sha256"] = "0" * 64
+    report_bytes = _evaluation_archive(report)
+    artifact_digest = hashlib.sha256(report_bytes).hexdigest()
+
+    class Store:
+        def canonicalize_sagemaker_output(self, uri: str, **kwargs: Any) -> ArtifactRef:
+            del uri, kwargs
+            return ArtifactRef(
+                bucket="demo-bucket",
+                key="post-training/evaluation.tar.gz",
+                sha256=artifact_digest,
+                size_bytes=len(report_bytes),
+                version_id="retained-v1",
+            )
+
+        def get_bytes(self, reference: ArtifactRef) -> bytes:
+            del reference
+            return report_bytes
+
+    state = SimpleNamespace(
+        run_id="run-1",
+        current_candidate_uri="s3://demo-bucket/checkpoint.tar.gz?versionId=v1",
+        current_candidate_sha256="d" * 64,
+        base_checkpoint_sha256="e" * 64,
+        benchmark_id="service-recovery-v1",
+        benchmark_manifest_sha256="a" * 64,
+        benchmark_suite="AgentGym/AgentEval",
+        benchmark_version="agent-eval-v1",
+        benchmark_seed=7,
+        model_id="google/functiongemma-270m-it",
+    )
+    job = JobResult(
+        job_name="eval-run-1-1",
+        provider_job_id="arn:aws:sagemaker:us-east-1:123:processing-job/eval-run-1-1",
+        status=JobStatus.COMPLETED,
+        artifact_uri="s3://demo-bucket/post-training/run-1/eval/1/evaluation.tar.gz",
+    )
+
+    with pytest.raises(LiveExecutionFailed):
+        LiveEvaluationReader(Store(), _config()).read_evaluation(
+            job, state=state, experiment_number=1
+        )

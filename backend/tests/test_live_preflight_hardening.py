@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from email.message import Message
+from io import BytesIO
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 
@@ -30,8 +33,8 @@ def _config(**overrides: object) -> Any:
         "objective_worker_auth_token": "worker-secret",
         "hf_repo_id": "google/functiongemma-270m-it",
         "hf_revision": "c" * 40,
-        "training_input_s3_uri": "s3://demo-bucket/input/checkpoint",
-        "evaluation_input_s3_uri": "s3://demo-bucket/input/held-out",
+        "training_input_s3_uri": "s3://demo-bucket/post-training/inputs/training",
+        "evaluation_input_s3_uri": "s3://demo-bucket/post-training/inputs/evaluation",
         "checkpoint_s3_uri": "s3://demo-bucket/checkpoints/base.tar.gz?versionId=v1",
         "checkpoint_sha256": "d" * 64,
         "sagemaker_gpu_quota_code": "L-0123456789abcdef0",
@@ -100,7 +103,7 @@ def test_bedrock_client_factory_forces_sigv4(monkeypatch: pytest.MonkeyPatch) ->
 def test_objective_worker_health_requires_bearer_auth_without_exposing_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    requests: list[dict[str, object]] = []
+    requests: list[dict[str, Any]] = []
 
     def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
         requests.append({"url": url, **kwargs})
@@ -126,19 +129,71 @@ def test_objective_worker_without_auth_token_fails_closed() -> None:
 def test_preflight_proves_worker_token_with_protected_non_mutating_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    requests: list[dict[str, object]] = []
+    requests: list[dict[str, Any]] = []
 
     def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
         requests.append({"url": url, **kwargs})
         if url.endswith("v1/auth-probe"):
             return {"status": "authenticated", "service": "objective-worker"}
-        return {"status": "healthy"}
+        if url.endswith("/health"):
+            return {"status": "healthy"}
+        if url.endswith("v1/readiness"):
+            return {
+                "status": "ready",
+                "service": "objective-worker",
+                "capabilities": {"benchmark": True, "verify-curation": True},
+            }
+        raise AssertionError(f"unexpected objective readiness request: {url}")
 
     monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
     runner = live_execution.PreflightRunner(_config())
 
     assert runner._check_worker_readiness()["status"] == "ready"
-    assert requests[1]["headers"] == {"Authorization": "Bearer worker-secret"}
+    assert [request["url"].rsplit("/", 1)[-1] for request in requests] == [
+        "health",
+        "readiness",
+        "auth-probe",
+    ]
+    assert all(
+        request["headers"] == {"Authorization": "Bearer worker-secret"}
+        for request in requests
+    )
+    assert requests[1]["method"] == "GET"
+    assert "payload" not in requests[1]
+
+
+def test_preflight_does_not_treat_schema_rejection_as_worker_execution_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
+        if url.endswith("/health"):
+            return {"status": "healthy"}
+        if url.endswith("v1/auth-probe"):
+            return {"status": "authenticated", "service": "objective-worker"}
+        if kwargs.get("method") == "POST":
+            raise HTTPError(url, 422, "request validation", Message(), BytesIO(b"{}"))
+        raise AssertionError(f"unexpected objective readiness request: {url}")
+
+    monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
+    runner = PreflightRunner(_config())
+
+    with pytest.raises(LiveExecutionBlocked, match="execution readiness"):
+        runner._check_worker_readiness()
+
+
+def test_preflight_rejects_objective_readiness_route_without_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_http_json(url: str, **kwargs: object) -> dict[str, object]:
+        if url.endswith("/health"):
+            return {"status": "healthy"}
+        raise HTTPError(url, 401, "unauthorized", Message(), BytesIO(b"{}"))
+
+    monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
+    runner = PreflightRunner(_config())
+
+    with pytest.raises(LiveExecutionBlocked, match="execution readiness"):
+        runner._check_worker_readiness()
 
 
 def test_preflight_rejects_worker_token_when_protected_probe_returns_unauthorized(
@@ -148,7 +203,15 @@ def test_preflight_rejects_worker_token_when_protected_probe_returns_unauthorize
         del kwargs
         if url.endswith("v1/auth-probe"):
             return {"status": "unauthorized", "service": "objective-worker"}
-        return {"status": "healthy"}
+        if url.endswith("/health"):
+            return {"status": "healthy"}
+        if url.endswith("v1/readiness"):
+            return {
+                "status": "ready",
+                "service": "objective-worker",
+                "capabilities": {"benchmark": True, "verify-curation": True},
+            }
+        raise AssertionError(f"unexpected objective readiness request: {url}")
 
     monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
     runner = live_execution.PreflightRunner(_config())
@@ -207,10 +270,89 @@ def test_s3_preflight_requires_region_encryption_and_versioned_checkpoint() -> N
     assert bucket["region"] == "us-east-1"
     assert bucket["encryption"] == "AES256"
     assert checkpoint["version_id"] == "v1"
+    assert not any(name == "head_bucket" for name, _ in s3.calls)
     assert (
         "head_object",
         {"Bucket": "demo-bucket", "Key": "checkpoints/base.tar.gz", "VersionId": "v1"},
     ) in s3.calls
+
+
+class _ReadOnlyDynamoDB:
+    def __init__(self, key_schema: list[dict[str, str]]) -> None:
+        self.key_schema = key_schema
+
+    def describe_table(self, **kwargs: object) -> dict[str, object]:
+        assert kwargs == {"TableName": "demo-history"}
+        return {
+            "Table": {
+                "TableStatus": "ACTIVE",
+                "KeySchema": self.key_schema,
+            }
+        }
+
+
+def test_dynamodb_preflight_requires_the_repository_key_schema() -> None:
+    runner = PreflightRunner(
+        _config(),
+        clients={
+            "dynamodb": _ReadOnlyDynamoDB(
+                [{"AttributeName": "id", "KeyType": "HASH"}]
+            )
+        },
+    )
+
+    with pytest.raises(LiveExecutionBlocked, match="pk HASH and sk RANGE"):
+        runner._check_dynamodb_readiness()
+
+
+def test_dynamodb_preflight_accepts_the_repository_key_schema() -> None:
+    runner = PreflightRunner(
+        _config(),
+        clients={
+            "dynamodb": _ReadOnlyDynamoDB(
+                [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"},
+                ]
+            )
+        },
+    )
+
+    assert runner._check_dynamodb_readiness()["key_schema"] == "pk/sk"
+
+
+class _ReadOnlyS3Inputs:
+    def __init__(self, contents: list[dict[str, object]]) -> None:
+        self.contents = contents
+        self.calls: list[dict[str, object]] = []
+
+    def list_objects_v2(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(kwargs)
+        return {"Contents": self.contents, "KeyCount": len(self.contents)}
+
+
+def test_sagemaker_input_preflight_requires_a_nonempty_prefix() -> None:
+    client = _ReadOnlyS3Inputs([])
+    runner = PreflightRunner(_config(), clients={"s3": client})
+
+    with pytest.raises(LiveExecutionBlocked, match="training input prefix is empty"):
+        runner._check_input_readiness("training")
+
+    assert client.calls == [
+        {
+            "Bucket": "demo-bucket",
+            "Prefix": "post-training/inputs/training/",
+            "MaxKeys": 1,
+        }
+    ]
+
+
+def test_sagemaker_input_preflight_rejects_inputs_outside_artifact_scope() -> None:
+    config = _config(training_input_s3_uri="s3://other-bucket/post-training/inputs/training")
+    runner = PreflightRunner(config, clients={"s3": _ReadOnlyS3Inputs([])})
+
+    with pytest.raises(LiveExecutionBlocked, match="artifact bucket and prefix"):
+        runner._check_input_readiness("training")
 
 
 def test_checkpoint_preflight_rejects_unversioned_uri() -> None:
@@ -254,12 +396,31 @@ class _ReadOnlyIdentity:
 
 
 class _ReadOnlyIam:
-    def __init__(self, expected_role_name: str = "train") -> None:
+    def __init__(
+        self,
+        expected_role_name: str = "train",
+        *,
+        service_trust: str = "sagemaker.amazonaws.com",
+    ) -> None:
         self.expected_role_name = expected_role_name
+        self.service_trust = service_trust
 
     def get_role(self, **kwargs: object) -> dict[str, object]:
         assert kwargs == {"RoleName": self.expected_role_name}
-        return {"Role": {"RoleName": "train"}}
+        return {
+            "Role": {
+                "RoleName": "train",
+                "AssumeRolePolicyDocument": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {"Service": self.service_trust},
+                            "Action": "sts:AssumeRole",
+                        }
+                    ]
+                },
+            }
+        }
 
 
 class _ReadOnlyEcr:
@@ -313,6 +474,20 @@ def test_ecr_preflight_rejects_tag_and_cross_region_images() -> None:
     )
 
     with pytest.raises(LiveExecutionBlocked, match="digest-pinned"):
+        runner._check_sagemaker_readiness()
+
+
+def test_sagemaker_preflight_rejects_role_without_sagemaker_trust() -> None:
+    runner = PreflightRunner(
+        _config(),
+        clients={
+            "ecr": _ReadOnlyEcr(),
+            "sts": _ReadOnlyIdentity(),
+            "iam": _ReadOnlyIam(service_trust="ecs-tasks.amazonaws.com"),
+        },
+    )
+
+    with pytest.raises(LiveExecutionBlocked, match="SageMaker service trust"):
         runner._check_sagemaker_readiness()
 
 

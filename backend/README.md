@@ -38,6 +38,35 @@ the hard budget. Missing checkpoint revisions, objective-worker artifacts,
 SageMaker images/roles, provider IDs, or verified measurements produce
 `BLOCKED`/`FAILED`; no fallback metrics are generated.
 
+The HTTP live control plane is separate from the process-local `/api/runs`
+demo. In AWS mode, `POST /api/live/runs/prepare` runs preflight and stores a
+durable prepared run plus its immutable approval packet; `POST
+/api/live/runs/{run_id}/start` rechecks preflight and consumes the signed,
+single-run approval before queuing work. These mutating requests require an
+`Idempotency-Key`. Status, ordered events, experiments, and artifact references
+are read from the durable repository; cancel and safe-stop requests are
+idempotent. This API wiring and its local contract tests do not prove an AWS
+deployment or a completed post-training run.
+
+### Objective worker and FunctionGemma checkpoint
+
+`SERVICE_ROLE=objective` exposes the isolated `/v1/benchmark` endpoint. It
+requires `OBJECTIVE_AUTH_TOKEN` and `S3_ARTIFACT_BUCKET`; benchmark execution
+also requires all three values below:
+
+- `OBJECTIVE_MODEL_CHECKPOINT_DIR`: a complete local `google/functiongemma-270m-it` snapshot.
+- `OBJECTIVE_MODEL_REVISION`: the immutable lowercase 40-character Hugging Face commit SHA for that snapshot.
+- `OBJECTIVE_MODEL_SHA256`: the expected digest of the validator's sorted per-file identities.
+
+The staging validator rejects incomplete, mutable-cache, gated, or malformed
+checkpoints. Runtime loading uses `local_files_only=True`; it never downloads
+or silently substitutes a remote model. The adapter accepts train/replay tasks
+only, replays model actions through the deterministic service-recovery
+verifier, and persists only verifier-confirmed trajectories. Missing
+configuration, inference errors, replay failures, or artifact-store failures
+block the request. The code and contract tests do not establish that a complete
+checkpoint is available or that a real FunctionGemma benchmark has succeeded.
+
 Before the first job, configure `CHECKPOINT_SHA256`,
 `SAGEMAKER_GPU_QUOTA_CODE`, `GPU_INSTANCE_ALLOWLIST`, and a secret in
 `LIVE_APPROVAL_SECRET`. The scripts print a metadata-only approval packet when
@@ -66,6 +95,13 @@ with `nvidia.nemotron-super-3-120b` and leave `AWS_BEARER_TOKEN_BEDROCK`
 unset. If that variable is set, the AWS SDK may select it instead of IAM; set
 it only when a valid Bedrock API key is intentionally being used. A successful
 STS check alone is not proof that Bedrock model invocation is authorized.
+
+Any deployment and live-run actions described by this backend are scoped only
+to the AWS Agents for Humans hackathon. As of 2026-09-12, the operator-reported
+SageMaker GPU quota request `9a3453884e2c4230a6e8bb0004c8cca57FuK8VC5` is
+`PENDING`; this is not evidence of granted quota or placement capacity. No
+live post-training completion is claimed by this documentation. Recheck the
+request and run the read-only preflight before authorizing compute.
 
 All agent prompts are versioned contracts. They include explicit schemas,
 evidence rules, sealed held-out-data boundaries, and bounded creative latitude.

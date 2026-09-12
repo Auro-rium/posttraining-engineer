@@ -592,7 +592,8 @@ class S3ObjectiveArtifactStore:
         jsonl_payload = "\n".join(row.canonical_json() for row in dataset.rows).encode("utf-8")
         if _digest(jsonl_payload) != payload_digest:
             raise ObjectiveArtifactIntegrityError("dataset rows do not match manifest digest")
-        key = self._key("datasets", run_id, experiment_id, f"{payload_digest}.jsonl")
+        dataset_prefix = self._key("datasets", run_id, experiment_id, payload_digest)
+        key = f"{dataset_prefix}/dataset.jsonl"
         artifact = self._put_bytes(key, jsonl_payload, kind="dataset-jsonl", split=None)
         payload_manifest = dataset.manifest.model_copy(
             update={
@@ -600,9 +601,7 @@ class S3ObjectiveArtifactStore:
                 "s3_uri": artifact.version_ref,
             }
         )
-        manifest_key = self._key(
-            "datasets", run_id, experiment_id, f"{payload_digest}.manifest.json"
-        )
+        manifest_key = f"{dataset_prefix}/manifest.json"
         manifest_artifact = self._put_bytes(
             manifest_key,
             _canonical_json(payload_manifest.model_dump(mode="json")),

@@ -8,17 +8,37 @@ This CDK app provisions the AWS boundary for the backend:
 - VPC, ECS/Fargate cluster, task, and CloudWatch logs
 - task and SageMaker IAM roles
 
-The backend image must be pushed before the ECS service is started.
+The coordinator image must be present in the stack's ECR repository before the
+ECS service starts. Because this stack creates that repository, bootstrap it
+with zero coordinator tasks, then push the three images and update the stack
+with their immutable digests. The trainer and evaluator images are consumed by
+SageMaker; build them for `linux/amd64` as well.
 
 ```bash
 cd backend
-uv sync --extra cloud
+docker buildx build --platform linux/amd64 --load -t post-training-backend:local -f Dockerfile .
+docker buildx build --platform linux/amd64 --load -t post-training-trainer:local -f workers/trainer/Dockerfile .
+docker buildx build --platform linux/amd64 --load -t post-training-evaluator:local -f workers/evaluator/Dockerfile .
 cd ../infra/cdk
-../../backend/.venv/bin/python app.py
-cdk deploy -c image_tag=latest \
-  -c training_image_uri=ACCOUNT.dkr.ecr.REGION.amazonaws.com/trainer:latest \
-  -c evaluation_image_uri=ACCOUNT.dkr.ecr.REGION.amazonaws.com/evaluator:latest
 ```
+
+First create the ECR repositories without starting the coordinator. Supply
+syntactically valid placeholder digests for this bootstrap only; no task will
+pull them while `desired_count=0`.
+
+```bash
+cdk deploy \
+  -c backend_image_digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  -c trainer_image_digest=sha256:1111111111111111111111111111111111111111111111111111111111111111 \
+  -c evaluator_image_digest=sha256:2222222222222222222222222222222222222222222222222222222222222222 \
+  -c desired_count=0
+```
+
+After pushing the local images to the three repository URIs output by CDK,
+resolve each ECR `imageDigest` and deploy again with the real values and
+`-c desired_count=1`. Pass only lowercase `sha256:` digests; mutable `:latest`
+tags are rejected by the stack's image contract. Do not start a SageMaker run
+until both worker images have been pushed and pinned as well.
 
 The stack is infrastructure only. The application still requires the durable
 DynamoDB/S3/provider orchestration path to be wired before a live training or

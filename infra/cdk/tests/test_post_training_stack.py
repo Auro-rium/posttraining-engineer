@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stacks.post_training_stack import PostTrainingStack
+from stacks.post_training_stack import PostTrainingStack  # noqa: E402
 
 
 def template(extra_context: dict[str, str] | None = None) -> Template:
@@ -121,6 +121,18 @@ def test_objective_service_is_internal_and_token_authenticated() -> None:
     ]
     assert len(objective) == 1
     assert "OBJECTIVE_AUTH_TOKEN" in json.dumps(objective[0])
+    objective_container = next(
+        item
+        for item in objective[0]["Properties"]["ContainerDefinitions"]
+        if item["Name"] == "Objective"
+    )
+    objective_environment = {
+        item["Name"]: item["Value"]
+        for item in objective_container["Environment"]
+    }
+    assert objective_environment["SERVICE_ROLE"] == "objective"
+    assert objective_environment["S3_ARTIFACT_BUCKET"]
+    assert objective_environment["S3_ARTIFACT_PREFIX"] == "post-training"
     ingress = stack_template.find_resources("AWS::EC2::SecurityGroupIngress")
     assert ingress
     assert all("CidrIp" not in item["Properties"] for item in ingress.values())
@@ -330,7 +342,8 @@ def test_certificate_only_objective_uses_private_alias_matching_certificate_san(
         )
     )
     environment = {
-        item["Name"]: item["Value"] for item in coordinator["Properties"]["ContainerDefinitions"][0]["Environment"]
+        item["Name"]: item["Value"]
+        for item in coordinator["Properties"]["ContainerDefinitions"][0]["Environment"]
     }
     assert environment["OBJECTIVE_WORKER_URL"] == "https://objective.internal.example.test"
 
@@ -403,7 +416,9 @@ def test_objective_role_can_read_write_versioned_encrypted_artifacts() -> None:
 
 
 def test_task_role_has_only_scoped_readonly_preflight_permissions() -> None:
-    policies = template().find_resources("AWS::IAM::Policy")
+    artifact_prefix = "scoped-preflight"
+    stack_template = template({"artifact_prefix": artifact_prefix})
+    policies = stack_template.find_resources("AWS::IAM::Policy")
     coordinator_policy = next(
         item
         for key, item in policies.items()
@@ -415,6 +430,18 @@ def test_task_role_has_only_scoped_readonly_preflight_permissions() -> None:
         "s3:GetBucketLocation",
         "s3:GetEncryptionConfiguration",
         "s3:GetBucketVersioning",
+    }
+    versioned_object_preflight = by_sid["ReadOnlyPreflightS3ObjectVersions"]
+    assert versioned_object_preflight["Action"] == "s3:GetObjectVersion"
+    artifact_bucket_id = next(iter(stack_template.find_resources("AWS::S3::Bucket")))
+    assert versioned_object_preflight["Resource"] == {
+        "Fn::Join": [
+            "",
+            [
+                {"Fn::GetAtt": [artifact_bucket_id, "Arn"]},
+                f"/{artifact_prefix}/*",
+            ],
+        ]
     }
     assert by_sid["ReadOnlyPreflightIam"]["Action"] == "iam:GetRole"
     assert by_sid["ReadOnlyPreflightEcr"]["Action"] == "ecr:DescribeImages"

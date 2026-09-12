@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -19,6 +19,7 @@ from app.autonomous.repository import (
     ApprovalAlreadyConsumedError,
     ConcurrentUpdateError,
     DynamoDBAutonomousRunRepository,
+    IdempotencyKeyConflictError,
     InMemoryAutonomousRunRepository,
     LeaseConflictError,
     OperationAlreadyExistsError,
@@ -41,6 +42,18 @@ def make_run(run_id: str = "run-1") -> AutonomousRunState:
     )
 
 
+def make_approved_queued_run(run_id: str = "run-1") -> AutonomousRunState:
+    state = make_run(run_id).model_copy(
+        update={
+            "status": AutonomousRunStatus.QUEUED,
+            "phase": RunPhase.QUEUED,
+            "approval_digest": "c" * 64,
+            "approval_consumed": True,
+        }
+    )
+    return AutonomousRunState.model_validate(state.model_dump(mode="python"))
+
+
 def test_create_is_conditional_and_get_returns_defensive_copy() -> None:
     repository = InMemoryAutonomousRunRepository()
     created = repository.create(make_run())
@@ -58,6 +71,39 @@ def test_create_is_conditional_and_get_returns_defensive_copy() -> None:
     stored = repository.get("run-1")
     assert stored is not None
     assert tuple(stored.experiments) == ()
+
+
+def test_idempotency_claim_binds_request_and_persists_safe_response() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    digest = "d" * 64
+
+    pending, created = repository.claim_idempotency("prepare", "key-1", digest)
+    replay, replay_created = repository.claim_idempotency("prepare", "key-1", digest)
+
+    assert created is True
+    assert replay_created is False
+    assert pending.request_digest == digest
+    assert pending.response is None
+    assert replay == pending
+
+    completed = repository.complete_idempotency(
+        "prepare", "key-1", digest, {"run_id": "run-1", "status": "PREPARED"}
+    )
+    restored = repository.get_idempotency("prepare", "key-1")
+    assert completed.response == {"run_id": "run-1", "status": "PREPARED"}
+    assert restored == completed
+    assert repository.claim_idempotency("prepare", "key-1", digest) == (completed, False)
+
+    with pytest.raises(IdempotencyKeyConflictError):
+        repository.claim_idempotency("prepare", "key-1", "e" * 64)
+
+
+def test_idempotency_completion_requires_prior_matching_claim() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.claim_idempotency("start", "key-1", "a" * 64)
+
+    with pytest.raises(IdempotencyKeyConflictError):
+        repository.complete_idempotency("start", "key-1", "b" * 64, {"status": "QUEUED"})
 
 
 def test_transition_is_optimistic_and_appends_atomic_ordered_event() -> None:
@@ -111,6 +157,56 @@ def test_update_state_is_validated_optimistic_and_preserves_repository_fields() 
         repository.update_state("run-1", expected_version=1, updates={"not_a_field": True})
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("status", AutonomousRunStatus.RUNNING),
+        ("phase", RunPhase.TRAINING),
+        ("approval_scope", {"max_cost_usd": 1.0}),
+        ("benchmark_id", "other"),
+        ("benchmark_suite", "other"),
+        ("benchmark_version", "other"),
+        ("benchmark_seed", 99),
+        ("max_experiments", 1),
+        ("approved_budget_usd", 1.0),
+    ],
+)
+def test_update_state_rejects_lifecycle_and_approval_scope_mutations(
+    field: str, value: object
+) -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(make_run())
+    with pytest.raises(ValueError, match="state patch"):
+        repository.update_state("run-1", expected_version=0, updates={field: value})
+
+
+@pytest.mark.parametrize(
+    "method,reason",
+    [("request_cancel", "cancel requested"), ("request_safe_stop", "safe stop requested")],
+)
+def test_control_requests_are_atomic_and_append_lifecycle_event(method: str, reason: str) -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(make_approved_queued_run())
+    requested = getattr(repository, method)("run-1", expected_version=0)
+    assert requested.version == 1
+    assert requested.event_sequence == 1
+    assert getattr(
+        requested,
+        "cancellation_requested" if method == "request_cancel" else "safe_stop_requested",
+    )
+    events = repository.list_events("run-1")
+    assert len(events) == 1
+    assert events[0].reason == reason
+
+
+def test_control_request_is_optimistic() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(make_approved_queued_run())
+    repository.request_cancel("run-1", expected_version=0)
+    with pytest.raises(ConcurrentUpdateError):
+        repository.request_safe_stop("run-1", expected_version=0)
+
+
 def test_approval_digest_can_be_consumed_only_once_and_must_match_scope() -> None:
     repository = InMemoryAutonomousRunRepository()
     repository.create(make_run())
@@ -127,14 +223,11 @@ def test_approval_digest_can_be_consumed_only_once_and_must_match_scope() -> Non
 
 def test_lease_claim_renew_release_and_recovery_scan() -> None:
     repository = InMemoryAutonomousRunRepository()
-    repository.create(make_run("queued"))
-    repository.create(make_run("running"))
+    repository.create(make_approved_queued_run("queued"))
+    repository.create(make_approved_queued_run("running"))
     repository.transition(
-        "running",
-        expected_version=0,
-        status=AutonomousRunStatus.RUNNING,
-        phase=RunPhase.BASELINE,
-        reason="worker started",
+        "running", expected_version=0, status=AutonomousRunStatus.RUNNING,
+        phase=RunPhase.BASELINE, reason="worker started"
     )
     now = datetime(2026, 9, 8, tzinfo=UTC)
 
@@ -151,6 +244,19 @@ def test_lease_claim_renew_release_and_recovery_scan() -> None:
     assert expired.lease_expires_at == now + timedelta(seconds=1)
     recoverable = repository.scan_recoverable(now=now + timedelta(seconds=2))
     assert [item.run_id for item in recoverable] == ["queued", "running"]
+
+
+def test_recovery_excludes_prepared_unapproved_runs_and_supports_cursor_pages() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(make_run("prepared"))
+    for run_id in ("queued-a", "queued-b", "queued-c"):
+        repository.create(make_approved_queued_run(run_id))
+    first = repository.scan_recoverable(limit=2)
+    assert [state.run_id for state in first] == ["queued-a", "queued-b"]
+    assert first.next_cursor == {"run_id": "queued-b"}
+    second = repository.scan_recoverable(limit=2, cursor=first.next_cursor)
+    assert [state.run_id for state in second] == ["queued-c"]
+    assert second.next_cursor is None
 
 
 def test_operation_intent_is_idempotent_and_result_reconciles() -> None:
@@ -194,6 +300,35 @@ def test_operation_intent_is_idempotent_and_result_reconciles() -> None:
         repository.put_operation_intent(
             operation.model_copy(update={"experiment_number": 2, "phase": RunPhase.EVALUATION})
         )
+
+
+def test_operation_status_is_monotonic_and_same_status_updates_are_idempotent() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(make_run())
+    operation = RunOperation(
+        operation_key="monotonic",
+        run_id="run-1",
+        experiment_number=1,
+        phase=RunPhase.TRAINING,
+        provider_name="job",
+    )
+    repository.put_operation_intent(operation)
+    running = repository.record_operation_result(
+        "run-1", "monotonic", status=RunOperationStatus.RUNNING, provider_id="job-1"
+    )
+    assert running.status is RunOperationStatus.RUNNING
+    with pytest.raises(OperationAlreadyExistsError):
+        repository.record_operation_result(
+            "run-1", "monotonic", status=RunOperationStatus.INTENT, provider_id="job-1"
+        )
+    succeeded = repository.record_operation_result(
+        "run-1", "monotonic", status=RunOperationStatus.SUCCEEDED, provider_id="job-1",
+        result={"job_name": "job-1", "refs": ["artifact://one"]},
+    )
+    assert repository.record_operation_result(
+        "run-1", "monotonic", status=RunOperationStatus.SUCCEEDED, provider_id="job-1",
+        result={"job_name": "job-1", "refs": ["artifact://one"]},
+    ) == succeeded
 
 
 def test_operation_retry_identity_uses_stable_request_digest_not_timestamps() -> None:
@@ -259,6 +394,44 @@ def test_models_reject_invalid_scope_and_unknown_fields() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: RunOperation(
+            operation_key="unsafe", run_id="run-1", experiment_number=1,
+            phase=RunPhase.TRAINING, provider_name="job", result={"raw_prompt": "secret"}
+        ),
+        lambda: ExperimentRecord(
+            experiment_number=1, training_config={"objective": "DPO", "held_out": "task text"}
+        ),
+        lambda: AutonomousRunState.model_validate(
+            {
+                **make_run().model_dump(mode="python"),
+                "current_hypothesis": {"completion": "raw response"},
+            }
+        ),
+    ],
+)
+def test_durable_payloads_reject_raw_content_and_unsupported_training(factory: object) -> None:
+    with pytest.raises(ValueError):
+        cast(Any, factory)()
+
+
+def test_durable_payloads_are_bounded_and_json_scalar_only() -> None:
+    with pytest.raises(ValueError):
+        RunOperation(
+            operation_key="unsafe", run_id="run-1", experiment_number=1,
+            phase=RunPhase.TRAINING, provider_name="job", result={"nested": object()}
+        )
+    with pytest.raises(ValueError):
+        AutonomousRunState.model_validate(
+            {
+                **make_run().model_dump(mode="python"),
+                "current_hypothesis": {"hypothesis": {"statement": "x" * 5000}},
+            }
+        )
+
+
 def test_run_state_persists_complete_live_recovery_fields() -> None:
     state = make_run().model_copy(
         update={
@@ -305,12 +478,14 @@ class StubDynamoTable:
         self.items: list[dict[str, object]] = []
         self.puts: list[dict[str, object]] = []
         self.queries: list[dict[str, object]] = []
+        self.get_item_calls: list[dict[str, object]] = []
         self.page_size = 1
 
     def put_item(self, **kwargs: object) -> None:
         self.puts.append(kwargs)
 
     def get_item(self, **kwargs: object) -> dict[str, object]:
+        self.get_item_calls.append(kwargs)
         key = kwargs["Key"]
         assert isinstance(key, dict)
         for item in self.items:
@@ -367,6 +542,62 @@ class StubDynamoClient:
         self.transactions.append(kwargs)
 
 
+def test_dynamo_idempotency_claim_and_completion_are_conditional_and_replayable() -> None:
+    class ConditionalError(Exception):
+        pass
+
+    class IdempotencyTable:
+        name = "autonomous-runs"
+
+        def __init__(self) -> None:
+            self.items: dict[tuple[str, str], dict[str, object]] = {}
+            self.puts: list[dict[str, object]] = []
+
+        def get_item(self, **kwargs: object) -> dict[str, object]:
+            key = cast(dict[str, str], kwargs["Key"])
+            item = self.items.get((key["pk"], key["sk"]))
+            return {"Item": item} if item is not None else {}
+
+        def put_item(self, **kwargs: object) -> None:
+            self.puts.append(kwargs)
+            item = cast(dict[str, object], kwargs["Item"])
+            identity = (str(item["pk"]), str(item["sk"]))
+            current = self.items.get(identity)
+            condition = str(kwargs.get("ConditionExpression", ""))
+            if condition == "attribute_not_exists(pk)" and current is not None:
+                raise ConditionalError("conditional put failed")
+            if condition.startswith("request_digest =") and (
+                current is None
+                or current.get("request_digest")
+                != cast(dict[str, str], kwargs["ExpressionAttributeValues"])[":request_digest"]
+                or current.get("state")
+                != cast(dict[str, str], kwargs["ExpressionAttributeValues"])[":pending"]
+            ):
+                raise ConditionalError("conditional completion failed")
+            self.items[identity] = item
+
+    table = IdempotencyTable()
+    repository = DynamoDBAutonomousRunRepository(table=table, client=StubDynamoClient())
+    digest = "f" * 64
+
+    first, created = repository.claim_idempotency("start", "key-1", digest)
+    replay, replay_created = repository.claim_idempotency("start", "key-1", digest)
+    assert created is True
+    assert replay_created is False
+    assert replay == first
+    with pytest.raises(IdempotencyKeyConflictError):
+        repository.claim_idempotency("start", "key-1", "e" * 64)
+
+    completed = repository.complete_idempotency(
+        "start", "key-1", digest, {"run_id": "run-1", "status": "QUEUED"}
+    )
+    assert repository.get_idempotency("start", "key-1") == completed
+    conditions = [put["ConditionExpression"] for put in table.puts]
+    assert conditions[0] == "attribute_not_exists(pk)"
+    assert conditions[1] == "attribute_not_exists(pk)"
+    assert conditions[-1] == "request_digest = :request_digest AND #state = :pending"
+
+
 def seed_dynamo_table(table: StubDynamoTable) -> None:
     run = make_run()
     table.items.extend(
@@ -377,7 +608,7 @@ def seed_dynamo_table(table: StubDynamoTable) -> None:
                 RunEventRecord(
                     run_id="run-1",
                     sequence=1,
-                    event_type="x",
+                    event_type="state.transitioned",
                     to_status=AutonomousRunStatus.QUEUED,
                     to_phase=RunPhase.QUEUED,
                     reason="queued",
@@ -426,7 +657,7 @@ def test_dynamo_event_after_sequence_is_exclusive() -> None:
             RunEventRecord(
                 run_id="run-1",
                 sequence=2,
-                event_type="x",
+                event_type="state.transitioned",
                 to_status=AutonomousRunStatus.RUNNING,
                 to_phase=RunPhase.BASELINE,
                 reason="started",
@@ -440,7 +671,7 @@ def test_dynamo_event_after_sequence_is_exclusive() -> None:
 
 def test_dynamo_lease_uses_native_resource_expression_values_and_derived_name() -> None:
     table = StubDynamoTable()
-    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_run()))
+    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_approved_queued_run()))
     repository = DynamoDBAutonomousRunRepository(table=table, client=StubDynamoClient())
     repository.claim_lease("run-1", "worker", now=datetime(2026, 9, 8, tzinfo=UTC))
     values = table.puts[-1]["ExpressionAttributeValues"]
@@ -450,7 +681,8 @@ def test_dynamo_lease_uses_native_resource_expression_values_and_derived_name() 
 def test_dynamo_update_state_uses_validated_conditional_put() -> None:
     table = StubDynamoTable()
     table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_run()))
-    repository = DynamoDBAutonomousRunRepository(table=table, client=StubDynamoClient())
+    client = StubDynamoClient()
+    repository = DynamoDBAutonomousRunRepository(table=table, client=client)
 
     updated = repository.update_state(
         "run-1", expected_version=0, updates={"cancellation_requested": True}
@@ -458,8 +690,52 @@ def test_dynamo_update_state_uses_validated_conditional_put() -> None:
 
     assert updated.cancellation_requested is True
     assert updated.version == 1
-    assert table.puts[-1]["ConditionExpression"] == "version = :version"
-    assert table.puts[-1]["ExpressionAttributeValues"] == {":version": 0}
+    assert len(client.transactions) == 1
+    writes = cast(list[dict[str, object]], client.transactions[-1]["TransactItems"])
+    assert "Put" in writes[0]
+    put = cast(dict[str, object], writes[0]["Put"])
+    assert put["ConditionExpression"] == "version = :version AND cancellation_requested = :false"
+
+
+def test_dynamo_append_event_reads_exact_sequence_consistently() -> None:
+    table = StubDynamoTable()
+    run = make_run()
+    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", run))
+    client = StubDynamoClient()
+    repository = DynamoDBAutonomousRunRepository(table=table, client=client)
+    event = RunEventRecord(
+        run_id="run-1", sequence=1, event_type="state.transitioned", to_status=run.status,
+        to_phase=run.phase, reason="queued"
+    )
+    table.items.append(DynamoDBAutonomousRunRepository._item("EVENT#00000000000000000001", event))
+    returned = repository.append_event("run-1", event_type="state.transitioned", reason="queued")
+    assert returned.sequence == 1
+    assert table.queries == []
+    call = cast(dict[str, object], table.get_item_calls[-1])
+    key = cast(dict[str, object], call["Key"])
+    assert key["sk"] == "EVENT#00000000000000000001"
+    assert call["ConsistentRead"] is True
+
+
+def test_dynamo_release_lease_maps_conditional_race_to_repository_error() -> None:
+    table = StubDynamoTable()
+    state = AutonomousRunState.model_validate(
+        {
+            **make_run().model_dump(mode="python"),
+            "lease_owner": "worker-a",
+            "lease_expires_at": datetime.now(UTC) + timedelta(minutes=1),
+        }
+    )
+    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", state))
+
+    def fail(**kwargs: object) -> None:
+        del kwargs
+        raise type("ConditionalError", (Exception,), {})()
+
+    table.put_item = fail  # type: ignore[method-assign]
+    repository = DynamoDBAutonomousRunRepository(table=table)
+    with pytest.raises(LeaseConflictError):
+        repository.release_lease("run-1", "worker-a")
 
 
 def test_dynamo_operation_intent_requires_existing_run_and_uses_transaction() -> None:
@@ -489,7 +765,7 @@ def test_event_contract_rejects_raw_content_and_nested_contracts_are_immutable()
         RunEventRecord(
             run_id="run-1",
             sequence=1,
-            event_type="x",
+            event_type="state.transitioned",
             to_status=AutonomousRunStatus.QUEUED,
             to_phase=RunPhase.QUEUED,
             reason="raw prompt: secret words",
@@ -498,7 +774,7 @@ def test_event_contract_rejects_raw_content_and_nested_contracts_are_immutable()
         RunEventRecord(
             run_id="run-1",
             sequence=1,
-            event_type="x",
+            event_type="state.transitioned",
             to_status=AutonomousRunStatus.QUEUED,
             to_phase=RunPhase.QUEUED,
             reason="arbitrary private answer",
@@ -507,7 +783,7 @@ def test_event_contract_rejects_raw_content_and_nested_contracts_are_immutable()
         RunEventRecord(
             run_id="run-1",
             sequence=1,
-            event_type="x",
+            event_type="state.transitioned",
             to_status=AutonomousRunStatus.QUEUED,
             to_phase=RunPhase.QUEUED,
             reason="queued",
@@ -528,7 +804,7 @@ def test_event_reason_accepts_safe_lifecycle_phrases() -> None:
         event = RunEventRecord(
             run_id="run-1",
             sequence=1,
-            event_type="x",
+            event_type="state.transitioned",
             to_status=AutonomousRunStatus.QUEUED,
             to_phase=RunPhase.QUEUED,
             reason=reason,
@@ -568,7 +844,7 @@ def test_event_metadata_requires_finite_numbers_and_allows_opaque_artifact_paths
     event = RunEventRecord(
         run_id="run-1",
         sequence=1,
-        event_type="x",
+        event_type="state.transitioned",
         to_status=AutonomousRunStatus.QUEUED,
         to_phase=RunPhase.QUEUED,
         reason="queued",
@@ -584,7 +860,7 @@ def test_event_metadata_requires_finite_numbers_and_allows_opaque_artifact_paths
             RunEventRecord(
                 run_id="run-1",
                 sequence=1,
-                event_type="x",
+                event_type="state.transitioned",
                 to_status=AutonomousRunStatus.QUEUED,
                 to_phase=RunPhase.QUEUED,
                 reason="queued",
@@ -594,7 +870,7 @@ def test_event_metadata_requires_finite_numbers_and_allows_opaque_artifact_paths
 
 def test_recovery_final_page_does_not_advertise_spurious_cursor() -> None:
     table = StubDynamoTable()
-    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_run()))
+    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_approved_queued_run()))
     repository = DynamoDBAutonomousRunRepository(table=table)
     page = repository.scan_recoverable(limit=1)
     assert len(page.items) == 1
@@ -604,7 +880,11 @@ def test_recovery_final_page_does_not_advertise_spurious_cursor() -> None:
 def test_recovery_scan_rejects_zero_limit_and_returns_cursor_for_physical_pages() -> None:
     table = StubDynamoTable()
     for index in range(3):
-        table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_run(f"run-{index}")))
+        table.items.append(
+            DynamoDBAutonomousRunRepository._item(
+                "STATE", make_approved_queued_run(f"run-{index}")
+            )
+        )
     repository = DynamoDBAutonomousRunRepository(table=table)
     with pytest.raises(ValueError):
         repository.scan_recoverable(limit=0)

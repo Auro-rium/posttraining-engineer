@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from hashlib import sha256
 from threading import RLock
 from typing import Any, Protocol, TypeVar, cast, runtime_checkable
 
@@ -61,6 +63,19 @@ class OperationNotFoundError(RepositoryError):
     pass
 
 
+class IdempotencyKeyConflictError(RepositoryError):
+    """An idempotency key is already bound to another request or response."""
+
+
+@dataclass(frozen=True)
+class IdempotencyRecord:
+    """Persisted request identity and a safe JSON response, if completed."""
+
+    operation: str
+    request_digest: str
+    response: Mapping[str, Any] | None = None
+
+
 class OptionalDependencyError(RepositoryError):
     pass
 
@@ -106,6 +121,20 @@ StatePage = Page[AutonomousRunState]
 class AutonomousRunRepository(Protocol):
     def create(self, state: AutonomousRunState) -> AutonomousRunState: ...
 
+    def claim_idempotency(
+        self, operation: str, key: str, request_digest: str
+    ) -> tuple[IdempotencyRecord, bool]: ...
+
+    def get_idempotency(self, operation: str, key: str) -> IdempotencyRecord | None: ...
+
+    def complete_idempotency(
+        self,
+        operation: str,
+        key: str,
+        request_digest: str,
+        response: Mapping[str, Any],
+    ) -> IdempotencyRecord: ...
+
     def get(self, run_id: str) -> AutonomousRunState | None: ...
 
     def update_state(
@@ -114,6 +143,14 @@ class AutonomousRunRepository(Protocol):
         *,
         expected_version: int,
         updates: Mapping[str, Any],
+    ) -> AutonomousRunState: ...
+
+    def request_cancel(
+        self, run_id: str, *, expected_version: int
+    ) -> AutonomousRunState: ...
+
+    def request_safe_stop(
+        self, run_id: str, *, expected_version: int
     ) -> AutonomousRunState: ...
 
     def transition(
@@ -201,10 +238,120 @@ def _ensure_now(value: datetime | None) -> datetime:
     return current
 
 
+def _validate_idempotency(operation: str, key: str, request_digest: str) -> None:
+    if not isinstance(operation, str) or not operation or len(operation) > 300:
+        raise ValueError("idempotency operation must be a non-empty bounded string")
+    if not isinstance(key, str) or not key.strip() or len(key) > 200:
+        raise ValueError("idempotency key must be a non-empty bounded string")
+    if (
+        not isinstance(request_digest, str)
+        or len(request_digest) != 64
+        or any(char not in "0123456789abcdef" for char in request_digest)
+    ):
+        raise ValueError("idempotency request digest must be a lowercase SHA-256")
+
+
+def _safe_response(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("idempotency response must be a JSON object")
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        normalized = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("idempotency response must contain safe JSON values") from exc
+    if not isinstance(normalized, dict):
+        raise ValueError("idempotency response must be a JSON object")
+    return normalized
+
+
 def _ensure_ttl(ttl_seconds: int) -> int:
     if ttl_seconds <= 0:
         raise ValueError("lease ttl_seconds must be positive")
     return ttl_seconds
+
+
+_OPERATION_STATUS_ORDER = {
+    RunOperationStatus.INTENT: 0,
+    RunOperationStatus.SUBMITTED: 1,
+    RunOperationStatus.RUNNING: 2,
+    RunOperationStatus.SUCCEEDED: 3,
+    RunOperationStatus.FAILED: 3,
+    RunOperationStatus.CANCELLED: 3,
+}
+_TERMINAL_OPERATION_STATUSES = frozenset(
+    {RunOperationStatus.SUCCEEDED, RunOperationStatus.FAILED, RunOperationStatus.CANCELLED}
+)
+_RECOVERABLE_STATUSES = frozenset(
+    {
+        AutonomousRunStatus.QUEUED,
+        AutonomousRunStatus.RUNNING,
+        AutonomousRunStatus.CANCEL_REQUESTED,
+        AutonomousRunStatus.SAFE_STOP_REQUESTED,
+    }
+)
+
+
+def _recoverable(state: AutonomousRunState, when: datetime) -> bool:
+    return (
+        state.status in _RECOVERABLE_STATUSES
+        and state.approval_consumed
+        and not (
+            state.lease_owner
+            and state.lease_expires_at
+            and state.lease_expires_at > when
+        )
+    )
+
+
+def _operation_update(
+    current: RunOperation,
+    *,
+    provider_id: str | None,
+    status: RunOperationStatus,
+    result: Mapping[str, Any] | None,
+) -> RunOperation:
+    """Apply one monotonic, idempotent provider callback to an intent."""
+
+    normalized_result = dict(result or {})
+
+    def canonical(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return tuple(sorted((str(key), canonical(item)) for key, item in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(canonical(item) for item in value)
+        return value
+
+    same_result = canonical(current.result) == canonical(normalized_result)
+    if _OPERATION_STATUS_ORDER[status] < _OPERATION_STATUS_ORDER[current.status]:
+        raise OperationAlreadyExistsError("operation status cannot move backwards")
+    effective_provider = provider_id if provider_id is not None else current.provider_id
+    if current.provider_id is not None and provider_id not in {None, current.provider_id}:
+        raise OperationAlreadyExistsError("operation provider identity cannot change")
+    if current.status in _TERMINAL_OPERATION_STATUSES:
+        if (
+            current.status is status
+            and current.provider_id == effective_provider
+            and same_result
+        ):
+            return current
+        raise OperationAlreadyExistsError("terminal operation result cannot be changed")
+    if (
+        current.status is status
+        and current.provider_id == effective_provider
+        and same_result
+    ):
+        return current
+    return RunOperation.model_validate(
+        current.model_copy(
+            update={
+                "provider_id": effective_provider,
+                "status": status,
+                "result": normalized_result,
+                "version": current.version + 1,
+                "updated_at": utc_now(),
+            }
+        ).model_dump(mode="python")
+    )
 
 
 _PATCH_FORBIDDEN_FIELDS = frozenset(
@@ -212,6 +359,9 @@ _PATCH_FORBIDDEN_FIELDS = frozenset(
         "run_id",
         "model_id",
         "checkpoint_revision",
+        "checkpoint_id",
+        "base_checkpoint_uri",
+        "base_checkpoint_sha256",
         "benchmark_manifest_sha256",
         "created_at",
         "version",
@@ -223,6 +373,16 @@ _PATCH_FORBIDDEN_FIELDS = frozenset(
         "lease_expires_at",
         "experiments",
         "updated_at",
+        "status",
+        "phase",
+        "benchmark_id",
+        "benchmark_suite",
+        "benchmark_version",
+        "benchmark_seed",
+        "max_experiments",
+        "approved_budget_usd",
+        "approval_scope",
+        "approval_expires_at",
     }
 )
 
@@ -251,7 +411,58 @@ class InMemoryAutonomousRunRepository:
         self._events: dict[str, list[RunEventRecord]] = {}
         self._experiments: dict[str, list[ExperimentRecord]] = {}
         self._operations: dict[tuple[str, str], RunOperation] = {}
+        self._idempotency: dict[tuple[str, str], IdempotencyRecord] = {}
         self._lock = RLock()
+
+    def claim_idempotency(
+        self, operation: str, key: str, request_digest: str
+    ) -> tuple[IdempotencyRecord, bool]:
+        _validate_idempotency(operation, key, request_digest)
+        identity = (operation, key)
+        with self._lock:
+            current = self._idempotency.get(identity)
+            if current is not None:
+                if current.request_digest != request_digest:
+                    raise IdempotencyKeyConflictError(
+                        "idempotency key is bound to a different request"
+                    )
+                return _copy_idempotency(current), False
+            created = IdempotencyRecord(operation=operation, request_digest=request_digest)
+            self._idempotency[identity] = created
+            return _copy_idempotency(created), True
+
+    def get_idempotency(self, operation: str, key: str) -> IdempotencyRecord | None:
+        if not operation or not key:
+            raise ValueError("idempotency operation and key are required")
+        with self._lock:
+            current = self._idempotency.get((operation, key))
+            return _copy_idempotency(current) if current is not None else None
+
+    def complete_idempotency(
+        self,
+        operation: str,
+        key: str,
+        request_digest: str,
+        response: Mapping[str, Any],
+    ) -> IdempotencyRecord:
+        _validate_idempotency(operation, key, request_digest)
+        normalized = _safe_response(response)
+        identity = (operation, key)
+        with self._lock:
+            current = self._idempotency.get(identity)
+            if current is None or current.request_digest != request_digest:
+                raise IdempotencyKeyConflictError("idempotency claim does not match completion")
+            if current.response is not None:
+                if _json(current.response) != _json(normalized):
+                    raise IdempotencyKeyConflictError("idempotency response cannot be changed")
+                return _copy_idempotency(current)
+            completed = IdempotencyRecord(
+                operation=operation,
+                request_digest=request_digest,
+                response=normalized,
+            )
+            self._idempotency[identity] = completed
+            return _copy_idempotency(completed)
 
     def create(self, state: AutonomousRunState) -> AutonomousRunState:
         with self._lock:
@@ -283,6 +494,14 @@ class InMemoryAutonomousRunRepository:
                     f"run version is {current.version}; expected {expected_version}"
                 )
             normalized = _validated_state_updates(updates)
+            if set(normalized) <= {"cancellation_requested", "safe_stop_requested"}:
+                if len(normalized) != 1 or normalized.get(next(iter(normalized))) is not True:
+                    raise ValueError("control patches must request exactly one control flag")
+                return self.request_cancel(
+                    run_id, expected_version=expected_version
+                ) if "cancellation_requested" in normalized else self.request_safe_stop(
+                    run_id, expected_version=expected_version
+                )
             next_state = AutonomousRunState.model_validate(
                 current.model_copy(
                     update={
@@ -293,6 +512,61 @@ class InMemoryAutonomousRunRepository:
                 ).model_dump(mode="python")
             )
             return self._store_state(next_state)
+
+    def _request_control(
+        self, run_id: str, *, expected_version: int, field: str, reason: str, event_type: str
+    ) -> AutonomousRunState:
+        with self._lock:
+            current = self._require(run_id)
+            if current.version != expected_version:
+                raise ConcurrentUpdateError(
+                    f"run version is {current.version}; expected {expected_version}"
+                )
+            if getattr(current, field):
+                return copy_for_storage(current)
+            when = utc_now()
+            next_state = AutonomousRunState.model_validate(
+                current.model_copy(
+                    update={
+                        field: True,
+                        "version": current.version + 1,
+                        "event_sequence": current.event_sequence + 1,
+                        "updated_at": when,
+                    }
+                ).model_dump(mode="python")
+            )
+            event = RunEventRecord(
+                run_id=run_id,
+                sequence=next_state.event_sequence,
+                event_type=event_type,
+                from_status=current.status,
+                to_status=current.status,
+                from_phase=current.phase,
+                to_phase=current.phase,
+                reason=reason,
+                occurred_at=when,
+            )
+            self._states[run_id] = copy_for_storage(next_state)
+            self._events[run_id].append(copy_for_storage(event))
+            return copy_for_storage(next_state)
+
+    def request_cancel(self, run_id: str, *, expected_version: int) -> AutonomousRunState:
+        return self._request_control(
+            run_id,
+            expected_version=expected_version,
+            field="cancellation_requested",
+            reason="cancel requested",
+            event_type="run.cancel_requested",
+        )
+
+    def request_safe_stop(self, run_id: str, *, expected_version: int) -> AutonomousRunState:
+        return self._request_control(
+            run_id,
+            expected_version=expected_version,
+            field="safe_stop_requested",
+            reason="safe stop requested",
+            event_type="run.safe_stop_requested",
+        )
 
     def _require(self, run_id: str) -> AutonomousRunState:
         state = self._states.get(run_id)
@@ -497,25 +771,19 @@ class InMemoryAutonomousRunRepository:
     ) -> StatePage:
         if limit < 1:
             raise ValueError("limit must be positive")
-        if cursor is not None:
-            raise ValueError("in-memory recovery does not accept a cursor")
         when = _ensure_now(now)
-        terminal = {
-            AutonomousRunStatus.SUCCEEDED,
-            AutonomousRunStatus.FAILED,
-            AutonomousRunStatus.CANCELLED,
-            AutonomousRunStatus.BLOCKED,
-            AutonomousRunStatus.STOPPED,
-        }
+        if cursor is not None and set(cursor) != {"run_id"}:
+            raise ValueError("in-memory recovery cursor must contain run_id")
+        after = str(cursor["run_id"]) if cursor is not None else None
         with self._lock:
-            values = []
-            for state in self._states.values():
-                if state.status in terminal:
-                    continue
-                if state.lease_owner and state.lease_expires_at and state.lease_expires_at > when:
-                    continue
-                values.append(copy_for_storage(state))
-            return StatePage(values[:limit])
+            values = [
+                copy_for_storage(state)
+                for run_id, state in sorted(self._states.items())
+                if (after is None or run_id > after) and _recoverable(state, when)
+            ]
+            selected = values[:limit]
+            next_cursor = {"run_id": selected[-1].run_id} if len(values) > len(selected) else None
+            return StatePage(selected, next_cursor=next_cursor)
 
     def put_operation_intent(self, operation: RunOperation) -> RunOperation:
         with self._lock:
@@ -562,29 +830,12 @@ class InMemoryAutonomousRunRepository:
             if current is None:
                 raise OperationNotFoundError("operation intent does not exist")
             normalized_status = RunOperationStatus(status)
-            normalized_result = dict(result or {})
-            if current.status in {
-                RunOperationStatus.SUCCEEDED,
-                RunOperationStatus.FAILED,
-                RunOperationStatus.CANCELLED,
-            }:
-                if (
-                    current.status is normalized_status
-                    and current.provider_id == provider_id
-                    and dict(current.result) == normalized_result
-                ):
-                    return copy_for_storage(current)
-                raise OperationAlreadyExistsError("terminal operation result cannot be changed")
-            updated = current.model_copy(
-                update={
-                    "provider_id": provider_id if provider_id is not None else current.provider_id,
-                    "status": normalized_status,
-                    "result": normalized_result,
-                    "version": current.version + 1,
-                    "updated_at": utc_now(),
-                }
+            updated = _operation_update(
+                current,
+                provider_id=provider_id,
+                status=normalized_status,
+                result=result,
             )
-            updated = RunOperation.model_validate(updated.model_dump(mode="python"))
             self._operations[(run_id, operation_key)] = copy_for_storage(updated)
             return copy_for_storage(updated)
 
@@ -668,6 +919,15 @@ def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
+def _copy_idempotency(record: IdempotencyRecord) -> IdempotencyRecord:
+    response = _safe_response(record.response) if record.response is not None else None
+    return IdempotencyRecord(
+        operation=record.operation,
+        request_digest=record.request_digest,
+        response=response,
+    )
+
+
 class DynamoDBAutonomousRunRepository:
     """DynamoDB implementation with conditional writes and transaction boundaries."""
 
@@ -731,6 +991,14 @@ class DynamoDBAutonomousRunRepository:
                 f"run version is {current.version}; expected {expected_version}"
             )
         normalized = _validated_state_updates(updates)
+        if set(normalized) <= {"cancellation_requested", "safe_stop_requested"}:
+            if len(normalized) != 1 or normalized.get(next(iter(normalized))) is not True:
+                raise ValueError("control patches must request exactly one control flag")
+            return self.request_cancel(
+                run_id, expected_version=expected_version
+            ) if "cancellation_requested" in normalized else self.request_safe_stop(
+                run_id, expected_version=expected_version
+            )
         next_state = AutonomousRunState.model_validate(
             current.model_copy(
                 update={
@@ -751,6 +1019,85 @@ class DynamoDBAutonomousRunRepository:
                 raise ConcurrentUpdateError("conditional state update failed") from exc
             raise
         return next_state
+
+    def _request_control(
+        self, run_id: str, *, expected_version: int, field: str, reason: str, event_type: str
+    ) -> AutonomousRunState:
+        current = self.get(run_id)
+        if current is None:
+            raise RunNotFoundError(f"run {run_id!r} was not found")
+        if current.version != expected_version:
+            raise ConcurrentUpdateError("stale run version")
+        if getattr(current, field):
+            return current
+        when = utc_now()
+        next_state = AutonomousRunState.model_validate(
+            current.model_copy(
+                update={
+                    field: True,
+                    "version": current.version + 1,
+                    "event_sequence": current.event_sequence + 1,
+                    "updated_at": when,
+                }
+            ).model_dump(mode="python")
+        )
+        event = RunEventRecord(
+            run_id=run_id,
+            sequence=next_state.event_sequence,
+            event_type=event_type,
+            from_status=current.status,
+            to_status=current.status,
+            from_phase=current.phase,
+            to_phase=current.phase,
+            reason=reason,
+            occurred_at=when,
+        )
+        try:
+            self._client_or_create().transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table_name,
+                            "Item": self._ddb_item(self.STATE_SK, next_state),
+                            "ConditionExpression": f"version = :version AND {field} = :false",
+                            "ExpressionAttributeValues": {
+                                ":version": {"N": str(current.version)},
+                                ":false": {"BOOL": False},
+                            },
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table_name,
+                            "Item": self._ddb_item(f"EVENT#{event.sequence:020d}", event),
+                            "ConditionExpression": "attribute_not_exists(pk)",
+                        }
+                    },
+                ]
+            )
+        except Exception as exc:
+            if self._conditional(exc):
+                raise ConcurrentUpdateError("control request changed concurrently") from exc
+            raise
+        return next_state
+
+    def request_cancel(self, run_id: str, *, expected_version: int) -> AutonomousRunState:
+        return self._request_control(
+            run_id,
+            expected_version=expected_version,
+            field="cancellation_requested",
+            reason="cancel requested",
+            event_type="run.cancel_requested",
+        )
+
+    def request_safe_stop(self, run_id: str, *, expected_version: int) -> AutonomousRunState:
+        return self._request_control(
+            run_id,
+            expected_version=expected_version,
+            field="safe_stop_requested",
+            reason="safe stop requested",
+            event_type="run.safe_stop_requested",
+        )
 
     @staticmethod
     def _operation_sk(operation_key: str) -> str:
@@ -859,6 +1206,156 @@ class DynamoDBAutonomousRunRepository:
             and response["Error"].get("Code") == "ConditionalCheckFailedException"
         ) or exc.__class__.__name__ in {"ConditionalCheckFailedException", "ConditionalError"}
 
+    @staticmethod
+    def _idempotency_key(operation: str, key: str) -> dict[str, str]:
+        identity = sha256(_json({"operation": operation, "key": key}).encode("utf-8")).hexdigest()
+        return {"pk": f"IDEMP#{identity}", "sk": "RECORD"}
+
+    @classmethod
+    def _idempotency_item(
+        cls,
+        operation: str,
+        request_digest: str,
+        response: Mapping[str, Any] | None,
+        *,
+        key: str,
+    ) -> dict[str, Any]:
+        item = cls._idempotency_key(operation, key)
+        state = "COMPLETED" if response is not None else "PENDING"
+        item.update(
+            {
+                "entity": "LiveAPIIdempotency",
+                "operation": operation,
+                "request_digest": request_digest,
+                "state": state,
+                "payload": _json(
+                    {
+                        "operation": operation,
+                        "request_digest": request_digest,
+                        "state": state,
+                        "response": dict(response) if response is not None else None,
+                    }
+                ),
+            }
+        )
+        return item
+
+    @staticmethod
+    def _decode_idempotency(item: Mapping[str, Any]) -> IdempotencyRecord:
+        payload = item.get("payload")
+        if not isinstance(payload, str):
+            raise RepositoryError("stored idempotency record has invalid payload")
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise RepositoryError("stored idempotency record has invalid payload") from exc
+        if not isinstance(decoded, Mapping):
+            raise RepositoryError("stored idempotency record has invalid payload")
+        operation = decoded.get("operation")
+        request_digest = decoded.get("request_digest")
+        state = decoded.get("state")
+        response = decoded.get("response")
+        if (
+            not isinstance(operation, str)
+            or not isinstance(request_digest, str)
+            or state not in {"PENDING", "COMPLETED"}
+        ):
+            raise RepositoryError("stored idempotency record is malformed")
+        if state == "PENDING":
+            if response is not None:
+                raise RepositoryError("pending idempotency record contains a response")
+            normalized_response = None
+        else:
+            if not isinstance(response, Mapping):
+                raise RepositoryError("completed idempotency record has no safe response")
+            normalized_response = _safe_response(response)
+        return IdempotencyRecord(
+            operation=operation,
+            request_digest=request_digest,
+            response=normalized_response,
+        )
+
+    def get_idempotency(self, operation: str, key: str) -> IdempotencyRecord | None:
+        if not operation or not key:
+            raise ValueError("idempotency operation and key are required")
+        response = self._table_or_create().get_item(
+            Key=self._idempotency_key(operation, key), ConsistentRead=True
+        )
+        item = response.get("Item")
+        if not isinstance(item, Mapping):
+            return None
+        record = self._decode_idempotency(item)
+        if record.operation != operation:
+            raise RepositoryError("stored idempotency identity does not match its key")
+        return _copy_idempotency(record)
+
+    def claim_idempotency(
+        self, operation: str, key: str, request_digest: str
+    ) -> tuple[IdempotencyRecord, bool]:
+        _validate_idempotency(operation, key, request_digest)
+        record = IdempotencyRecord(operation=operation, request_digest=request_digest)
+        try:
+            self._table_or_create().put_item(
+                Item=self._idempotency_item(operation, request_digest, None, key=key),
+                ConditionExpression="attribute_not_exists(pk)",
+            )
+        except Exception as exc:
+            if not self._conditional(exc):
+                raise
+            existing = self.get_idempotency(operation, key)
+            if existing is None:
+                raise RepositoryError(
+                    "idempotency claim raced but no durable record is readable"
+                ) from exc
+            if existing.request_digest != request_digest:
+                raise IdempotencyKeyConflictError(
+                    "idempotency key is bound to a different request"
+                ) from exc
+            return existing, False
+        return record, True
+
+    def complete_idempotency(
+        self,
+        operation: str,
+        key: str,
+        request_digest: str,
+        response: Mapping[str, Any],
+    ) -> IdempotencyRecord:
+        _validate_idempotency(operation, key, request_digest)
+        normalized = _safe_response(response)
+        current = self.get_idempotency(operation, key)
+        if current is None or current.request_digest != request_digest:
+            raise IdempotencyKeyConflictError("idempotency claim does not match completion")
+        if current.response is not None:
+            if _json(current.response) != _json(normalized):
+                raise IdempotencyKeyConflictError("idempotency response cannot be changed")
+            return current
+        try:
+            self._table_or_create().put_item(
+                Item=self._idempotency_item(operation, request_digest, normalized, key=key),
+                ConditionExpression="request_digest = :request_digest AND #state = :pending",
+                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeValues={
+                    ":request_digest": request_digest,
+                    ":pending": "PENDING",
+                },
+            )
+        except Exception as exc:
+            if not self._conditional(exc):
+                raise
+            raced = self.get_idempotency(operation, key)
+            if raced is not None and raced.request_digest == request_digest:
+                if raced.response is not None and _json(raced.response) == _json(normalized):
+                    return raced
+            raise IdempotencyKeyConflictError(
+                "idempotency completion changed concurrently"
+            ) from exc
+        return IdempotencyRecord(
+            operation=operation,
+            request_digest=request_digest,
+            response=normalized,
+        )
+
     def transition(
         self,
         run_id: str,
@@ -936,7 +1433,7 @@ class DynamoDBAutonomousRunRepository:
         current = self.get(run_id)
         if current is None:
             raise RunNotFoundError(f"run {run_id!r} was not found")
-        self.transition(
+        next_state = self.transition(
             run_id,
             expected_version=current.version,
             status=current.status,
@@ -945,10 +1442,17 @@ class DynamoDBAutonomousRunRepository:
             event_type=event_type,
             metadata=metadata,
         )
-        page = self.list_events(run_id, after_sequence=current.event_sequence, limit=1)
-        if not page.items:
+        response = self._table_or_create().get_item(
+            Key=self._key(run_id, f"EVENT#{next_state.event_sequence:020d}"),
+            ConsistentRead=True,
+        )
+        item = response.get("Item")
+        if not isinstance(item, Mapping):
             raise RepositoryError("event append succeeded without a readable event")
-        return page.items[0]
+        event = self._decode(item, RunEventRecord)
+        if event.sequence != next_state.event_sequence:
+            raise RepositoryError("event append returned an unexpected sequence")
+        return event
 
     def consume_approval(self, run_id: str, approval_digest: str) -> AutonomousRunState:
         current = self.get(run_id)
@@ -1084,11 +1588,16 @@ class DynamoDBAutonomousRunRepository:
                 }
             ).model_dump(mode="python")
         )
-        self._table_or_create().put_item(
-            Item=self._item(self.STATE_SK, next_state),
-            ConditionExpression="version = :version",
-            ExpressionAttributeValues={":version": current.version},
-        )
+        try:
+            self._table_or_create().put_item(
+                Item=self._item(self.STATE_SK, next_state),
+                ConditionExpression="version = :version",
+                ExpressionAttributeValues={":version": current.version},
+            )
+        except Exception as exc:
+            if self._conditional(exc):
+                raise LeaseConflictError("lease release lost a race") from exc
+            raise
         return next_state
 
     def scan_recoverable(
@@ -1102,13 +1611,6 @@ class DynamoDBAutonomousRunRepository:
             raise ValueError("limit must be positive")
         # Scan is intentionally metadata-only and bounded; production callers should add a GSI.
         when = _ensure_now(now)
-        terminal = {
-            AutonomousRunStatus.SUCCEEDED,
-            AutonomousRunStatus.FAILED,
-            AutonomousRunStatus.CANCELLED,
-            AutonomousRunStatus.BLOCKED,
-            AutonomousRunStatus.STOPPED,
-        }
         output: list[AutonomousRunState] = []
         next_cursor = dict(cursor) if cursor is not None else None
         while len(output) < limit:
@@ -1116,21 +1618,26 @@ class DynamoDBAutonomousRunRepository:
             if next_cursor is not None:
                 kwargs["ExclusiveStartKey"] = next_cursor
             response = self._table_or_create().scan(**kwargs)
+            items = response.get("Items", [])
             page_cursor: dict[str, Any] | None = None
-            for item in response.get("Items", []):
+            for index, item in enumerate(items):
                 if item.get("sk") != self.STATE_SK:
-                    page_cursor = {"pk": item.get("pk"), "sk": item.get("sk")}
                     continue
                 state = self._decode(item, AutonomousRunState)
-                if state.status not in terminal and not (
-                    state.lease_owner and state.lease_expires_at and state.lease_expires_at > when
-                ):
+                if _recoverable(state, when):
                     output.append(state)
                     page_cursor = {"pk": item.get("pk"), "sk": item.get("sk")}
                     if len(output) >= limit:
+                        has_more_in_page = index + 1 < len(items)
+                        if not has_more_in_page and not isinstance(
+                            response.get("LastEvaluatedKey"), Mapping
+                        ):
+                            page_cursor = None
                         break
             raw_cursor = response.get("LastEvaluatedKey")
-            if len(output) >= limit and page_cursor is not None and isinstance(raw_cursor, Mapping):
+            if len(output) >= limit and page_cursor is not None and (
+                isinstance(raw_cursor, Mapping) or page_cursor is not None
+            ):
                 next_cursor = page_cursor
             else:
                 next_cursor = dict(raw_cursor) if isinstance(raw_cursor, Mapping) else None
@@ -1214,30 +1721,14 @@ class DynamoDBAutonomousRunRepository:
         if current is None:
             raise OperationNotFoundError("operation intent does not exist")
         normalized_status = RunOperationStatus(status)
-        normalized_result = dict(result or {})
-        if current.status in {
-            RunOperationStatus.SUCCEEDED,
-            RunOperationStatus.FAILED,
-            RunOperationStatus.CANCELLED,
-        }:
-            if (
-                current.status is normalized_status
-                and current.provider_id == provider_id
-                and dict(current.result) == normalized_result
-            ):
-                return current
-            raise OperationAlreadyExistsError("terminal operation result cannot be changed")
-        updated = RunOperation.model_validate(
-            current.model_copy(
-                update={
-                    "provider_id": provider_id if provider_id is not None else current.provider_id,
-                    "status": normalized_status,
-                    "result": normalized_result,
-                    "version": current.version + 1,
-                    "updated_at": utc_now(),
-                }
-            ).model_dump(mode="python")
+        updated = _operation_update(
+            current,
+            provider_id=provider_id,
+            status=normalized_status,
+            result=result,
         )
+        if updated == current:
+            return current
         try:
             self._table_or_create().put_item(
                 Item=self._item(self._operation_sk(updated.operation_key), updated),

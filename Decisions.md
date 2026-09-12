@@ -310,3 +310,39 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** The observer is read-only and may show a blocked or incomplete run; authenticated durable events remain a live deployment prerequisite.
 - **Affected components:** Frontend observer, run/event APIs, comparison graph, telemetry, and demo documentation.
 - **Validation:** UI tests must verify event-driven phase movement, visible blocked/failed states, one-to-five run comparisons, and the absence of raw prompt/completion/task content.
+
+## DEC-027 — Enforce durable telemetry lifecycle and correlation contracts
+
+- **Date / run:** 2026-09-12 / `TELEMETRY-LIFECYCLE-HARDENING-001`
+- **Status:** Accepted
+- **Context:** Supervisor transitions did not provide a complete run/phase lifecycle, and unbounded event labels or free-form identifier values could weaken telemetry's metadata-only boundary.
+- **Decision:** Restrict durable event records to the finite lifecycle vocabulary; validate recorder identifiers and allow-listed metadata as opaque values; persist run starts, phase outcomes, and terminal events through the durable telemetry bridge; stop the supervisor on durable validation or persistence errors; and attach the durable event ID plus exact autonomous event type to OpenTelemetry spans.
+- **Alternatives:** Keep generic state-transition events only; accept arbitrary event strings and metadata values; treat durable validation errors as optional-observer failures.
+- **Reason:** Precise, bounded lifecycle records make recovery and audit meaningful without capturing model/task content or making an incomplete durable write look successful.
+- **Trade-offs:** Adding event semantics requires updating the model vocabulary; legacy persisted records with unrecognized event types will need explicit migration before they can be decoded.
+- **Affected components:** `backend/app/autonomous/models.py`, `backend/app/autonomous/telemetry.py`, `backend/app/autonomous/supervisor.py`, `backend/app/observability.py`, telemetry tests, and `Flow.md`.
+- **Validation:** Focused telemetry/supervisor/repository tests, Ruff, mypy, documentation sync, and diff checks; no live AWS run is implied.
+
+## DEC-028 — Separate explanatory coordinator output from objective-worker evidence
+
+- **Date / run:** 2026-09-12 / `OBJECTIVE-CHECKPOINT-EXECUTION-001`
+- **Status:** Accepted
+- **Context:** The ordinary local `/api/runs` flow uses in-memory state and explanatory fixtures, while the isolated objective service now has a real FunctionGemma execution adapter. Treating both as one path would blur the boundary between a local demo, real checkpoint inference, and a complete AWS post-training run.
+- **Decision:** Keep `/api/runs` explicitly labeled `EXPLANATION`; run objective benchmark work only through the separately configured `SERVICE_ROLE=objective` service with a complete local FunctionGemma snapshot, immutable revision, expected snapshot digest, authentication, and artifact persistence. Load model files locally without Hub fallback, execute train/replay only, and admit artifacts only after deterministic verifier replay. Document `/api/live` as a separate, approval-gated AWS control plane; scope deployment/live-run activity to the AWS hackathon project only.
+- **Alternatives:** Reuse the coordinator's explanatory fixture as benchmark evidence; resolve a mutable remote model reference at runtime; combine local-demo and AWS-control APIs.
+- **Reason:** Explicitly separated paths make it possible to distinguish implementation and contract tests from real model execution and AWS-backed training/evaluation evidence.
+- **Trade-offs:** The objective worker requires a separately staged target checkpoint and configured artifact storage. Implemented adapters and passing tests do not prove that a real checkpoint loaded, AWS resources deployed, or a post-training run completed.
+- **Affected components:** `.env.example`, `README.md`, `backend/README.md`, `Flow.md`, objective-worker configuration and `/api/live` runbook.
+- **Validation:** Objective execution/artifact contract tests passed (26 tests); `backend/scripts/check_docs_sync.py` and `git diff --check` passed. No AWS calls, deployment, real checkpoint inference, SageMaker job, or live-run completion is asserted by this decision.
+
+## DEC-029 — Compare champion and candidate only through the paired sealed evaluator
+
+- **Date / run:** 2026-09-12 / `SEALED-PAIRED-EVALUATION-001`
+- **Status:** Accepted
+- **Context:** The supervisor requested `split=baseline` through the objective benchmark endpoint, which is restricted to train/replay trajectories. Treating baseline as train would create false held-out provenance.
+- **Decision:** Do not benchmark the baseline through the training endpoint. Obtain both active champion and candidate scores from one SageMaker sealed-evaluator report bound to the same evaluation manifest, checkpoint digests, task ordering, paired-outcome digest, and environment aggregates. Reject non-train/replay benchmark requests and fail closed on missing or inconsistent paired evidence.
+- **Alternatives:** Map baseline to train; compare a separately measured baseline result; expose hidden tasks through the objective benchmark API.
+- **Reason:** One sealed report is the authoritative evidence that both models were evaluated against the same held-out suite and task sequence.
+- **Trade-offs:** The objective worker alone cannot establish a baseline; the SageMaker evaluator and its immutable report are prerequisites for promotion.
+- **Affected components:** Autonomous supervisor, live objective/evaluation adapters, objective benchmark request contract, evaluator report validation, focused tests, and Flow.
+- **Validation:** Focused supervisor, live execution, objective workflow, objective service, and objective execution tests. No AWS run or held-out model evaluation is implied by local tests.

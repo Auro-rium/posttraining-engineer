@@ -21,19 +21,31 @@ from app.providers.sagemaker import (
 
 
 def _training_request() -> TrainingJobRequest:
+    dataset_sha256 = "a" * 64
     return TrainingJobRequest(
         job_name="apt-run-001-train",
         role_arn="arn:aws:iam::123456789012:role/train",
         image_uri="123456789012.dkr.ecr.us-east-1.amazonaws.com/train@sha256:abc",
-        input_s3_uri="s3://artifacts/run-001/dataset",
+        input_s3_uri=f"s3://artifacts/run-001/dataset/{dataset_sha256}",
         output_s3_uri="s3://artifacts/run-001/candidate",
         instance_type="ml.g5.xlarge",
         hyperparameters={"epochs": 2, "learning_rate": "0.0002"},
-        environment={"RUN_ID": "run-001"},
+        environment={
+            "RUN_ID": "run-001",
+            "EXPERIMENT_ID": "run-001-1",
+            "DATASET_ID": "dataset-001",
+            "DATASET_SHA256": dataset_sha256,
+            "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-001",
+            "BASE_MODEL_ID": "google/functiongemma-270m-it",
+            "BASE_MODEL_REVISION": "b" * 40,
+            "QLORA_CONFIG": "{}",
+        },
     )
 
 
 def _evaluation_request() -> EvaluationJobRequest:
+    candidate_sha256 = "c" * 64
+    champion_sha256 = "b" * 64
     return EvaluationJobRequest(
         job_name="apt-run-001-eval",
         role_arn="arn:aws:iam::123456789012:role/eval",
@@ -41,7 +53,19 @@ def _evaluation_request() -> EvaluationJobRequest:
         input_s3_uri="s3://artifacts/run-001/held-out",
         output_s3_uri="s3://artifacts/run-001/evaluation",
         instance_type="ml.g5.xlarge",
-        model_s3_uri="s3://artifacts/run-001/candidate/model.tar.gz",
+        model_s3_uri=f"s3://artifacts/run-001/candidate/{candidate_sha256}.tar.gz",
+        candidate_s3_uri=f"s3://artifacts/run-001/candidate/{candidate_sha256}.tar.gz",
+        champion_s3_uri=f"s3://artifacts/run-001/champion/{champion_sha256}.tar.gz",
+        sealed_s3_uri="s3://artifacts/run-001/held-out",
+        environment={
+            "RUN_ID": "run-001",
+            "EXPERIMENT_ID": "run-001-1",
+            "EVALUATION_MANIFEST_SHA256": "d" * 64,
+            "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+            "OBJECTIVE_SEED": "7",
+            "CANDIDATE_ARCHIVE_SHA256": candidate_sha256,
+            "CHAMPION_ARCHIVE_SHA256": champion_sha256,
+        },
     )
 
 

@@ -22,8 +22,11 @@ from .repository import (
     InMemoryAutonomousRunRepository,
     LeaseConflictError,
     OperationAlreadyExistsError,
+    OperationNotFoundError,
+    OptionalDependencyError,
     RepositoryError,
     RunAlreadyExistsError,
+    RunNotFoundError,
 )
 
 __all__ = [
@@ -41,10 +44,13 @@ __all__ = [
     "InMemoryAutonomousRunRepository",
     "LeaseConflictError",
     "OperationAlreadyExistsError",
+    "OperationNotFoundError",
     "OptimizationRunner",
+    "OptionalDependencyError",
     "RepositoryError",
     "RunAlreadyExistsError",
     "RunEventRecord",
+    "RunNotFoundError",
     "RunOperation",
     "RunOperationStatus",
     "RunPhase",

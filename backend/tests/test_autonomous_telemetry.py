@@ -303,6 +303,33 @@ def test_rejects_unstructured_reason_before_persistence() -> None:
         )
 
 
+def test_run_event_record_rejects_unregistered_free_form_event_type() -> None:
+    with pytest.raises(ValueError, match="event_type"):
+        RunEventRecord(
+            run_id="run-1",
+            sequence=1,
+            event_type="provider returned customer details",
+            to_status=AutonomousRunStatus.RUNNING,
+            to_phase=RunPhase.BASELINE,
+            reason="started",
+        )
+
+
+@pytest.mark.parametrize("event_type", list(AutonomousEventType))
+def test_run_event_record_accepts_the_complete_autonomous_event_vocabulary(
+    event_type: AutonomousEventType,
+) -> None:
+    event = RunEventRecord(
+        run_id="run-1",
+        sequence=1,
+        event_type=event_type.value,
+        to_status=AutonomousRunStatus.RUNNING,
+        to_phase=RunPhase.BASELINE,
+        reason="started",
+    )
+    assert event.event_type == event_type.value
+
+
 def test_new_semantic_events_map_to_existing_observer_vocabulary() -> None:
     assert CANONICAL_EVENT_TYPES[AutonomousEventType.OPERATION_INTENT].value == "job.submitted"
     assert CANONICAL_EVENT_TYPES[AutonomousEventType.OPERATION_COMPLETED].value == "job.completed"
@@ -318,6 +345,7 @@ def test_new_semantic_events_map_to_existing_observer_vocabulary() -> None:
         {"authorization": "Bearer abc"},
         {"unknown": "free-form"},
         {"status": "contains spaces"},
+        {"durable_event_type": "provider returned customer details"},
     ],
 )
 def test_rejects_sensitive_and_unknown_metadata(metadata: dict[str, str]) -> None:
@@ -346,6 +374,7 @@ def test_vocabulary_contains_control_plane_and_provider_lifecycle_events() -> No
         "run.started",
         "run.completed",
         "run.failed",
+        "run.blocked",
         "phase.started",
         "phase.completed",
         "phase.failed",

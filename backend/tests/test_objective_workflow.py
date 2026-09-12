@@ -79,7 +79,7 @@ def test_objective_worker_result_is_provenance_checked() -> None:
         suite_version="2026-09-01",
         seed=7,
         num_episodes=10,
-        split="baseline",
+        split="train",
         output_s3_uri="s3://bucket/runs/run-001",
     )
 
@@ -107,6 +107,21 @@ def test_objective_worker_result_is_provenance_checked() -> None:
 
     with pytest.raises(ValueError, match="provenance"):
         execute_objective_benchmark(BadWorker(), request)
+
+
+@pytest.mark.parametrize("split", ["baseline", "held_out", "hidden"])
+def test_training_benchmark_request_rejects_non_training_splits(split: str) -> None:
+    with pytest.raises(ValueError):
+        ObjectiveBenchmarkRequest(
+            run_id="run-001",
+            model_uri="s3://bucket/base",
+            suite="AgentGym/WebShop",
+            suite_version="2026-09-01",
+            seed=7,
+            num_episodes=10,
+            split=split,
+            output_s3_uri="s3://bucket/runs/run-001",
+        )
 
 
 class FakeProvider:

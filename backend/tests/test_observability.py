@@ -156,6 +156,39 @@ def test_rejects_invalid_correlation_and_measurements() -> None:
         )
 
 
+def test_identifiers_and_allow_listed_string_metadata_reject_free_form_content() -> None:
+    exported: list[dict[str, object]] = []
+    recorder = TelemetryRecorder(exporter=exported.append, logger=None, tracer=None)
+
+    with pytest.raises(ValueError, match="run_id"):
+        recorder.record(
+            EventType.RUN_STARTED,
+            run_id="run-001 contains words",
+            run_number=1,
+            experiment_id="experiment-001",
+        )
+    with pytest.raises(ValueError, match="run_id"):
+        recorder.record(
+            EventType.RUN_STARTED,
+            run_id="private_prompt",
+            run_number=1,
+            experiment_id="experiment-001",
+        )
+
+    event = recorder.record(
+        EventType.RUN_STARTED,
+        run_id="run-001",
+        run_number=1,
+        experiment_id="experiment-001",
+        attributes={
+            "provider": "some harmless but free form text",
+            "region": "sealed-task",
+        },
+    )
+    assert event.attributes["provider"] == "[REDACTED]"
+    assert event.attributes["region"] == "[REDACTED]"
+
+
 def test_promotion_events_require_evidence_label() -> None:
     recorder = TelemetryRecorder()
 
@@ -209,6 +242,8 @@ def test_redacts_unknown_metadata_strings_and_freezes_nested_attributes() -> Non
             },
             "attempt": 2,
             "items": [1, 2],
+            "durable_event_type": "unregistered.event",
+            "evidence_label": "FAKE",
         },
     )
 
@@ -218,6 +253,8 @@ def test_redacts_unknown_metadata_strings_and_freezes_nested_attributes() -> Non
         "nested": {"environment": "webshop", "freeform": "[REDACTED]"},
         "attempt": 2,
         "items": [1, 2],
+        "durable_event_type": "[REDACTED]",
+        "evidence_label": "[REDACTED]",
     }
     assert isinstance(event.attributes, MappingProxyType)
     assert isinstance(event.attributes["nested"], MappingProxyType)
@@ -231,3 +268,42 @@ def test_redacts_unknown_metadata_strings_and_freezes_nested_attributes() -> Non
     assert isinstance(payload["attributes"], dict)
     payload["attributes"]["suite"] = "changed"
     assert event.attributes["suite"] == "agentgym"
+
+
+def test_otel_span_carries_event_identity_and_allow_listed_semantics() -> None:
+    spans: list[dict[str, object]] = []
+
+    class Span:
+        def end(self) -> None:
+            return None
+
+    class Tracer:
+        def start_span(self, name: str, *, attributes: dict[str, object]) -> Span:
+            spans.append({"name": name, **attributes})
+            return Span()
+
+    from app.autonomous.models import AutonomousRunState
+    from app.autonomous.repository import InMemoryAutonomousRunRepository
+    from app.autonomous.telemetry import AutonomousEventType, DurableTelemetryBridge
+
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(
+        AutonomousRunState(
+            run_id="run-otel",
+            checkpoint_revision="a" * 40,
+            benchmark_manifest_sha256="b" * 64,
+        )
+    )
+    recorder = TelemetryRecorder(exporter=None, logger=None, tracer=Tracer())
+    persisted = DurableTelemetryBridge(repository, recorder=recorder).emit(
+        AutonomousEventType.APPROVAL_CONSUMED,
+        run_id="run-otel",
+        run_number=1,
+        experiment_id="run-otel:1",
+        reason="approval consumed",
+        approval_digest="c" * 64,
+    )
+
+    assert len(spans) == 1
+    assert spans[0]["event.id"] == persisted.event_id
+    assert spans[0]["autonomous.event.type"] == "approval.consumed"

@@ -83,7 +83,13 @@ _SENSITIVE_VALUE = (
     re.compile(r"\b(?:private\s+)?prompt\b|\braw\s+(?:model\s+)?output\b", re.IGNORECASE),
     re.compile(r"\bheld[-_ ]?out\b|\bsealed\s+task\b", re.IGNORECASE),
 )
-_SAFE_IDENTIFIER = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/#@+\-]{0,255}$")
+_SAFE_METADATA_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/#@+\-]{0,511}$")
+_SENSITIVE_IDENTIFIER = re.compile(
+    r"(?:^|[._:/#@+\-])(?:prompt|completion|trajectory|hidden|sealed|secret|credential|"
+    r"password|token|authorization|private|answer|response)(?:$|[._:/#@+\-])",
+    re.IGNORECASE,
+)
 _OPERATIONAL_METADATA_KEYS = frozenset(
     {
         "artifact_id",
@@ -96,6 +102,7 @@ _OPERATIONAL_METADATA_KEYS = frozenset(
         "component",
         "cost_usd",
         "dataset_version",
+        "durable_event_type",
         "decision",
         "duration_ms",
         "environment",
@@ -131,6 +138,35 @@ _OPERATIONAL_METADATA_KEYS = frozenset(
         "training_status",
     }
 )
+_AUTONOMOUS_EVENT_TYPES = frozenset(
+    {
+        "approval.consumed",
+        "artifact.recorded",
+        "cleanup.completed",
+        "cleanup.failed",
+        "job.completed",
+        "job.failed",
+        "job.submitted",
+        "operation.completed",
+        "operation.failed",
+        "operation.intent",
+        "operation.submitted",
+        "phase.completed",
+        "phase.failed",
+        "phase.started",
+        "promotion.decided",
+        "run.blocked",
+        "run.cancel_requested",
+        "run.cancelled",
+        "run.completed",
+        "run.failed",
+        "run.queued",
+        "run.safe_stop_requested",
+        "run.started",
+        "run.stopped",
+    }
+)
+_EVIDENCE_LABELS = frozenset({"LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"})
 
 
 def _metadata_key(key: str) -> str:
@@ -143,9 +179,20 @@ def _redact_value(key: str, value: Any) -> Any:
     if _SENSITIVE_KEY.search(key):
         return _REDACTED
     if isinstance(value, str):
+        normalized_key = _metadata_key(key)
         if (
-            _metadata_key(key) not in _OPERATIONAL_METADATA_KEYS
+            normalized_key not in _OPERATIONAL_METADATA_KEYS
+            or not _SAFE_METADATA_VALUE.fullmatch(value)
             or any(pattern.search(value) for pattern in _SENSITIVE_VALUE)
+            or (
+                normalized_key == "durable_event_type"
+                and value not in _AUTONOMOUS_EVENT_TYPES
+            )
+            or (normalized_key == "evidence_label" and value not in _EVIDENCE_LABELS)
+            or (
+                normalized_key not in {"artifact_id", "artifact_sha256"}
+                and _SENSITIVE_IDENTIFIER.search(value) is not None
+            )
         ):
             return _REDACTED
         return value
@@ -204,11 +251,17 @@ def _thaw_value(value: Any) -> Any:
 
 
 def _validate_identifier(name: str, value: str) -> str:
-    if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value.strip()):
+    if not isinstance(value, str):
         raise ValueError(f"{name} must be a non-empty safe identifier")
-    if any(pattern.search(value) for pattern in _SENSITIVE_VALUE):
+    normalized = value.strip()
+    if not _SAFE_IDENTIFIER.fullmatch(normalized):
+        raise ValueError(f"{name} must be a non-empty safe identifier")
+    contains_sensitive_value = any(
+        pattern.search(normalized) for pattern in _SENSITIVE_VALUE
+    ) or _SENSITIVE_IDENTIFIER.search(normalized)
+    if contains_sensitive_value:
         raise ValueError(f"{name} cannot contain sensitive material")
-    return value
+    return normalized
 
 
 def _optional_identifier(name: str, value: str | None) -> str | None:
@@ -393,10 +446,20 @@ class TelemetryRecorder:
             return
         attrs: dict[str, str | int | float] = {
             "event.type": event.event_type.value,
+            "event.id": event.event_id,
             "run.id": event.run_id,
             "run.number": event.run_number,
             "experiment.id": event.experiment_id,
         }
+        durable_event_id = event.attributes.get("event_id")
+        if isinstance(durable_event_id, str) and durable_event_id != _REDACTED:
+            attrs["event.id"] = durable_event_id
+        durable_event_type = event.attributes.get("durable_event_type")
+        if (
+            isinstance(durable_event_type, str)
+            and durable_event_type in _AUTONOMOUS_EVENT_TYPES
+        ):
+            attrs["autonomous.event.type"] = durable_event_type
         for key, value in (
             ("phase", event.phase),
             ("job.id", event.job_id),
@@ -409,6 +472,15 @@ class TelemetryRecorder:
             attrs["latency_ms"] = event.latency_ms
         if event.cost_usd is not None:
             attrs["cost_usd"] = event.cost_usd
+        for key, value in event.attributes.items():
+            normalized_key = _metadata_key(str(key))
+            if (
+                normalized_key in _OPERATIONAL_METADATA_KEYS
+                and normalized_key not in {"event_id", "durable_event_type"}
+                and isinstance(value, (str, int, float))
+                and not isinstance(value, bool)
+            ):
+                attrs[f"event.metadata.{normalized_key}"] = value
         try:
             span = self._tracer.start_span(event.event_type.value, attributes=attrs)
             span.end()

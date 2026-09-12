@@ -6,9 +6,11 @@ control-plane behavior without pretending that a local test is an AWS run.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -30,6 +32,7 @@ from app.autonomous.supervisor import (
     AutonomousRunSupervisor,
     CheckpointArtifact,
     EvaluationEvidence,
+    SupervisorBlocked,
 )
 from app.autonomous.telemetry import DurableTelemetryBridge
 from app.posttraining.models import Evidence, EvidenceKind, EvidenceLabel
@@ -93,6 +96,14 @@ class _Dataset:
     cost_usd: float = 0.0
 
 
+@dataclass(frozen=True)
+class _CheckpointArtifactWithManifest:
+    artifact_id: str
+    uri: str
+    sha256: str
+    manifest_sha256: str
+
+
 class _StateStore(InMemoryAutonomousRunRepository):
     """Test-only state patch operation mirroring the future durable adapter."""
 
@@ -101,7 +112,7 @@ class _StateStore(InMemoryAutonomousRunRepository):
         run_id: str,
         *,
         expected_version: int,
-        updates: dict[str, Any],
+        updates: Mapping[str, Any],
     ) -> AutonomousRunState:
         current = self.get(run_id)
         assert current is not None
@@ -155,24 +166,49 @@ class _Objective:
 
 
 class _Agents:
+    def __init__(self) -> None:
+        self.analysis_calls: list[dict[str, Any]] = []
+        self.research_calls: list[dict[str, Any]] = []
+        self.curation_calls: list[dict[str, Any]] = []
+
     def analyze_failures(
-        self, refs: tuple[str, ...], history: tuple[Any, ...] = ()
+        self, refs: Sequence[str], history: Sequence[Any] = (), *, evidence_class: str
     ) -> tuple[FailureCluster, ...]:
         assert refs
+        self.analysis_calls.append(
+            {"refs": tuple(refs), "history": tuple(history), "evidence_class": evidence_class}
+        )
         return (
             FailureCluster(
                 cluster_id="cluster-checkout",
                 failure_type="dependency_config",
                 description="checkout dependency configuration recovery",
                 count=1,
-                evidence_refs=refs,
-                evidence_class="LIVE",
+                evidence_refs=tuple(refs),
+                evidence_class=evidence_class,
             ),
         )
 
     def research(
-        self, clusters: tuple[FailureCluster, ...], history: tuple[Any, ...] = (), **kwargs: Any
+        self,
+        clusters: Sequence[FailureCluster],
+        history: Sequence[Any] = (),
+        *,
+        run_id: str,
+        experiment_number: int,
+        verified_evidence_references: Sequence[str],
+        verified_evidence_metadata: Mapping[str, Mapping[str, Any]],
     ) -> tuple[ResearchHypothesis, ...]:
+        self.research_calls.append(
+            {
+                "clusters": tuple(clusters),
+                "history": tuple(history),
+                "run_id": run_id,
+                "experiment_number": experiment_number,
+                "verified_evidence_references": tuple(verified_evidence_references),
+                "verified_evidence_metadata": dict(verified_evidence_metadata),
+            }
+        )
         return (
             ResearchHypothesis(
                 hypothesis_id=f"hyp-{len(history) + 1}",
@@ -186,13 +222,31 @@ class _Agents:
         )
 
     def curate(
-        self, refs: tuple[str, ...], hypotheses: tuple[ResearchHypothesis, ...] = (), **kwargs: Any
+        self,
+        refs: Sequence[str],
+        hypotheses: Sequence[ResearchHypothesis] = (),
+        experiment_history: Sequence[Any] = (),
+        *,
+        failure_clusters: Sequence[FailureCluster],
+        verified_trajectory_metadata: Mapping[str, Mapping[str, Any]],
     ) -> CuratedDatasetPlan:
+        self.curation_calls.append(
+            {
+                "refs": tuple(refs),
+                "hypotheses": tuple(hypotheses),
+                "history": tuple(experiment_history),
+                "failure_clusters": tuple(failure_clusters),
+                "verified_trajectory_metadata": dict(verified_trajectory_metadata),
+            }
+        )
         return CuratedDatasetPlan(
             plan_id=f"plan-{len(refs)}",
-            selected_trajectory_refs=refs,
-            dataset_artifact_ref="dataset://provenance",
+            selected_trajectory_refs=tuple(refs),
+            target_failure_classes=tuple(item.failure_type for item in failure_clusters),
             record_count=len(refs),
+            evidence_class=next(
+                iter(verified_trajectory_metadata.values())
+            )["evidence_class"],
         )
 
     def design_qlora(self, plan: CuratedDatasetPlan, history: tuple[Any, ...] = ()) -> QLoRAConfig:
@@ -290,14 +344,25 @@ class _Factory:
 
 
 class _Artifacts:
+    def __init__(self, *, manifest_sha256: str | None = None) -> None:
+        self.manifest_sha256 = manifest_sha256
+
     def verify_checkpoint(
         self, job: JobResult, *, run_id: str, experiment_number: int
     ) -> CheckpointArtifact:
-        return CheckpointArtifact(
-            artifact_id=f"checkpoint://{run_id}/{experiment_number}",
-            uri=job.artifact_uri or "",
-            sha256="d" * 64,
-        )
+        values = {
+            "artifact_id": f"checkpoint://{run_id}/{experiment_number}",
+            "uri": job.artifact_uri or "",
+            "sha256": "d" * 64,
+        }
+        if self.manifest_sha256 is not None:
+            return cast(
+                CheckpointArtifact,
+                _CheckpointArtifactWithManifest(
+                    **values, manifest_sha256=self.manifest_sha256
+                ),
+            )
+        return CheckpointArtifact(**values)
 
 
 class _Evaluator:
@@ -314,12 +379,19 @@ class _Evaluator:
             if experiment_number == 1
             else f"eval://{state.run_id}/candidate/{experiment_number - 1}"
         )
+        champion_score = 0.4 if experiment_number == 1 else score - 0.1
         return EvaluationEvidence(
             evaluation=_evaluation(
                 f"eval://{state.run_id}/candidate/{experiment_number}",
                 score=score,
                 run_number=experiment_number,
                 champion=champion_id,
+            ),
+            champion_evaluation=_evaluation(
+                champion_id,
+                score=champion_score,
+                run_number=experiment_number - 1,
+                champion=None,
             ),
             artifact_ids=(f"eval-artifact://{experiment_number}",),
             cost_usd=0.1,
@@ -348,16 +420,19 @@ def _supervisor(
     budget: float = 25.0,
     provider: _Provider | None = None,
     target_score: float | None = None,
+    objective: _Objective | None = None,
+    agents: _Agents | None = None,
+    artifacts: _Artifacts | None = None,
 ) -> tuple[AutonomousRunSupervisor, _Provider]:
     provider = provider or _Provider([0.5])
     store.create(_state(max_experiments=max_experiments, approved_budget_usd=budget))
     supervisor = AutonomousRunSupervisor(
         repository=store,
-        objective=_Objective(),
-        agents=_Agents(),
+        objective=objective or _Objective(),
+        agents=agents or _Agents(),
         provider=provider,
         request_factory=_Factory(),
-        artifacts=_Artifacts(),
+        artifacts=artifacts or _Artifacts(),
         evaluator=_Evaluator(),
         target_score=target_score,
         poll_interval_seconds=0,
@@ -369,14 +444,17 @@ def _supervisor(
 @pytest.mark.asyncio
 async def test_one_call_progresses_baseline_training_evaluation_and_promotion() -> None:
     store = _StateStore()
-    supervisor, provider = _supervisor(store)
+    objective = _Objective()
+    supervisor, provider = _supervisor(store, objective=objective)
     result = await supervisor.run_optimization("run-1")
-    assert result.status is AutonomousRunStatus.SUCCEEDED
+    assert result.status is AutonomousRunStatus.SUCCEEDED, result.stop_reason
     assert result.phase is RunPhase.COMPLETED
     assert result.champion_metrics["aggregate"] == pytest.approx(0.5)
+    assert result.baseline_metrics["aggregate"] == pytest.approx(0.4)
     assert provider.training_submits == 1
     assert provider.evaluation_submits == 1
     assert result.experiments[0].status is ExperimentStatus.SUCCEEDED
+    assert objective.benchmarks == [("train", 1)]
 
 
 @pytest.mark.asyncio
@@ -389,6 +467,33 @@ async def test_restart_resumes_submitted_operation_without_duplicate_training() 
     second = await supervisor.run_optimization("run-1")
     assert second.status is AutonomousRunStatus.SUCCEEDED
     assert provider.training_submits == 1
+
+
+@pytest.mark.asyncio
+async def test_promoted_checkpoint_lineage_survives_promotion_recovery() -> None:
+    store = _StateStore()
+    manifest_sha256 = "f" * 64
+    supervisor, _ = _supervisor(
+        store, artifacts=_Artifacts(manifest_sha256=manifest_sha256)
+    )
+
+    result = await supervisor.run_optimization("run-1")
+
+    assert result.status is AutonomousRunStatus.SUCCEEDED
+    assert result.champion_checkpoint_uri == "s3://artifacts/checkpoint"
+    assert result.champion_checkpoint_sha256 == "d" * 64
+    assert result.metadata["champion_checkpoint_artifact_id"] == "checkpoint://run-1/1"
+    assert result.metadata["champion_checkpoint_manifest_sha256"] == manifest_sha256
+    promotion = store.get_operation("run-1", "run-1:1:promotion")
+    assert promotion is not None
+    assert promotion.result["candidate_manifest_sha256"] == manifest_sha256
+
+    recovered = supervisor._complete_promotion("run-1", "run-1:1:promotion")
+
+    assert recovered.champion_checkpoint_uri == "s3://artifacts/checkpoint"
+    assert recovered.champion_checkpoint_sha256 == "d" * 64
+    assert recovered.metadata["champion_checkpoint_artifact_id"] == "checkpoint://run-1/1"
+    assert recovered.metadata["champion_checkpoint_manifest_sha256"] == manifest_sha256
 
 
 @pytest.mark.asyncio
@@ -442,29 +547,93 @@ async def test_safe_stop_requested_before_next_phase_stops_without_training() ->
 
 
 def test_missing_dataset_provenance_is_empty_not_fabricated() -> None:
-    state = _state(metadata={"checkpoint_uri": "s3://artifacts/functiongemma"})
-    assert AutonomousRunSupervisor._dataset_refs(state) == ()
+    plan = CuratedDatasetPlan(
+        plan_id="plan-1",
+        selected_trajectory_refs=("traj://run-1/train/1",),
+        target_failure_classes=("dependency_config",),
+        record_count=1,
+        evidence_class="LIVE",
+    )
+    assert "dataset_artifact_ref" not in plan.model_dump(mode="json")
 
 
 @pytest.mark.asyncio
-async def test_baseline_evidence_survives_new_supervisor_instance() -> None:
+async def test_strict_agent_handoffs_use_only_verified_benchmark_provenance() -> None:
     store = _StateStore()
-    supervisor, _ = _supervisor(store)
-    state = store.get("run-1")
-    assert state is not None
-    baseline = await supervisor._ensure_baseline(state)
-    restarted = AutonomousRunSupervisor(
-        repository=store,
-        objective=_Objective(),
-        agents=_Agents(),
-        provider=_Provider([0.5]),
-        request_factory=_Factory(),
-        artifacts=_Artifacts(),
-        evaluator=_Evaluator(),
-        poll_interval_seconds=0,
-    )
-    loaded = restarted._champion_evaluation("run-1", baseline)
-    assert loaded.run_id == "eval://run-1/baseline"
+    agents = _Agents()
+    supervisor, _ = _supervisor(store, agents=agents)
+
+    result = await supervisor.run_optimization("run-1")
+
+    assert result.status is AutonomousRunStatus.SUCCEEDED, result.stop_reason
+    ref = "traj://run-1/train/1"
+    expected_metadata = {
+        ref: {
+            "verified": True,
+            "run_id": "run-1",
+            "experiment_number": 1,
+            "measurement_id": ref,
+            "evidence_class": "LIVE",
+        }
+    }
+    assert agents.analysis_calls[0]["evidence_class"] == "LIVE"
+    assert agents.research_calls[0]["run_id"] == "run-1"
+    assert agents.research_calls[0]["experiment_number"] == 1
+    assert agents.research_calls[0]["verified_evidence_references"] == (ref,)
+    assert agents.research_calls[0]["verified_evidence_metadata"] == expected_metadata
+    assert agents.curation_calls[0]["failure_clusters"] == agents.research_calls[0]["clusters"]
+    assert agents.curation_calls[0]["verified_trajectory_metadata"] == expected_metadata
+
+
+@pytest.mark.asyncio
+async def test_restart_reuses_persisted_benchmark_provenance_before_recuration() -> None:
+    store = _StateStore()
+    agents = _Agents()
+    objective = _Objective()
+    supervisor, _ = _supervisor(store, objective=objective, agents=agents)
+    original_curate = agents.curate
+    curation_attempts = 0
+
+    def interrupt_first_curation(*args: Any, **kwargs: Any) -> CuratedDatasetPlan:
+        nonlocal curation_attempts
+        curation_attempts += 1
+        if curation_attempts == 1:
+            raise asyncio.CancelledError()
+        return original_curate(*args, **kwargs)
+
+    agents.curate = interrupt_first_curation  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await supervisor.run_optimization("run-1")
+
+    interrupted = store.get("run-1")
+    assert interrupted is not None
+    assert interrupted.current_hypothesis is not None
+    assert "dataset_plan" not in interrupted.current_hypothesis
+    benchmark_operation = store.get_operation("run-1", "run-1:1:benchmark")
+    assert benchmark_operation is not None
+    assert benchmark_operation.result["trajectory_refs"] == ("traj://run-1/train/1",)
+
+    agents.curate = original_curate  # type: ignore[method-assign]
+    resumed = await supervisor.run_optimization("run-1")
+
+    assert resumed.status is AutonomousRunStatus.SUCCEEDED
+    assert objective.benchmarks == [("train", 1)]
+    assert len(agents.analysis_calls) == 2
+    assert len(agents.research_calls) == 1
+    assert len(agents.curation_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_initial_champion_baseline_is_derived_from_the_paired_sealed_evaluator() -> None:
+    store = _StateStore()
+    objective = _Objective()
+    supervisor, _ = _supervisor(store, objective=objective)
+
+    result = await supervisor.run_optimization("run-1")
+
+    assert result.status is AutonomousRunStatus.SUCCEEDED
+    assert objective.benchmarks == [("train", 1)]
+    assert result.baseline_metrics["aggregate"] == pytest.approx(0.4)
 
 
 @pytest.mark.asyncio
@@ -631,6 +800,40 @@ async def test_durable_telemetry_events_are_persisted_by_supervisor() -> None:
     assert any(event.event_type == "job.submitted" for event in events)
     assert any(event.event_type == "job.completed" for event in events)
     assert any(event.event_type == "promotion.decided" for event in events)
+    event_types = {event.event_type for event in events}
+    assert {
+        "run.started",
+        "phase.started",
+        "phase.completed",
+        "run.completed",
+    } <= event_types
+
+
+@pytest.mark.asyncio
+async def test_supervisor_fails_closed_on_telemetry_validation_error() -> None:
+    store = _StateStore()
+    supervisor, _ = _supervisor(store)
+
+    class InvalidTelemetry:
+        def emit(self, *_: Any, **__: Any) -> None:
+            raise ValueError("telemetry contract rejected event")
+
+    supervisor.telemetry = InvalidTelemetry()  # type: ignore[assignment]
+    result = await supervisor.run_optimization("run-1")
+    assert result.status is AutonomousRunStatus.STOPPED
+    assert result.stop_reason == "durable telemetry failure"
+
+
+def test_foreign_run_identity_is_rejected_even_when_prefix_matches() -> None:
+    foreign = _Benchmark(
+        evaluation=_evaluation(
+            "eval://run-1-foreign/baseline", score=0.4, run_number=0, champion=None
+        ),
+        trajectory_refs=("traj://run-1-foreign/baseline/0",),
+        artifact_ids=("artifact://run-1-foreign/baseline/0",),
+    )
+    with pytest.raises(SupervisorBlocked, match="provenance"):
+        AutonomousRunSupervisor._validate_benchmark(foreign, "run-1", 0)
 
 
 @pytest.mark.asyncio

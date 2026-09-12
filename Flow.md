@@ -20,26 +20,42 @@ HTTP client
           -> Champion Manager
        -> final status and artifact references
 
-Live AWS target (not yet deployed):
+End-to-end AWS architecture target (this diagram is not evidence of deployment):
   Bedrock -> agent decisions
   S3 -> immutable trajectories, datasets, checkpoints
   DynamoDB -> durable run state and events
   SageMaker -> QLoRA training
   AgentCore/CloudWatch -> optional hosting and observability
+```
 
-Run history and observation contracts:
+Any deployment and live-run actions described here are scoped only to this AWS
+Agents for Humans hackathon. The operator-reported SageMaker GPU quota request
+`9a3453884e2c4230a6e8bb0004c8cca57FuK8VC5` is `PENDING` as of 2026-09-12;
+this documents neither granted quota nor placement capacity. No completed
+end-to-end live post-training result is claimed.
+
+## Run history and observation contracts
 
 ```text
 RunRegistry -> DynamoDB transaction (unique run number 1..5)
            -> ComparisonDTO -> JSON chart data + self-contained SVG
-Run/phase/job transitions -> TelemetryRecorder
+Supervisor run/phase/job/promotion lifecycle -> DurableTelemetryBridge
+           -> allow-listed RunEventRecord vocabulary and opaque metadata
+           -> TelemetryRecorder
            -> redacted logger/exporter and optional OpenTelemetry spans
 ```
 
 Telemetry is operational metadata only. Prompts, raw completions, trajectories,
 held-out tasks, credentials, and secret-like values are redacted and event
-attributes are immutable after emission.
-```
+attributes are immutable after emission. Free-form IDs and allow-listed string
+values are rejected or redacted unless they match the opaque metadata contract.
+The supervisor records `run.started`, `phase.started`, `phase.completed`,
+`phase.failed`, and precise terminal run events; phase starts and terminal state
+transitions use the repository's atomic transition operation. Durable telemetry
+validation or persistence failures stop the supervisor, while failures from the
+optional logger/exporter/OpenTelemetry observer do not alter run outcomes.
+OpenTelemetry spans include the durable event ID and exact autonomous event
+type even when the observer-facing event type is a broader compatibility label.
 
 ## Reasoning model and prompt contract
 
@@ -60,11 +76,15 @@ The contract version, model ID, and prompt SHA-256 travel as metadata in the
 manifest and telemetry. Raw prompts, completions, trajectories, and sealed
 evaluation contents do not.
 
-The current local path uses the same role boundaries but keeps state in memory
-and returns `EXPLANATION` fixtures. It is a reproducible demonstration, not
-live AWS evidence. `backend/scripts/live_smoke.py` separately verifies AWS
-identity, one Strands/Bedrock call, and a temporary S3 artifact round trip; it
-does not create compute or persistent infrastructure.
+The ordinary local `/api/runs` path uses the same role boundaries but keeps
+state in memory and returns `EXPLANATION` fixtures. It is a reproducible
+demonstration, not live AWS evidence. The isolated `SERVICE_ROLE=objective`
+process has a separate checkpoint-backed benchmark adapter described below;
+it is not the same path as the local coordinator workflow. The changelog's
+2026-09-06 records cover a scoped AWS identity/Bedrock/S3 smoke and eight
+bounded agent calls with `amazon.nova-pro-v1:0`; these historical checks do not
+prove the currently pinned Nemotron call, a deployed application, training,
+evaluation, or model improvement.
 
 ## End-to-end workflow
 
@@ -207,9 +227,53 @@ restart.
 - `GET /api/runs/compare?run_ids=run-001&run_ids=run-002`
 - `GET /api/runs/graph?run_ids=run-001&run_ids=run-002`
 
-The list above is the currently implemented local surface. A live deployment
-may add an authenticated resumable event-stream endpoint once durable event
-storage is connected; it must not be described as available in the local demo.
+The list above is the legacy coordinator surface. A separate `/api/live`
+control plane is mounted for AWS mode; it uses the durable run repository and
+dispatcher when their configuration and adapters are available. It is not an
+SSE endpoint: clients page ordered events with `after` and `limit`.
+
+## Guarded AWS live control plane
+
+The live API is separate from the local `POST /api/runs` demo:
+
+```text
+GET  /api/live/readiness                         -> read-only readiness checks
+POST /api/live/runs/prepare                      -> preflight, durable PREPARED state, approval packet
+POST /api/live/runs/{run_id}/start               -> preflight, consume signed one-run approval, queue
+GET  /api/live/runs/{run_id}                     -> durable state snapshot
+GET  /api/live/runs/{run_id}/events?after=N      -> ordered persisted lifecycle events
+GET  /api/live/runs/{run_id}/experiments         -> persisted experiment records
+GET  /api/live/runs/{run_id}/artifacts           -> opaque artifact references
+POST /api/live/runs/{run_id}/cancel              -> idempotent cancel request
+POST /api/live/runs/{run_id}/safe-stop           -> idempotent safe-stop request
+```
+
+Prepare requires an `Idempotency-Key`, passes a fresh read-only preflight, and
+stores a bounded approval packet; it does not submit SageMaker work. Start
+requires a new `Idempotency-Key`, reruns preflight, validates and consumes the
+packet-bound single-run approval, marks the run queued, and schedules the
+dispatcher. Startup attempts recovery of incomplete runs. Status, events,
+experiments, and artifact routes read from the durable repository; cancel and
+safe-stop request state changes, and the supervisor performs bounded cleanup.
+In AWS mode the app wires a DynamoDB repository plus Bedrock, objective-worker,
+S3, and SageMaker adapters, but any absent/invalid configuration leaves the
+live control plane blocked rather than selecting local simulated adapters.
+
+Successful local API/contract tests or a CDK synthesis do not establish that
+these resources are deployed, accessible, or that a run completed. Deployment
+state and SageMaker capacity must be checked live before authorizing compute.
+
+The train/replay objective benchmark endpoint does not accept a `baseline` or
+`held_out` split. The supervisor therefore does not request a baseline score
+from that endpoint or relabel training measurements. During candidate
+evaluation, SageMaker's isolated sealed evaluator measures both the active
+champion checkpoint and candidate checkpoint against the same pinned sealed
+manifest and task ordering. The coordinator accepts the pair only when both
+checkpoint digests, shared evaluation manifest, task counts and environment
+aggregates, paired outcomes digest, and regression evidence digest validate.
+The candidate is gated against the champion result from that same report. A
+missing champion result or any provenance mismatch blocks promotion; no hidden
+task contents are returned to the coordinator.
 
 The hackathon observer renders this same lifecycle as moving role bots:
 launcher -> benchmark -> failure analysis -> data curation -> training ->
@@ -217,22 +281,52 @@ evaluation -> promotion. Animation is presentation only. A bot may enter a
 phase when a corresponding event exists, and a blocked/failed event must stop
 that phase visibly; the observer cannot approve a run or manufacture progress.
 
+## Real service-recovery benchmark execution
+
+When `SERVICE_ROLE=objective`, the application selects the isolated,
+authenticated objective worker. Its `/v1/benchmark` adapter requires a local
+`google/functiongemma-270m-it` snapshot plus `OBJECTIVE_MODEL_REVISION` (an
+immutable 40-character commit SHA) and `OBJECTIVE_MODEL_SHA256` (the digest of
+the validator's sorted per-file identities). The existing checkpoint staging
+validator must accept the complete snapshot before the adapter is constructed.
+Transformers loads the checkpoint from that directory with
+`local_files_only=True`; the runtime never downloads a mutable Hub reference.
+Missing or invalid configuration yields a blocked benchmark response, not a
+rule-based or random fallback.
+
+For each requested train/replay task, the model receives only the sanitized
+objective, service name, allow-listed tool schemas, and earlier environment
+observations. It does not receive verifier rewards, terminal flags, internal
+failure-mode fields, or held-out tasks. Its tool calls execute through the
+service-recovery engine until the task terminates or reaches its step budget.
+The engine then deterministically replays each full action sequence, confirms
+the reward and outcome, and the artifact store persists only verified
+trajectories; the HTTP response exposes aggregate metrics and opaque artifact
+references. Inference, replay, or persistence failures block the benchmark.
+The current validation record contains no successful checkpoint-backed
+`/v1/benchmark` result or real FunctionGemma trajectory hash. The adapter is
+implemented, but a successful contract test with a test double does not prove
+that the actual checkpoint loads or that any live benchmark was completed.
+
 ## Evidence labels
 
 - `LIVE`: produced by a currently verified AWS request.
 - `PRIOR_VERIFIED_RUN`: produced by an earlier run with provider IDs and
   hashes.
-- `EXPLANATION`: local fixture or simulated output. The current repository
-  produces this label only.
+- `EXPLANATION`: local fixture or simulated output. The ordinary coordinator
+  `/api/runs` demo produces this label; a separately verified objective worker
+  is not proof of live training, held-out evaluation, improvement, or promotion.
 
 ## Failure and recovery boundary
 
-The local coordinator is process-local and therefore loses active runs on
-restart. Runtime configuration now supports `APP_MODE=aws` and fails startup
-when required S3, DynamoDB, and SageMaker settings are missing. The CDK
-foundation provisions versioned S3, DynamoDB, ECR, ECS, IAM, VPC, and
-CloudWatch resources. The workflow still needs its durable repository and AWS
-provider adapters wired before `APP_MODE=aws` can claim live execution.
+The legacy local coordinator is process-local and therefore loses active runs
+on restart. Runtime configuration supports `APP_MODE=aws`; the `/api/live`
+path constructs the durable DynamoDB repository and AWS adapters only when
+their required settings are available. The CDK foundation defines versioned
+S3, DynamoDB, ECR, ECS, IAM, VPC, and CloudWatch resources but does not prove
+they have been deployed. A real `LIVE` result still requires fresh preflight,
+an explicit signed approval, provider job IDs, immutable artifact hashes,
+held-out evidence, and a deterministic promotion decision.
 Missing credentials, unavailable AWS services, invalid artifacts, unknown job
 states, or failed deterministic gates must stop the run; the system must not
 manufacture progress.

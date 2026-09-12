@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import tarfile
 from pathlib import Path
 from typing import ClassVar, cast
 
@@ -486,10 +488,20 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
             job_name="train-1",
             role_arn="arn:role",
             image_uri="123.dkr.ecr/image:latest",
-            input_s3_uri="s3://bucket/data",
+            input_s3_uri=f"s3://bucket/data/{'a' * 64}",
             output_s3_uri="s3://bucket/output",
             instance_type="ml.g5.xlarge",
             hyperparameters={"epochs": 1},
+            environment={
+                "RUN_ID": "run-1",
+                "EXPERIMENT_ID": "run-1-1",
+                "DATASET_ID": "dataset-1",
+                "DATASET_SHA256": "a" * 64,
+                "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
+                "BASE_MODEL_ID": "google/functiongemma-270m-it",
+                "BASE_MODEL_REVISION": "b" * 40,
+                "QLORA_CONFIG": "{}",
+            },
         )
     )
     evaluation = provider.submit_evaluation(
@@ -497,9 +509,21 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
             job_name="eval-1",
             role_arn="arn:role",
             image_uri="123.dkr.ecr/eval:latest",
-            input_s3_uri="s3://bucket/candidate",
+            input_s3_uri="s3://bucket/sealed",
             output_s3_uri="s3://bucket/eval-output",
             instance_type="ml.g5.xlarge",
+            candidate_s3_uri=f"s3://bucket/candidate/{'c' * 64}.tar.gz",
+            champion_s3_uri=f"s3://bucket/champion/{'b' * 64}.tar.gz",
+            sealed_s3_uri="s3://bucket/sealed",
+            environment={
+                "RUN_ID": "run-1",
+                "EXPERIMENT_ID": "run-1-1",
+                "EVALUATION_MANIFEST_SHA256": "d" * 64,
+                "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+                "OBJECTIVE_SEED": "7",
+                "CANDIDATE_ARCHIVE_SHA256": "c" * 64,
+                "CHAMPION_ARCHIVE_SHA256": "b" * 64,
+            },
         )
     )
 
@@ -560,8 +584,20 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
         "EXPERIMENT_ID": "exp-1",
         "DATASET_ID": "dataset-1",
         "DATASET_SHA256": "a" * 64,
+        "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
         "BASE_MODEL_ID": "google/functiongemma-270m-it",
         "BASE_MODEL_REVISION": "b" * 40,
+        "QLORA_CONFIG": json.dumps({
+            "rank": 8,
+            "alpha": 16,
+            "dropout": 0.05,
+            "learning_rate": 0.0002,
+            "epochs": 1,
+            "sequence_length": 512,
+            "batch_size": 1,
+            "gradient_accumulation_steps": 4,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        }),
         "SM_MODEL_DIR": str(model_dir),
     }
     provider.submit_training(
@@ -569,7 +605,7 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
             job_name="train-contract",
             role_arn="arn:role",
             image_uri="123.dkr.ecr/train@sha256:" + "c" * 64,
-            input_s3_uri="s3://bucket/dataset/run-1?versionId=dataset-v1",
+            input_s3_uri=f"s3://bucket/datasets/run-1/1/{'a' * 64}",
             output_s3_uri="s3://bucket/output/run-1",
             instance_type="ml.g5.xlarge",
             environment=training_environment,
@@ -577,15 +613,38 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
     )
     training_payload = client.calls[0][1]
     assert training_payload["InputDataConfig"][0]["ChannelName"] == "train"
+    assert training_payload["InputDataConfig"][0]["DataSource"]["S3DataSource"]["S3Uri"] == (
+        f"s3://bucket/datasets/run-1/1/{'a' * 64}"
+    )
     parser_environment = dict(training_payload["Environment"])
     parser_environment["SM_CHANNEL_TRAIN"] = str(train_dir)
     parsed_training = parse_training_inputs(parser_environment)
     assert parsed_training.dataset_id == "dataset-1"
     assert parsed_training.base_model_revision == "b" * 40
 
-    candidate_uri = "s3://bucket/checkpoints/candidate.tar.gz?versionId=candidate-v1"
-    champion_uri = "s3://bucket/checkpoints/champion.tar.gz?versionId=champion-v1"
-    sealed_uri = "s3://bucket/evaluation/sealed?versionId=sealed-v1"
+    candidate_bytes = b"candidate checkpoint fixture"
+    champion_bytes = b"champion checkpoint fixture"
+
+    def archive_file(name: str, payload: bytes) -> tuple[bytes, str]:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            item = tarfile.TarInfo(name)
+            item.size = len(payload)
+            archive.addfile(item, io.BytesIO(payload))
+        data = buffer.getvalue()
+        return data, hashlib.sha256(data).hexdigest()
+
+    candidate_archive, candidate_sha = archive_file("candidate.json", candidate_bytes)
+    champion_archive, champion_sha = archive_file("champion.json", champion_bytes)
+    candidate_channel = tmp_path / "candidate"
+    champion_channel = tmp_path / "champion"
+    candidate_channel.mkdir()
+    champion_channel.mkdir()
+    (candidate_channel / f"{candidate_sha}.tar.gz").write_bytes(candidate_archive)
+    (champion_channel / f"{champion_sha}.tar.gz").write_bytes(champion_archive)
+    candidate_uri = f"s3://bucket/checkpoints/{candidate_sha}.tar.gz"
+    champion_uri = f"s3://bucket/checkpoints/{champion_sha}.tar.gz"
+    sealed_uri = "s3://bucket/evaluation/sealed"
     sealed_dir = tmp_path / "sealed"
     sealed_dir.mkdir()
     evaluation_environment = {
@@ -594,6 +653,8 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
         "EVALUATION_MANIFEST_SHA256": "d" * 64,
         "EVALUATION_SUITE_VERSION": "agent-eval-v1",
         "OBJECTIVE_SEED": "7",
+        "CANDIDATE_ARCHIVE_SHA256": candidate_sha,
+        "CHAMPION_ARCHIVE_SHA256": champion_sha,
         "SM_OUTPUT_DATA_DIR": str(tmp_path / "evaluation-output"),
     }
     provider.submit_evaluation(
@@ -628,10 +689,15 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
         assert native_path == Path(f"/opt/ml/processing/input/{name}")
         parser_path = tmp_path / name
         parser_path.mkdir(parents=True, exist_ok=True)
+        if name == "candidate":
+            (parser_path / f"{candidate_sha}.tar.gz").write_bytes(candidate_archive)
+        elif name == "champion":
+            (parser_path / f"{champion_sha}.tar.gz").write_bytes(champion_archive)
         evaluator_environment[f"SM_CHANNEL_{name.upper()}"] = str(parser_path)
     parsed_evaluation = parse_evaluation_inputs(evaluator_environment)
-    assert parsed_evaluation.candidate_dir == (tmp_path / "candidate").resolve()
-    assert parsed_evaluation.champion_dir == (tmp_path / "champion").resolve()
+    assert (parsed_evaluation.candidate_dir / "candidate.json").read_bytes() == candidate_bytes
+    assert parsed_evaluation.champion_dir is not None
+    assert (parsed_evaluation.champion_dir / "champion.json").read_bytes() == champion_bytes
     assert parsed_evaluation.sealed_dir == (tmp_path / "sealed").resolve()
 
 
@@ -680,3 +746,53 @@ def test_sagemaker_rejects_empty_processing_output_uri() -> None:
 
     with pytest.raises(ProviderResponseError, match="invalid artifact URI"):
         SageMakerProvider(client=_Client()).get_evaluation_status("eval-empty-artifact")
+
+
+def test_sagemaker_rejects_version_query_in_input_uri() -> None:
+    """SageMaker S3Uri is a prefix/manifest, not an S3 VersionId reference."""
+
+    with pytest.raises(ValueError, match="unsupported S3Uri query"):
+        SageMakerProvider._validate_training(
+            TrainingJobRequest(
+                job_name="train-version-query",
+                role_arn="arn:role",
+                image_uri="123.dkr.ecr/train@sha256:" + "a" * 64,
+                input_s3_uri="s3://bucket/dataset?versionId=dataset-v1",
+                output_s3_uri="s3://bucket/output",
+                instance_type="ml.g5.xlarge",
+                environment={
+                    "RUN_ID": "run-1",
+                    "EXPERIMENT_ID": "exp-1",
+                    "DATASET_ID": "dataset-1",
+                    "DATASET_SHA256": "a" * 64,
+                    "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
+                    "BASE_MODEL_ID": "google/functiongemma-270m-it",
+                    "BASE_MODEL_REVISION": "a" * 40,
+                    "QLORA_CONFIG": "{}",
+                },
+            )
+        )
+
+    with pytest.raises(ValueError, match="unsupported S3Uri query"):
+        SageMakerProvider._validate_evaluation(
+            EvaluationJobRequest(
+                job_name="eval-version-query",
+                role_arn="arn:role",
+                image_uri="123.dkr.ecr/eval@sha256:" + "b" * 64,
+                input_s3_uri="s3://bucket/sealed",
+                output_s3_uri="s3://bucket/output",
+                instance_type="ml.g5.xlarge",
+                candidate_s3_uri="s3://bucket/checkpoints/candidate.tar.gz?versionId=v1",
+                champion_s3_uri="s3://bucket/checkpoints/" + "b" * 64 + ".tar.gz",
+                sealed_s3_uri="s3://bucket/sealed",
+                environment={
+                    "RUN_ID": "run-1",
+                    "EXPERIMENT_ID": "exp-1",
+                    "EVALUATION_MANIFEST_SHA256": "d" * 64,
+                    "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+                    "OBJECTIVE_SEED": "7",
+                    "CANDIDATE_ARCHIVE_SHA256": "c" * 64,
+                    "CHAMPION_ARCHIVE_SHA256": "b" * 64,
+                },
+            )
+        )

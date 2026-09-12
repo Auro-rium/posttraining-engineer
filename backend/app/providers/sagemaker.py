@@ -69,6 +69,7 @@ class TrainingJobRequest:
     input_s3_uri: str
     output_s3_uri: str
     instance_type: str
+    parent_adapter_s3_uri: str | None = None
     instance_count: int = 1
     volume_size_gb: int = 30
     max_runtime_seconds: int = 3600
@@ -198,6 +199,7 @@ def request_fingerprint(request: TrainingJobRequest | EvaluationJobRequest) -> s
             "role_arn": request.role_arn,
             "image_uri": request.image_uri,
             "input_s3_uri": request.input_s3_uri,
+            "parent_adapter_s3_uri": request.parent_adapter_s3_uri,
             "output_s3_uri": request.output_s3_uri,
             "instance_type": request.instance_type,
             "instance_count": request.instance_count,
@@ -458,17 +460,56 @@ def _validate_input_uri(value: object, name: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
         raise ValueError(f"{name} must be a non-empty S3 URI")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"{name} contains an unsupported S3Uri query or fragment")
     if any(character.isspace() or ord(character) < 32 for character in value):
         raise ValueError(f"{name} must be a valid S3 URI")
     return value
 
 
 def _validate_versioned_input_uri(value: object, name: str) -> str:
+    # SageMaker cannot receive an S3 VersionId through S3Uri.  The caller must
+    # first materialize and verify the exact bytes under a digest-addressed
+    # key/prefix, then submit that query-free location.
     uri = _validate_input_uri(value, name)
-    versions = parse_qs(urlparse(uri).query, keep_blank_values=True).get("versionId", [])
-    if len(versions) != 1 or not versions[0].strip() or versions[0].lower() == "null":
-        raise ValueError(f"{name} must contain exactly one immutable VersionId")
+    basename = urlparse(uri).path.rstrip("/").rsplit("/", 1)[-1]
+    if re.fullmatch(r"[0-9a-f]{64}(?:\.[A-Za-z0-9._-]+)?", basename) is None:
+        raise ValueError(f"{name} must be a content-addressed S3 URI")
     return uri
+
+
+def _validate_digest_prefix(value: object, digest: object, name: str) -> str:
+    uri = _validate_input_uri(value, name)
+    if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+        raise ValueError(f"{name} requires a lowercase SHA-256 digest")
+    basename = urlparse(uri).path.rstrip("/").rsplit("/", 1)[-1]
+    if basename != digest:
+        raise ValueError(f"{name} must end in its expected SHA-256 digest")
+    return uri
+
+
+def _validate_digest_archive(value: object, digest: object, name: str) -> str:
+    uri = _validate_input_uri(value, name)
+    if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+        raise ValueError(f"{name} requires a lowercase SHA-256 digest")
+    basename = urlparse(uri).path.rstrip("/").rsplit("/", 1)[-1]
+    if basename != f"{digest}.tar.gz":
+        raise ValueError(f"{name} must match its expected archive SHA-256")
+    return uri
+
+
+def _required_environment(request: object, names: tuple[str, ...]) -> Mapping[str, str]:
+    environment = getattr(request, "environment", None)
+    if not isinstance(environment, Mapping):
+        raise ValueError("SageMaker environment must be a mapping")
+    missing = [
+        name
+        for name in names
+        if not isinstance(environment.get(name), str) or not environment[name].strip()
+    ]
+    if missing:
+        raise ValueError("SageMaker request is missing required environment: " + ", ".join(missing))
+    return environment
 
 
 def _status(value: object) -> JobStatus:
@@ -520,7 +561,56 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         ):
             _require(value, name)
         _validate_job_name(request.job_name)
-        _validate_input_uri(request.input_s3_uri, "input_s3_uri")
+        environment = _required_environment(
+            request,
+            (
+                "RUN_ID",
+                "EXPERIMENT_ID",
+                "DATASET_ID",
+                "DATASET_SHA256",
+                "APPROVED_DATASET_ARTIFACT_ID",
+                "BASE_MODEL_ID",
+                "BASE_MODEL_REVISION",
+                "QLORA_CONFIG",
+            ),
+        )
+        _validate_digest_prefix(
+            request.input_s3_uri, environment["DATASET_SHA256"], "input_s3_uri"
+        )
+        if environment["APPROVED_DATASET_ARTIFACT_ID"] != f"dataset://{environment['DATASET_ID']}":
+            raise ValueError("APPROVED_DATASET_ARTIFACT_ID is not bound to DATASET_ID")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", environment["BASE_MODEL_REVISION"]):
+            raise ValueError("BASE_MODEL_REVISION must be a 40-character immutable revision")
+        try:
+            qlora = json.loads(environment["QLORA_CONFIG"])
+        except json.JSONDecodeError as exc:
+            raise ValueError("QLORA_CONFIG must be a JSON object") from exc
+        if not isinstance(qlora, Mapping):
+            raise ValueError("QLORA_CONFIG must be a JSON object")
+        if request.parent_adapter_s3_uri is not None:
+            _validate_digest_archive(
+                request.parent_adapter_s3_uri,
+                environment.get("APPROVED_PARENT_ARCHIVE_SHA256"),
+                "parent_adapter_s3_uri",
+            )
+            _required_environment(
+                request,
+                (
+                    "APPROVED_PARENT_ARTIFACT_ID",
+                    "APPROVED_PARENT_MANIFEST_SHA256",
+                "APPROVED_PARENT_ARTIFACT_SHA256",
+                "APPROVED_PARENT_ARCHIVE_SHA256",
+                ),
+            )
+        elif any(
+            name in environment
+            for name in (
+                "APPROVED_PARENT_ARTIFACT_ID",
+                "APPROVED_PARENT_MANIFEST_SHA256",
+                "APPROVED_PARENT_ARTIFACT_SHA256",
+            )
+        ):
+            raise ValueError("approved parent metadata requires a parent adapter channel")
         _validate_input_uri(request.output_s3_uri, "output_s3_uri")
         if (
             request.instance_count < 1
@@ -543,13 +633,44 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         _validate_job_name(request.job_name)
         _validate_input_uri(request.input_s3_uri, "input_s3_uri")
         _validate_input_uri(request.output_s3_uri, "output_s3_uri")
+        environment = _required_environment(
+            request,
+            (
+                "RUN_ID",
+                "EXPERIMENT_ID",
+                "EVALUATION_MANIFEST_SHA256",
+                "EVALUATION_SUITE_VERSION",
+                "OBJECTIVE_SEED",
+                "CANDIDATE_ARCHIVE_SHA256",
+                "CHAMPION_ARCHIVE_SHA256",
+            ),
+        )
+        for name in ("EVALUATION_MANIFEST_SHA256",):
+            if _SHA256_PATTERN.fullmatch(environment[name]) is None:
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        if not re.fullmatch(r"-?[0-9]+", environment["OBJECTIVE_SEED"]):
+            raise ValueError("OBJECTIVE_SEED must be an integer")
+        if (
+            request.candidate_s3_uri is None
+            or request.champion_s3_uri is None
+            or request.sealed_s3_uri is None
+        ):
+            raise ValueError("candidate, champion, and sealed evaluation channels are required")
         if request.model_s3_uri is not None:
             _require(request.model_s3_uri, "model_s3_uri")
             _validate_input_uri(request.model_s3_uri, "model_s3_uri")
         if request.candidate_s3_uri is not None:
-            _validate_versioned_input_uri(request.candidate_s3_uri, "candidate_s3_uri")
+            _validate_digest_archive(
+                request.candidate_s3_uri,
+                environment["CANDIDATE_ARCHIVE_SHA256"],
+                "candidate_s3_uri",
+            )
         if request.champion_s3_uri is not None:
-            _validate_versioned_input_uri(request.champion_s3_uri, "champion_s3_uri")
+            _validate_digest_archive(
+                request.champion_s3_uri,
+                environment["CHAMPION_ARCHIVE_SHA256"],
+                "champion_s3_uri",
+            )
         if request.sealed_s3_uri is not None:
             _validate_input_uri(request.sealed_s3_uri, "sealed_s3_uri")
         if (
@@ -775,7 +896,6 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                 },
                 InputDataConfig=[
                     {
-                        # The trainer accepts exactly SM_CHANNEL_TRAIN.
                         "ChannelName": "train",
                         "DataSource": {
                             "S3DataSource": {
@@ -785,7 +905,19 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                             }
                         },
                     }
-                ],
+                ]
+                + ([
+                    {
+                        "ChannelName": "parent_adapter",
+                        "DataSource": {
+                            "S3DataSource": {
+                                "S3DataType": "S3Prefix",
+                                "S3Uri": request.parent_adapter_s3_uri,
+                                "S3DataDistributionType": "FullyReplicated",
+                            }
+                        },
+                    }
+                ] if request.parent_adapter_s3_uri is not None else []),
                 OutputDataConfig={"S3OutputPath": request.output_s3_uri},
                 ResourceConfig={
                     "InstanceType": request.instance_type,

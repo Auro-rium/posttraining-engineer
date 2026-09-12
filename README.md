@@ -42,7 +42,11 @@ The Python backend provides eight logical roles behind three service modes:
 | `research` | Failure Analyst, Research Agent, Data Curator, Training Designer | Grounds a hypothesis with RAG, proposes replay-verifiable data, and selects a bounded QLoRA configuration. |
 | `execution` | Benchmark Runner, Training Executor, Evaluation Agent, Champion Manager | Produces trajectories, launches training, evaluates identical task sets, and applies deterministic gates. |
 
-The same immutable container runs all modes through `SERVICE_ROLE`. The AWS submission path is Strands-first and is designed to use Amazon Bedrock, S3, DynamoDB, SageMaker, and optional AgentCore/CloudWatch integrations. The repository now includes a bounded five-run history/graph contract, guarded objective-worker and SageMaker lifecycle boundaries, and metadata-only telemetry. The current repository run still uses in-memory state and explicit `EXPLANATION` adapters; those outputs are not a hackathon result.
+The same immutable container runs all modes through `SERVICE_ROLE`. The AWS submission path is Strands-first and is designed to use Amazon Bedrock, S3, DynamoDB, SageMaker, and optional AgentCore/CloudWatch integrations. The repository includes a bounded five-run history/graph contract, a separate guarded `/api/live` control plane, an objective-worker boundary, and metadata-only telemetry. The ordinary `/api/runs` demo remains process-local and emits `EXPLANATION` outputs; it is not a live post-training result. The isolated objective worker has a FunctionGemma checkpoint-backed train/replay adapter, but no successful real-checkpoint benchmark result is recorded here.
+
+Any AWS deployment or live run described here is scoped exclusively to this AWS
+Agents for Humans hackathon project. It does not authorize changes to unrelated
+resources in the AWS account.
 
 ### Reasoning model and post-training target
 
@@ -78,27 +82,38 @@ The API is intentionally small:
 - `GET /api/runs/compare`
 - `GET /api/runs/graph`
 - `GET /api/live/readiness`
+- `POST /api/live/runs/prepare`
+- `POST /api/live/runs/{run_id}/start`
+- `POST /api/live/runs/{run_id}/cancel`
+- `POST /api/live/runs/{run_id}/safe-stop`
+- `GET /api/live/runs/{run_id}`
+- `GET /api/live/runs/{run_id}/events`
+- `GET /api/live/runs/{run_id}/experiments`
+- `GET /api/live/runs/{run_id}/artifacts`
 - `GET /api/traces`
 - `GET /api/cycles`
 - `POST /api/demo/reset-environment`
 - `GET /health`
 
-`POST /api/runs/{run_id}/auto` runs the bounded local workflow in the current process. The comparison endpoints accept one to five run IDs and render only records with measured baseline/candidate metrics. A production AWS adapter must replace `active_runs` with durable state and persist provider job IDs before polling. Use explicit `/step` calls for the repeatable local walkthrough.
+`POST /api/runs/{run_id}/auto` runs the bounded local workflow in the current process. The comparison endpoints accept one to five run IDs and render only records with measured baseline/candidate metrics. This legacy demo surface uses process-local state. The separate `/api/live` surface is the guarded AWS path: prepare requires a passing preflight and creates a durable run plus a bounded approval packet; start rechecks preflight, consumes the one-run signed approval, and dispatches the run. Every mutating command requires an `Idempotency-Key`. The local `/api/runs` walkthrough is not an AWS run.
 
 See [Flow.md](Flow.md) for control flow and [Decisions.md](Decisions.md) for the reasons behind the architecture.
 
 ## Capability and evidence matrix
 
 The labels below are deliberate submission boundaries. `LOCAL_DEMO` describes
-what this checkout can run without credentials. `LIVE_AWS` describes the
-capability that must be connected and artifact-verified before it can be
-claimed; no `LIVE_AWS` run is included in this repository state.
+what this checkout can run without live model/training infrastructure.
+`LIVE_AWS` describes capability that must be connected and artifact-verified
+before it can be claimed. No end-to-end live post-training run is recorded in
+this checkout. The changelog does record narrower historical Bedrock/S3 smoke
+checks; those do not establish a current deployment or a training/evaluation
+result.
 
 | Capability | `LOCAL_DEMO` (current checkout) | `LIVE_AWS` (claim requires evidence) |
 | --- | --- | --- |
 | Strands specialist workflow | Eight role contracts initialize and execute a bounded local workflow. | Bedrock-backed agent decisions and authenticated service boundaries. |
 | Run control | In-memory `OptimizationRun` plus a process-local bounded history registry; `/step` advances one phase and `/auto` runs the remaining phases in-process. | Durable run ownership, idempotent commands, and restart-safe orchestration through DynamoDB. |
-| Benchmark and trajectories | Service-recovery fixture returns explanatory trajectories and simulated metrics. | Objective environment worker produces immutable S3 artifacts with hashes and provider/run IDs. |
+| Benchmark and trajectories | The ordinary coordinator demo uses explanatory fixtures. A separate objective-worker adapter can load a full digest-pinned local FunctionGemma snapshot and verify train/replay trajectories, but no real-checkpoint result is recorded here. | The authenticated worker must execute the real target model, deterministically replay each trajectory, and persist verified versioned S3 artifacts with hashes and run/provider provenance. |
 | Curation and QLoRA design | Agents return structured demonstration outputs and bounded configurations. | Replay-verified training rows and a recorded, budget-compliant training specification. |
 | Training execution | Missing objective/training adapters fail closed; no checkpoint or job is fabricated. | SageMaker job submission, bounded polling, logs, and an immutable checkpoint manifest. |
 | Evaluation and promotion | Deterministic gate code is exercised locally, but local metrics are simulated and cannot prove improvement. | Independent evaluation on identical sealed inputs, with artifact-backed metrics and a deterministic promotion decision. |
@@ -115,8 +130,9 @@ optional and sink failures never change run outcomes.
 
 The evidence labels used in outputs are `LIVE` (verified by the current AWS
 request), `PRIOR_VERIFIED_RUN` (a prior run with provider IDs and hashes), and
-`EXPLANATION` (fixture or simulation). The current checkout produces only
-`EXPLANATION` workflow evidence.
+`EXPLANATION` (fixture or simulation). The ordinary `/api/runs` coordinator
+demo emits `EXPLANATION`; a checkpoint-backed objective-worker response is not
+evidence of SageMaker training, held-out evaluation, improvement, or promotion.
 
 ## Evidence boundary
 
@@ -201,10 +217,22 @@ docker compose config --quiet
 
 ## AWS deployment status
 
-The AWS/Strands implementation has not been executed as a live post-training
-run in this checkout. The guarded live controller and AWS adapters exist, but
-the public local `/api/runs` workflow still uses process-local state and
-`EXPLANATION` fixtures. Do not describe that path as a live AWS result.
+The public `/api/runs` workflow still uses process-local state and
+`EXPLANATION` fixtures. A separate `/api/live` path is wired for AWS mode with
+DynamoDB-backed run/event state, a dispatcher/supervisor, Bedrock reasoning,
+S3 artifact verification, an authenticated objective-worker boundary, and
+SageMaker adapters. Source code and CDK synthesis do not prove those resources
+are deployed or reachable. The changelog's 2026-09-06 live records cover a
+Bedrock/S3 connectivity smoke using `amazon.nova-pro-v1:0` and eight bounded
+agent calls using that model; they do not verify the currently pinned
+`nvidia.nemotron-super-3-120b`, a deployed application, FunctionGemma
+inference, SageMaker training, held-out evaluation, or model improvement.
+
+Current live checkpoint (operator-reported 2026-09-12): AWS deployment and
+live-run scope is this hackathon only. SageMaker GPU quota request
+`9a3453884e2c4230a6e8bb0004c8cca57FuK8VC5` is `PENDING`; quota approval,
+placement capacity, deployment, and a live post-training result are not
+claimed. Recheck AWS state and the read-only preflight before any run.
 
 The repository includes a CDK foundation in [infra/cdk](infra/cdk). It can
 provision the retained storage, ECR, VPC, ECS/Fargate, CloudWatch, IAM, and
@@ -215,12 +243,13 @@ secret, GPU placement capacity, or public ingress/authentication. Those are
 deployment prerequisites and must be configured before the read-only
 `/api/live/readiness` or `scripts/live_preflight.py` can report `READY`.
 
-The live controller reuses existing resources and never deletes persistent
+The live controller reuses configured resources and never deletes persistent
 S3, DynamoDB, IAM, ECR, VPC, or ECS infrastructure. It only stops the current
 run's in-progress SageMaker jobs during cleanup. A real run is claimable only
-after a successful preflight, an explicit signed approval, provider job IDs,
-immutable artifact hashes, held-out evidence, and a deterministic promotion
-decision have been retained.
+after a successful fresh preflight, an explicit signed approval, provider job
+IDs, immutable artifact hashes, held-out evidence, and a deterministic
+promotion decision have been retained. The quota request above remains
+pending as of its recorded date; it is not proof of granted quota or capacity.
 
 ## Living documentation
 

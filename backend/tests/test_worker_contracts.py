@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import tarfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -27,6 +29,7 @@ from workers.trainer.train import (
     format_sft_example,
     load_training_dataset,
     parse_training_inputs,
+    run_training,
     verify_parent_adapter,
     write_training_manifest,
 )
@@ -88,6 +91,27 @@ def _qlora_config() -> dict[str, object]:
     }
 
 
+def _write_adapter_artifacts(output_dir: Path, weights: bytes = b"adapter") -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": BASE_MODEL_ID,
+                "peft_type": "LORA",
+                "task_type": "CAUSAL_LM",
+                "r": 8,
+                "lora_alpha": 16,
+                "lora_dropout": 0.05,
+                "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    (output_dir / "adapter_model.safetensors").write_bytes(weights)
+    (output_dir / "training_metrics.json").write_text('{"train_loss":0.5}\n')
+
+
 def test_training_parser_requires_train_channel_and_rejects_sealed_channels(tmp_path: Path) -> None:
     with pytest.raises(TrainingWorkerError, match="SM_CHANNEL_TRAIN"):
         parse_training_inputs(
@@ -136,8 +160,7 @@ def test_evaluator_parser_is_sealed_only_and_requires_pinned_manifest(tmp_path: 
 def test_training_manifest_is_deterministic_and_refuses_empty_output(tmp_path: Path) -> None:
     train = _dataset_fixture(tmp_path)
     dataset_sha256 = _dataset_digest(train)
-    (tmp_path / "model").mkdir()
-    (tmp_path / "model" / "adapter_model.safetensors").write_bytes(b"real-adapter")
+    _write_adapter_artifacts(tmp_path / "model", b"real-adapter")
     manifest_path = write_training_manifest(
         train,
         output_dir=tmp_path / "model",
@@ -186,8 +209,7 @@ def test_training_manifest_is_deterministic_and_refuses_empty_output(tmp_path: P
 
 def test_training_manifest_binds_to_the_source_dataset_digest(tmp_path: Path) -> None:
     train = _dataset_fixture(tmp_path)
-    (tmp_path / "model").mkdir()
-    (tmp_path / "model" / "adapter_model.safetensors").write_bytes(b"real-adapter")
+    _write_adapter_artifacts(tmp_path / "model", b"real-adapter")
     with pytest.raises(TrainingWorkerError, match="dataset"):
         write_training_manifest(
             train,
@@ -212,10 +234,53 @@ def test_training_manifest_binds_to_the_source_dataset_digest(tmp_path: Path) ->
         )
 
 
+def test_training_manifest_rejects_output_without_a_real_peft_adapter(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    output = tmp_path / "model"
+    output.mkdir()
+    (output / "training_metrics.json").write_text('{"train_loss":0.5}\n')
+
+    with pytest.raises(TrainingWorkerError, match="adapter"):
+        write_training_manifest(
+            train,
+            output_dir=output,
+            run_id="run-1",
+            experiment_id="exp-1",
+            dataset_id="dataset-1",
+            dataset_sha256=_dataset_digest(train),
+            base_model_id=BASE_MODEL_ID,
+            base_model_revision="a" * 40,
+            qlora_config=_qlora_config(),
+            training_metrics={"train_loss": 0.5},
+        )
+
+
+def test_training_refuses_to_reuse_a_preexisting_model_output(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    model_dir = tmp_path / "model"
+    _write_adapter_artifacts(model_dir, b"stale-adapter")
+    inputs = parse_training_inputs(
+        {
+            "SM_CHANNEL_TRAIN": str(train),
+            "SM_MODEL_DIR": str(model_dir),
+            "RUN_ID": "run-1",
+            "EXPERIMENT_ID": "exp-1",
+            "DATASET_ID": "dataset-1",
+            "DATASET_SHA256": _dataset_digest(train),
+            "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
+            "BASE_MODEL_ID": BASE_MODEL_ID,
+            "BASE_MODEL_REVISION": "a" * 40,
+            "QLORA_CONFIG": json.dumps(_qlora_config()),
+        }
+    )
+
+    with pytest.raises(TrainingWorkerError, match="empty"):
+        run_training(inputs)
+
+
 def test_training_manifest_rejects_qlora_config_outside_fixed_search_space(tmp_path: Path) -> None:
     train = _dataset_fixture(tmp_path)
-    (tmp_path / "model").mkdir()
-    (tmp_path / "model" / "adapter_model.safetensors").write_bytes(b"real-adapter")
+    _write_adapter_artifacts(tmp_path / "model", b"real-adapter")
     with pytest.raises(TrainingWorkerError, match="QLORA"):
         write_training_manifest(
             train,
@@ -278,7 +343,7 @@ def test_parent_adapter_manifest_is_verified_and_carried_into_lineage(tmp_path: 
     train = _dataset_fixture(tmp_path)
     parent = tmp_path / "parent"
     parent.mkdir()
-    (parent / "adapter_model.safetensors").write_bytes(b"parent")
+    _write_adapter_artifacts(parent, b"parent")
     parent_manifest = write_training_manifest(
         train,
         output_dir=parent,
@@ -296,7 +361,7 @@ def test_parent_adapter_manifest_is_verified_and_carried_into_lineage(tmp_path: 
 
     output = tmp_path / "candidate"
     output.mkdir()
-    (output / "adapter_model.safetensors").write_bytes(b"candidate")
+    _write_adapter_artifacts(output, b"candidate")
     manifest_path = write_training_manifest(
         train,
         output_dir=output,
@@ -314,6 +379,116 @@ def test_parent_adapter_manifest_is_verified_and_carried_into_lineage(tmp_path: 
 
     with pytest.raises(TrainingWorkerError, match=r"parent|checksum"):
         verify_parent_adapter(tmp_path / "missing-parent")
+
+
+def test_trainer_extracts_and_verifies_approved_parent_channel(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    _write_adapter_artifacts(parent, b"approved parent")
+    manifest_path = write_training_manifest(
+        train,
+        output_dir=parent,
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=_dataset_digest(train),
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        qlora_config=_qlora_config(),
+    )
+    parent_manifest = json.loads(manifest_path.read_text())
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+        for path in parent.iterdir():
+            bundle.add(path, arcname=path.name)
+    archive_bytes = archive.getvalue()
+    archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+    channel = tmp_path / "parent-channel"
+    channel.mkdir()
+    (channel / f"{archive_sha}.tar.gz").write_bytes(archive_bytes)
+
+    inputs = parse_training_inputs(
+        {
+            "SM_CHANNEL_TRAIN": str(train),
+            "SM_CHANNEL_PARENT_ADAPTER": str(channel),
+            "SM_MODEL_DIR": str(tmp_path / "model"),
+            "RUN_ID": "run-1",
+            "EXPERIMENT_ID": "run-1-2",
+            "DATASET_ID": "dataset-1",
+            "DATASET_SHA256": _dataset_digest(train),
+            "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
+            "BASE_MODEL_ID": BASE_MODEL_ID,
+            "BASE_MODEL_REVISION": "a" * 40,
+            "QLORA_CONFIG": json.dumps(_qlora_config()),
+            "APPROVED_PARENT_ARTIFACT_ID": parent_manifest["artifact_id"],
+            "APPROVED_PARENT_MANIFEST_SHA256": parent_manifest["manifest_sha256"],
+            "APPROVED_PARENT_ARTIFACT_SHA256": parent_manifest["artifact_sha256"],
+            "APPROVED_PARENT_ARCHIVE_SHA256": archive_sha,
+        }
+    )
+
+    assert inputs.parent_adapter_dir is not None
+    assert not inputs.parent_adapter_dir.is_relative_to(inputs.model_dir)
+    assert list(inputs.model_dir.iterdir()) == []
+    assert verify_parent_adapter(inputs.parent_adapter_dir)["manifest_sha256"] == parent_manifest[
+        "manifest_sha256"
+    ]
+
+
+def test_evaluator_extracts_candidate_and_champion_archives(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_adapter_artifacts(checkpoint, b"candidate")
+    write_training_manifest(
+        train,
+        output_dir=checkpoint,
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=_dataset_digest(train),
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        qlora_config=_qlora_config(),
+    )
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+        for path in checkpoint.iterdir():
+            bundle.add(path, arcname=path.name)
+    payload = archive.getvalue()
+    digest = hashlib.sha256(payload).hexdigest()
+    candidate_channel = tmp_path / "candidate-channel"
+    champion_channel = tmp_path / "champion-channel"
+    sealed_channel = tmp_path / "sealed-channel"
+    for channel in (candidate_channel, champion_channel, sealed_channel):
+        channel.mkdir()
+    for channel in (candidate_channel, champion_channel):
+        (channel / f"{digest}.tar.gz").write_bytes(payload)
+
+    inputs = parse_evaluation_inputs(
+        {
+            "RUN_ID": "run-1",
+            "EXPERIMENT_ID": "exp-1",
+            "EVALUATION_MANIFEST_SHA256": "b" * 64,
+            "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+            "OBJECTIVE_SEED": "7",
+            "CANDIDATE_ARCHIVE_SHA256": digest,
+            "CHAMPION_ARCHIVE_SHA256": digest,
+            "SM_OUTPUT_DATA_DIR": str(tmp_path / "evaluation-output"),
+        },
+        {
+            "candidate": candidate_channel,
+            "champion": champion_channel,
+            "sealed": sealed_channel,
+        },
+    )
+
+    assert verify_checkpoint_artifact(
+        inputs.candidate_dir, run_id="run-1", experiment_id="exp-1"
+    )["kind"] == "qlora-adapter"
+    assert inputs.champion_dir is not None
+    assert (inputs.champion_dir / "manifest.json").is_file()
 
 
 def test_training_and_evaluation_share_action_prompt_serialization() -> None:
@@ -375,7 +550,7 @@ def test_sealed_manifest_binds_task_bytes_and_rejects_duplicates(tmp_path: Path)
     train = _dataset_fixture(tmp_path)
     candidate = tmp_path / "candidate"
     candidate.mkdir()
-    (candidate / "adapter_model.safetensors").write_bytes(b"candidate")
+    _write_adapter_artifacts(candidate, b"candidate")
     write_training_manifest(
         train,
         output_dir=candidate,
@@ -437,9 +612,10 @@ def test_training_admission_rejects_untrusted_source_type(tmp_path: Path) -> Non
         {
             "RUN_ID": "run-1",
             "EXPERIMENT_ID": "exp-1",
-            "DATASET_ID": "dataset-1",
-            "DATASET_SHA256": raw["manifest"]["sha256"],
-            "BASE_MODEL_ID": BASE_MODEL_ID,
+                "DATASET_ID": "dataset-1",
+                "DATASET_SHA256": raw["manifest"]["sha256"],
+                "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
+                "BASE_MODEL_ID": BASE_MODEL_ID,
             "BASE_MODEL_REVISION": "a" * 40,
             "SM_MODEL_DIR": str(tmp_path / "model"),
         },
@@ -453,7 +629,7 @@ def test_artifact_id_is_bound_to_verified_content_digest(tmp_path: Path) -> None
     train = _dataset_fixture(tmp_path)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    _write_adapter_artifacts(checkpoint, b"adapter")
     manifest_path = write_training_manifest(
         train,
         output_dir=checkpoint,
@@ -479,11 +655,46 @@ def test_artifact_id_is_bound_to_verified_content_digest(tmp_path: Path) -> None
         verify_parent_adapter(checkpoint)
 
 
+def test_evaluator_rejects_self_consistent_manifest_without_adapter_files(tmp_path: Path) -> None:
+    train = _dataset_fixture(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    _write_adapter_artifacts(checkpoint)
+    manifest_path = write_training_manifest(
+        train,
+        output_dir=checkpoint,
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=_dataset_digest(train),
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        qlora_config=_qlora_config(),
+    )
+    (checkpoint / "adapter_config.json").unlink()
+    (checkpoint / "adapter_model.safetensors").unlink()
+    payload = json.loads(manifest_path.read_text())
+    payload["artifact_files"] = [
+        entry for entry in payload["artifact_files"] if entry["path"] == "training_metrics.json"
+    ]
+    payload["artifact_sha256"] = hashlib.sha256(
+        json.dumps(payload["artifact_files"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    payload["artifact_id"] = f"checkpoint://{payload['artifact_sha256']}"
+    payload.pop("manifest_sha256")
+    payload["manifest_sha256"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+
+    with pytest.raises(EvaluationWorkerError, match="adapter_config"):
+        verify_checkpoint_artifact(checkpoint)
+
+
 def test_evaluator_rejects_unlisted_duplicate_and_symlink_files(tmp_path: Path) -> None:
     train = _dataset_fixture(tmp_path)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    _write_adapter_artifacts(checkpoint, b"adapter")
     manifest_path = write_training_manifest(
         train,
         output_dir=checkpoint,
@@ -539,7 +750,7 @@ def test_evaluator_binds_checkpoint_run_and_experiment_before_scoring(tmp_path: 
     train = _dataset_fixture(tmp_path)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    _write_adapter_artifacts(checkpoint, b"adapter")
     write_training_manifest(
         train,
         output_dir=checkpoint,
@@ -561,7 +772,7 @@ def test_evaluator_binds_sealed_manifest_seed_and_run_identity(tmp_path: Path) -
     train = _dataset_fixture(tmp_path)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    _write_adapter_artifacts(checkpoint, b"adapter")
     write_training_manifest(
         train,
         output_dir=checkpoint,

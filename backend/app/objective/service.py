@@ -20,6 +20,7 @@ from .artifacts import (
     ObjectiveArtifactNotFound,
 )
 from .engine import ServiceRecoveryEngine
+from .execution import FunctionGemmaBenchmarkExecutionAdapter
 from .models import (
     BenchmarkExecutionResult,
     BenchmarkRequest,
@@ -28,6 +29,7 @@ from .models import (
     CurationResponse,
     Dataset,
     DatasetManifest,
+    ObjectiveReadinessResponse,
     Trajectory,
     TrajectoryReference,
     deterministic_dataset_created_at,
@@ -154,6 +156,47 @@ class ObjectiveService:
         self.auth_token = auth_token
         self.execution_adapter = execution_adapter
         self.artifact_store = artifact_store
+
+    def readiness(self) -> ObjectiveReadinessResponse:
+        """Return metadata-only readiness without running a benchmark or model."""
+
+        blockers: list[str] = []
+        adapter_ready = False
+        if type(self.execution_adapter) is not FunctionGemmaBenchmarkExecutionAdapter:
+            blockers.append("functiongemma_adapter_unavailable")
+        else:
+            try:
+                adapter_status = self.execution_adapter.readiness()
+            except Exception:
+                blockers.append("functiongemma_adapter_unavailable")
+            else:
+                adapter_ready = adapter_status.ready
+                blockers.extend(adapter_status.blockers)
+
+        store = self.artifact_store
+        can_persist_trajectory = callable(getattr(store, "put", None))
+        can_persist_dataset = callable(getattr(store, "put_dataset", None))
+        can_resolve_references = callable(getattr(store, "resolve_trajectory_reference", None))
+        benchmark_ready = adapter_ready and can_persist_trajectory
+        curation_ready = (
+            adapter_ready
+            and can_persist_trajectory
+            and can_persist_dataset
+            and can_resolve_references
+        )
+        if not (can_persist_trajectory and can_persist_dataset and can_resolve_references):
+            blockers.append("artifact_store_incomplete")
+
+        capabilities = {
+            "benchmark": benchmark_ready,
+            "verify-curation": curation_ready,
+        }
+        status = "ready" if all(capabilities.values()) else "blocked"
+        return ObjectiveReadinessResponse(
+            status=status,
+            capabilities=capabilities,
+            blockers=tuple(dict.fromkeys(blockers)),
+        )
 
     def benchmark(self, request: BenchmarkRequest) -> BenchmarkResponse:
         if self.execution_adapter is None:
@@ -283,7 +326,10 @@ class ObjectiveService:
             confirmed.append(result.trajectory)
         try:
             dataset = self.engine.build_dataset(
-                tuple(confirmed), run_id=request.run_id, experiment_id=request.experiment_id
+                tuple(confirmed),
+                run_id=request.run_id,
+                experiment_id=request.experiment_id,
+                scope=request.split,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -384,6 +430,14 @@ def create_objective_app(
     @app.post("/v1/verify-curation", response_model=CurationResponse, dependencies=[Depends(auth)])
     def verify_curation(request: CurationRequest) -> CurationResponse:
         return service.verify_curation(request)
+
+    @app.get(
+        "/v1/readiness",
+        response_model=ObjectiveReadinessResponse,
+        dependencies=[Depends(auth)],
+    )
+    def readiness() -> ObjectiveReadinessResponse:
+        return service.readiness()
 
     @app.get("/v1/auth-probe", dependencies=[Depends(auth)])
     def auth_probe() -> dict[str, str]:

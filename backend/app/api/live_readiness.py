@@ -8,6 +8,7 @@ provider exception text, credentials, prompts, or approval tokens.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -60,6 +61,36 @@ class LiveReadinessPayload(BaseModel):
 
 router = APIRouter(tags=["live-readiness"])
 
+_SAFE_BLOCKER_REASONS = {
+    "live_configuration": "Required live configuration is missing or invalid.",
+    "aws_identity": "The AWS identity could not be verified.",
+    "bedrock_model_access": "Required reasoning-model access is unavailable.",
+    "huggingface_pinned_revision": "The pinned Hugging Face model revision is unavailable.",
+    "s3_artifact_bucket": "The artifact bucket is missing or does not meet required settings.",
+    "sagemaker_training_input": (
+        "The SageMaker training input prefix is missing, empty, or outside the artifact scope."
+    ),
+    "sagemaker_evaluation_input": (
+        "The SageMaker evaluation input prefix is missing, empty, or outside the artifact scope."
+    ),
+    "pinned_checkpoint_artifact": (
+        "The pinned checkpoint is missing or its immutable digest could not be verified."
+    ),
+    "dynamodb_history_table": (
+        "The DynamoDB history table is inactive or has an unsupported key schema."
+    ),
+    "sagemaker_role_and_images": (
+        "The SageMaker role trust or pinned worker images could not be verified."
+    ),
+    "gpu_allowlist": "The requested GPU instance is not on the configured allowlist.",
+    "gpu_quota": "Configured GPU quota is insufficient or could not be verified.",
+    "objective_worker": (
+        "The objective worker is unavailable, unauthenticated, or not execution-ready."
+    ),
+    "approval_secret": "The one-run approval secret is not configured.",
+    "cost_ceiling": "The worst-case SageMaker estimate exceeds the configured cost ceiling.",
+}
+
 
 def _blocked_payload(reasoning_model: str = NEMOTRON_MODEL_ID) -> LiveReadinessPayload:
     return LiveReadinessPayload(
@@ -69,6 +100,14 @@ def _blocked_payload(reasoning_model: str = NEMOTRON_MODEL_ID) -> LiveReadinessP
         reasoning_model=reasoning_model,
         gpu=GpuReadinessPayload(),
         approval=ApprovalReadinessPayload(),
+        checks=(
+            {
+                "name": "live_configuration",
+                "status": "BLOCKED",
+                "classification": PreflightClassification.BLOCKED_CONFIGURATION.value,
+                "reason": _SAFE_BLOCKER_REASONS["live_configuration"],
+            },
+        ),
     )
 
 
@@ -80,6 +119,11 @@ def _report_payload(report: PreflightReport, *, target_model: str) -> LiveReadin
             "name": item.name,
             "status": item.status.value,
             "classification": item.classification.value if item.classification else None,
+            **(
+                {"reason": _SAFE_BLOCKER_REASONS.get(item.name, "This readiness check is blocked.")}
+                if item.status.value == "BLOCKED"
+                else {}
+            ),
         }
         for item in report.checks
     )
@@ -99,6 +143,15 @@ def _report_payload(report: PreflightReport, *, target_model: str) -> LiveReadin
         approval=ApprovalReadinessPayload(),
         checks=checks,
     )
+
+
+def _approval_secret_configured(request: Request, runner: Any) -> bool:
+    injected = getattr(request.app.state, "live_approval_secret", None)
+    if isinstance(injected, str) and injected:
+        return True
+    config = getattr(runner, "config", None)
+    name = getattr(config, "approval_secret_env", "LIVE_APPROVAL_SECRET")
+    return bool(os.getenv(name, ""))
 
 
 @router.get("/api/live/readiness", response_model=LiveReadinessPayload)
@@ -121,7 +174,19 @@ def live_readiness(request: Request) -> LiveReadinessPayload:
     try:
         report = runner.run()
         target_model = getattr(getattr(runner, "config", None), "target_model", "")
-        return _report_payload(report, target_model=target_model or "unknown")
+        payload = _report_payload(report, target_model=target_model or "unknown")
+        # A successful provider/configuration probe is insufficient to launch
+        # work unless the one-run HMAC approval secret is available too.
+        if payload.status is PreflightStatus.READY and not _approval_secret_configured(
+            request, runner
+        ):
+            return payload.model_copy(
+                update={
+                    "status": PreflightStatus.BLOCKED,
+                    "classification": PreflightClassification.BLOCKED_CONFIGURATION,
+                }
+            )
+        return payload
     except Exception:
         return _blocked_payload()
 

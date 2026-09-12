@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
 from typing import Any, Protocol, cast
+from urllib.parse import urlsplit
 
 from app.autonomous.agents import (
     CuratedDatasetPlan,
@@ -56,7 +57,7 @@ from app.providers.sagemaker import (
     TransientProviderError,
 )
 
-from .telemetry import DurableTelemetryError
+from .telemetry import AutonomousEventType, DurableTelemetryError
 
 
 class SupervisorError(RuntimeError):
@@ -130,12 +131,15 @@ class CheckpointArtifact:
     artifact_id: str
     uri: str
     sha256: str
+    manifest_sha256: str | None = None
+    artifact_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class EvaluationEvidence:
     evaluation: MultiRunEvaluation
     artifact_ids: tuple[str, ...]
+    champion_evaluation: MultiRunEvaluation | None = None
     cost_usd: float = 0.0
 
 
@@ -201,14 +205,22 @@ class ObjectiveAdapter(Protocol):
 
 class AgentAdapter(Protocol):
     def analyze_failures(
-        self, trajectory_references: Sequence[str], experiment_history: Sequence[Any] = ()
+        self,
+        trajectory_references: Sequence[str],
+        experiment_history: Sequence[Any] = (),
+        *,
+        evidence_class: str,
     ) -> Sequence[FailureCluster] | Awaitable[Sequence[FailureCluster]]: ...
 
     def research(
         self,
         failure_clusters: Sequence[FailureCluster],
         experiment_history: Sequence[Any] = (),
-        **kwargs: Any,
+        *,
+        run_id: str,
+        experiment_number: int,
+        verified_evidence_references: Sequence[str],
+        verified_evidence_metadata: Mapping[str, Mapping[str, Any]],
     ) -> Sequence[ResearchHypothesis] | Awaitable[Sequence[ResearchHypothesis]]: ...
 
     def curate(
@@ -216,7 +228,9 @@ class AgentAdapter(Protocol):
         verified_trajectory_references: Sequence[str],
         hypotheses: Sequence[ResearchHypothesis] = (),
         experiment_history: Sequence[Any] = (),
-        **kwargs: Any,
+        *,
+        failure_clusters: Sequence[FailureCluster],
+        verified_trajectory_metadata: Mapping[str, Mapping[str, Any]],
     ) -> CuratedDatasetPlan | Awaitable[CuratedDatasetPlan]: ...
 
     def design_qlora(
@@ -272,11 +286,22 @@ class ApprovalVerifier(Protocol):
 class TelemetrySink(Protocol):
     def emit(self, event_type: Any, **kwargs: Any) -> Any: ...
 
+    def transition(self, event_type: Any, **kwargs: Any) -> AutonomousRunState: ...
+
 
 async def _await[T](value: T | Awaitable[T]) -> T:
     if inspect.isawaitable(value):
         return await cast(Awaitable[T], value)
     return value
+
+
+async def _invoke(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run sync adapters off-loop while preserving async adapter support."""
+
+    if inspect.iscoroutinefunction(function):
+        return await function(*args, **kwargs)
+    value = await asyncio.to_thread(function, *args, **kwargs)
+    return await _await(value)
 
 
 def _finite_cost(value: object) -> float:
@@ -315,6 +340,30 @@ def _decode_json(value: object) -> Any:
         raise SupervisorBlocked("durable evidence is invalid") from exc
 
 
+def _exact_run_identity(value: object, run_id: str) -> bool:
+    if value == run_id:
+        return True
+    if not isinstance(value, str):
+        return False
+    parsed = urlsplit(value)
+    return parsed.scheme == "eval" and parsed.netloc == run_id and bool(parsed.path.strip("/"))
+
+
+def _reference_sequence(value: object, name: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise SupervisorBlocked(f"durable {name} references are invalid")
+    refs = tuple(value)
+    if not refs or any(
+        not isinstance(item, str)
+        or not item.strip()
+        or any(char.isspace() for char in item)
+        or "://" not in item
+        for item in refs
+    ):
+        raise SupervisorBlocked(f"durable {name} references are invalid")
+    return refs
+
+
 class AutonomousRunSupervisor:
     """Run one approved top-level optimization autonomously and durably."""
 
@@ -336,6 +385,7 @@ class AutonomousRunSupervisor:
         max_polls: int = 120,
         poll_interval_seconds: float = 30.0,
         phase_cost_estimates: Mapping[str, float] | None = None,
+        owner: str | None = None,
     ) -> None:
         if max_polls < 1 or poll_interval_seconds < 0:
             raise ValueError("poll settings are invalid")
@@ -361,6 +411,7 @@ class AutonomousRunSupervisor:
             "evaluation": 1.0,
             **dict(phase_cost_estimates or {}),
         }
+        self.owner = owner
 
     async def run_optimization(self, run_id: str) -> AutonomousRunState:
         state = self.repository.get(run_id)
@@ -376,7 +427,14 @@ class AutonomousRunSupervisor:
             return state
         try:
             await self._verify_start(state)
-            state = await self._ensure_baseline(state)
+            if state.status in {AutonomousRunStatus.PREPARED, AutonomousRunStatus.QUEUED}:
+                self._emit(
+                    AutonomousEventType.RUN_STARTED.value,
+                    run_id,
+                    max(1, state.current_experiment_number or len(state.experiments) + 1),
+                    status=state.status.value,
+                )
+                state = self._reload(run_id)
             state = self._recover_promotion_intents(state)
             while True:
                 state = self._reload(run_id)
@@ -390,6 +448,7 @@ class AutonomousRunSupervisor:
                     state.current_hypothesis if state.current_experiment_number == number else None
                 )
                 benchmark: BenchmarkEvidence | None = None
+                failures: Sequence[FailureCluster] | None = None
                 plan: CuratedDatasetPlan | None = None
                 if isinstance(persisted, Mapping) and isinstance(
                     persisted.get("hypothesis"), Mapping
@@ -414,10 +473,11 @@ class AutonomousRunSupervisor:
                     benchmark = await self._run_benchmark(state, number)
                     state = self._reload(run_id)
                     try:
-                        failures = await _await(
-                            self.agents.analyze_failures(
-                                benchmark.trajectory_refs, state.experiments
-                            )
+                        failures = await _invoke(
+                            self.agents.analyze_failures,
+                            benchmark.trajectory_refs,
+                            state.experiments,
+                            evidence_class=benchmark.evaluation.evidence.label.value,
                         )
                     except Exception as exc:
                         raise SupervisorAgentFailure("agent failure") from exc
@@ -427,16 +487,16 @@ class AutonomousRunSupervisor:
                         state, AutonomousRunStatus.RUNNING, RunPhase.RESEARCH, "phase started"
                     )
                     try:
-                        hypotheses = await _await(
-                            self.agents.research(
-                                failures,
-                                state.experiments,
-                                verified_evidence_references=benchmark.trajectory_refs,
-                                verified_evidence_metadata={
-                                    ref: {"status": "succeeded"}
-                                    for ref in benchmark.trajectory_refs
-                                },
-                            )
+                        hypotheses = await _invoke(
+                            self.agents.research,
+                            failures,
+                            state.experiments,
+                            run_id=state.run_id,
+                            experiment_number=number,
+                            verified_evidence_references=benchmark.trajectory_refs,
+                            verified_evidence_metadata=self._agent_evidence_metadata(
+                                benchmark, run_id=state.run_id, experiment_number=number
+                            ),
                         )
                     except Exception as exc:
                         raise SupervisorAgentFailure("agent failure") from exc
@@ -458,15 +518,31 @@ class AutonomousRunSupervisor:
                 if plan is None:
                     if benchmark is None:
                         benchmark = await self._run_benchmark(self._reload(run_id), number)
-                    dataset_refs = self._dataset_refs(self._reload(run_id))
-                    try:
-                        plan = await _await(
-                            self.agents.curate(
+                    if failures is None:
+                        state = self._reload(run_id)
+                        try:
+                            failures = await _invoke(
+                                self.agents.analyze_failures,
                                 benchmark.trajectory_refs,
-                                hypotheses=(hypothesis,),
-                                experiment_history=self._reload(run_id).experiments,
-                                verified_dataset_artifact_references=dataset_refs,
+                                state.experiments,
+                                evidence_class=benchmark.evaluation.evidence.label.value,
                             )
+                        except Exception as exc:
+                            raise SupervisorAgentFailure("agent failure") from exc
+                        if not failures:
+                            return self._finish(
+                                state, "no valid next experiment", None, blocked=True
+                            )
+                    try:
+                        plan = await _invoke(
+                            self.agents.curate,
+                            benchmark.trajectory_refs,
+                            hypotheses=(hypothesis,),
+                            experiment_history=self._reload(run_id).experiments,
+                            failure_clusters=failures,
+                            verified_trajectory_metadata=self._agent_evidence_metadata(
+                                benchmark, run_id=run_id, experiment_number=number
+                            ),
                         )
                     except Exception as exc:
                         raise SupervisorAgentFailure("agent failure") from exc
@@ -487,10 +563,6 @@ class AutonomousRunSupervisor:
                         "current_experiment_number": number,
                         "current_dataset_uri": dataset.uri,
                         "current_dataset_sha256": dataset.sha256,
-                        "metadata": {
-                            **self._reload(run_id).metadata,
-                            "dataset_artifact_ref": dataset.artifact_id,
-                        },
                     },
                 )
                 state = self._transition(
@@ -508,7 +580,7 @@ class AutonomousRunSupervisor:
                         raise SupervisorBlocked("persisted QLoRA config is invalid") from exc
                 else:
                     try:
-                        config = await _await(self.agents.design_qlora(plan, state.experiments))
+                        config = await _invoke(self.agents.design_qlora, plan, state.experiments)
                     except Exception as exc:
                         raise SupervisorAgentFailure("agent failure") from exc
                 state = self._patch(
@@ -520,10 +592,12 @@ class AutonomousRunSupervisor:
                         }
                     },
                 )
-                train_request = await _await(
-                    self.request_factory.training(
-                        state, experiment_number=number, dataset=dataset, config=config
-                    )
+                train_request = await _invoke(
+                    self.request_factory.training,
+                    state,
+                    experiment_number=number,
+                    dataset=dataset,
+                    config=config,
                 )
                 training = await self._run_job(
                     state, number, RunPhase.TRAINING, train_request, "training"
@@ -543,10 +617,11 @@ class AutonomousRunSupervisor:
                 if control.should_stop:
                     return self._finish(state, _policy_reason(control.action), control.action)
                 try:
-                    candidate = await _await(
-                        self.artifacts.verify_checkpoint(
-                            training, run_id=run_id, experiment_number=number
-                        )
+                    candidate = await _invoke(
+                        self.artifacts.verify_checkpoint,
+                        training,
+                        run_id=run_id,
+                        experiment_number=number,
                     )
                 except SupervisorError:
                     raise
@@ -567,10 +642,11 @@ class AutonomousRunSupervisor:
                 state = self._transition(
                     state, AutonomousRunStatus.RUNNING, RunPhase.EVALUATION, "phase started"
                 )
-                eval_request = await _await(
-                    self.request_factory.evaluation(
-                        state, experiment_number=number, candidate=candidate
-                    )
+                eval_request = await _invoke(
+                    self.request_factory.evaluation,
+                    state,
+                    experiment_number=number,
+                    candidate=candidate,
                 )
                 evaluation_job = await self._run_job(
                     state, number, RunPhase.EVALUATION, eval_request, "evaluation"
@@ -602,16 +678,23 @@ class AutonomousRunSupervisor:
                 if evidence_intent.status is RunOperationStatus.SUCCEEDED:
                     evidence = self._decode_evaluation_evidence(evidence_intent.result)
                 else:
+                    control = await self._control(self._reload(run_id), active_provider_job=False)
+                    if control.should_stop:
+                        raise SupervisorControlStop(control.action)
                     try:
-                        evidence = await _await(
-                            self.evaluator.read_evaluation(
-                                evaluation_job, state=state, experiment_number=number
-                            )
+                        evidence = await _invoke(
+                            self.evaluator.read_evaluation,
+                            evaluation_job,
+                            state=state,
+                            experiment_number=number,
                         )
                     except SupervisorError:
                         raise
                     except Exception as exc:
                         raise SupervisorArtifactFailure("evaluation evidence failure") from exc
+                    control = await self._control(self._reload(run_id), active_provider_job=False)
+                    if control.should_stop:
+                        raise SupervisorControlStop(control.action)
                     self.repository.record_operation_result(
                         run_id,
                         evidence_key,
@@ -625,10 +708,34 @@ class AutonomousRunSupervisor:
                     evidence.cost_usd,
                 )
                 state = self._reload(run_id)
+                champion = evidence.champion_evaluation
+                if champion is None:
+                    raise SupervisorBlocked(
+                        "paired champion evidence is required from the sealed evaluator"
+                    )
+                champion_metrics = {
+                    "aggregate": champion.aggregate_score,
+                    **champion.environment_scores,
+                }
+                updates: dict[str, Any] = {
+                    "champion_metrics": champion_metrics,
+                    "champion_artifact_ids": evidence.artifact_ids,
+                    "metadata": {
+                        **state.metadata,
+                        "champion_evaluation_b64": self._encode_evaluation(champion),
+                    },
+                }
+                if not state.baseline_metrics:
+                    updates.update(
+                        {
+                            "baseline_metrics": champion_metrics,
+                            "baseline_artifact_ids": evidence.artifact_ids,
+                        }
+                    )
+                state = self._patch(state, updates)
                 state = self._transition(
                     state, AutonomousRunStatus.RUNNING, RunPhase.PROMOTION, "phase started"
                 )
-                champion = self._champion_evaluation(run_id, state)
                 promotion = self.gate.evaluate(champion, evidence.evaluation)
                 record = ExperimentRecord(
                     experiment_number=number,
@@ -657,6 +764,9 @@ class AutonomousRunSupervisor:
                     else "; ".join(promotion.reasons) or "promotion rejected",
                 )
                 promotion_key = canonical_operation_key(run_id, number, "promotion")
+                control = await self._control(self._reload(run_id), active_provider_job=False)
+                if control.should_stop:
+                    raise SupervisorControlStop(control.action)
                 promotion_intent = self.repository.put_operation_intent(
                     RunOperation(
                         operation_key=promotion_key,
@@ -684,9 +794,18 @@ class AutonomousRunSupervisor:
                             "candidate_artifact_id": candidate.artifact_id,
                             "candidate_uri": candidate.uri,
                             "candidate_sha256": candidate.sha256,
+                            "candidate_artifact_sha256": getattr(
+                                candidate, "artifact_sha256", None
+                            ),
+                            "candidate_manifest_sha256": self._checkpoint_manifest_sha256(
+                                candidate
+                            ),
                             "promoted": promotion.passed,
                         },
                     )
+                control = await self._control(self._reload(run_id), active_provider_job=False)
+                if control.should_stop:
+                    raise SupervisorControlStop(control.action)
                 self._complete_promotion(run_id, promotion_key)
                 self._emit(
                     "promotion.decided",
@@ -723,7 +842,12 @@ class AutonomousRunSupervisor:
         except SupervisorControlStop as exc:
             return self._finish(self._reload(run_id), _policy_reason(exc.action), exc.action)
         except SupervisorTelemetryFailure:
-            return self._finish(self._reload(run_id), "durable telemetry failure", None)
+            return self._finish(
+                self._reload(run_id),
+                "durable telemetry failure",
+                None,
+                skip_telemetry=True,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -744,71 +868,11 @@ class AutonomousRunSupervisor:
         if self.readiness is not None and not await _await(self.readiness(state)):
             raise SupervisorBlocked(SupervisorStopReason.READINESS_BLOCKED.value)
 
-    async def _ensure_baseline(self, state: AutonomousRunState) -> AutonomousRunState:
-        if state.baseline_metrics:
-            return state
-        state = self._transition(
-            state, AutonomousRunStatus.RUNNING, RunPhase.BASELINE, "phase started"
-        )
-        self._check_budget(state, "baseline")
-        operation_key = canonical_operation_key(state.run_id, 1, "baseline")
-        request_digest = canonical_request_hash(
-            {"run_id": state.run_id, "split": "baseline", "experiment_number": 0}
-        )
-        operation = self.repository.put_operation_intent(
-            RunOperation(
-                operation_key=operation_key,
-                run_id=state.run_id,
-                experiment_number=1,
-                phase=RunPhase.BASELINE,
-                provider_name="objective",
-                request_digest=request_digest,
-            )
-        )
-        benchmark: BenchmarkEvidence
-        if operation.status is RunOperationStatus.SUCCEEDED:
-            benchmark = self._decode_benchmark(operation.result)
-        else:
-            try:
-                benchmark = await _await(
-                    self.objective.benchmark(state, split="baseline", experiment_number=0)
-                )
-            except (TransientProviderError, TimeoutError, ConnectionError) as exc:
-                raise SupervisorRecoverable("baseline provider request is retryable") from exc
-            except Exception as exc:
-                raise SupervisorProviderFailure("baseline provider failure") from exc
-            self._validate_benchmark(benchmark, state.run_id, 0, state=state)
-            self.repository.record_operation_result(
-                state.run_id,
-                operation_key,
-                status=RunOperationStatus.SUCCEEDED,
-                result=self._encode_benchmark_result(benchmark),
-            )
-        self._validate_benchmark(benchmark, state.run_id, 0, state=state)
-        state = self._reconcile_cost(state, operation_key, benchmark.cost_usd)
-        return self._patch(
-            self._reload(state.run_id),
-            {
-                "baseline_metrics": {
-                    "aggregate": benchmark.evaluation.aggregate_score,
-                    **benchmark.evaluation.environment_scores,
-                },
-                "champion_metrics": {
-                    "aggregate": benchmark.evaluation.aggregate_score,
-                    **benchmark.evaluation.environment_scores,
-                },
-                "baseline_artifact_ids": benchmark.artifact_ids,
-                "champion_artifact_ids": benchmark.artifact_ids,
-                "metadata": {
-                    **self._reload(state.run_id).metadata,
-                    "champion_evaluation_b64": self._encode_evaluation(benchmark.evaluation),
-                },
-            },
-        )
-
     async def _run_benchmark(self, state: AutonomousRunState, number: int) -> BenchmarkEvidence:
+        self._assert_lease(self._reload(state.run_id))
         self._check_budget(state, "benchmark")
         operation_key = canonical_operation_key(state.run_id, number, "benchmark")
+        self._assert_lease(self._reload(state.run_id))
         request_digest = canonical_request_hash(
             {"run_id": state.run_id, "split": "train", "experiment_number": number}
         )
@@ -825,9 +889,12 @@ class AutonomousRunSupervisor:
         if operation.status is RunOperationStatus.SUCCEEDED:
             result = self._decode_benchmark(operation.result)
         else:
+            control = await self._control(self._reload(state.run_id), active_provider_job=False)
+            if control.should_stop:
+                raise SupervisorControlStop(control.action)
             try:
-                result = await _await(
-                    self.objective.benchmark(state, split="train", experiment_number=number)
+                result = await _invoke(
+                    self.objective.benchmark, state, split="train", experiment_number=number
                 )
             except (TransientProviderError, TimeoutError, ConnectionError) as exc:
                 raise SupervisorRecoverable("benchmark provider request is retryable") from exc
@@ -852,34 +919,58 @@ class AutonomousRunSupervisor:
         request: TrainingJobRequest | EvaluationJobRequest,
         kind: str,
     ) -> JobResult:
+        self._assert_lease(self._reload(state.run_id))
         expected_type = TrainingJobRequest if kind == "training" else EvaluationJobRequest
         if not isinstance(request, expected_type):
             raise SupervisorProviderFailure(f"{kind} request is invalid")
-        request_payload = asdict(request)
-        request_hash = canonical_request_hash(
-            {key: value for key, value in request_payload.items() if key != "job_name"}
-        )
         operation_key = canonical_operation_key(state.run_id, number, kind)
+        existing = self.repository.get_operation(state.run_id, operation_key)
+        if existing is not None and isinstance(existing.result.get("request"), Mapping):
+            try:
+                request = expected_type(**dict(existing.result["request"]))
+                if existing.request_digest is None:
+                    raise ValueError("persisted request digest is missing")
+            except Exception as exc:
+                raise SupervisorRecoverable("persisted provider request is invalid") from exc
+            request_hash = existing.request_digest
+            if (
+                canonical_request_hash(
+                    {key: value for key, value in asdict(request).items() if key != "job_name"}
+                )
+                != request_hash
+            ):
+                raise SupervisorRecoverable("persisted provider request digest mismatch")
+            deterministic_name = canonical_job_name(operation_key, request_hash)
+            if request.job_name != deterministic_name:
+                raise SupervisorRecoverable("persisted provider request identity is invalid")
+            operation = existing
+        else:
+            request_payload = asdict(request)
+            request_hash = canonical_request_hash(
+                {key: value for key, value in request_payload.items() if key != "job_name"}
+            )
+            deterministic_name = canonical_job_name(operation_key, request_hash)
+            operation = self.repository.put_operation_intent(
+                RunOperation(
+                    operation_key=operation_key,
+                    run_id=state.run_id,
+                    experiment_number=number,
+                    phase=phase,
+                    provider_name="sagemaker",
+                    request_digest=request_hash,
+                )
+            )
         deterministic_name = canonical_job_name(operation_key, request_hash)
         # The request factory supplies all mutable parameters; the supervisor
         # owns the final deterministic provider name so a retry/restart cannot
         # accidentally create a second job.
         request.job_name = deterministic_name
         request_payload = asdict(request)
-        operation = self.repository.put_operation_intent(
-            RunOperation(
-                operation_key=operation_key,
-                run_id=state.run_id,
-                experiment_number=number,
-                phase=phase,
-                provider_name="sagemaker",
-                request_digest=request_hash,
-            )
-        )
         if operation.status is RunOperationStatus.INTENT and not operation.result:
             # Persist the exact request before the provider side effect.  A
             # restarted worker can therefore inspect the intent and reconcile
             # the same deterministic job name without creating another job.
+            self._assert_lease(self._reload(state.run_id))
             self.repository.record_operation_result(
                 state.run_id,
                 operation_key,
@@ -889,10 +980,11 @@ class AutonomousRunSupervisor:
             operation = self.repository.get_operation(state.run_id, operation_key) or operation
         result: JobResult | None = None
         reconcile = getattr(self.provider, f"reconcile_{kind}", None)
+        stop_attempts = 0
         if operation.provider_id:
             try:
                 result = _require_job_result(
-                    await _await(getattr(self.provider, f"get_{kind}_status")(request.job_name))
+                    await _invoke(getattr(self.provider, f"get_{kind}_status"), request.job_name)
                 )
             except (TransientProviderError, TimeoutError, ConnectionError) as exc:
                 raise SupervisorRecoverable(f"provider {kind} status is retryable") from exc
@@ -900,7 +992,7 @@ class AutonomousRunSupervisor:
                 raise SupervisorProviderFailure(f"provider {kind} status failure") from exc
         elif callable(reconcile):
             try:
-                reconciled = await _await(reconcile(request))
+                reconciled = await _invoke(reconcile, request)
             except (TransientProviderError, TimeoutError, ConnectionError) as exc:
                 raise SupervisorRecoverable(f"provider {kind} reconciliation is retryable") from exc
             except Exception as exc:
@@ -913,7 +1005,7 @@ class AutonomousRunSupervisor:
             self._check_budget(state, kind)
             try:
                 result = _require_job_result(
-                    await _await(getattr(self.provider, f"submit_{kind}")(request))
+                    await _invoke(getattr(self.provider, f"submit_{kind}"), request)
                 )
             except (TransientProviderError, TimeoutError, ConnectionError) as exc:
                 raise SupervisorRecoverable(f"provider {kind} submission is retryable") from exc
@@ -921,6 +1013,7 @@ class AutonomousRunSupervisor:
                 raise
             except Exception as exc:
                 raise SupervisorProviderFailure(f"provider {kind} submission failure") from exc
+            self._assert_lease(self._reload(state.run_id))
             self.repository.record_operation_result(
                 state.run_id,
                 operation_key,
@@ -928,7 +1021,9 @@ class AutonomousRunSupervisor:
                 status=_operation_status(result.status),
                 result={
                     "job_name": result.job_name,
-                    "cost_usd": self._job_cost(result),
+                    "cost_usd": self._job_cost(
+                        result, fallback=self.phase_cost_estimates.get(kind, 0.0)
+                    ),
                 },
             )
         else:
@@ -943,7 +1038,12 @@ class AutonomousRunSupervisor:
                     operation_key,
                     provider_id=_safe_job_id(result),
                     status=_operation_status(result.status),
-                    result={"job_name": result.job_name, "cost_usd": self._job_cost(result)},
+                    result={
+                        "job_name": result.job_name,
+                        "cost_usd": self._job_cost(
+                            result, fallback=self.phase_cost_estimates.get(kind, 0.0)
+                        ),
+                    },
                 )
         current = self._reload(state.run_id)
         current_field = (
@@ -951,7 +1051,11 @@ class AutonomousRunSupervisor:
         )
         state = self._patch(current, {current_field: _safe_job_id(result)})
         if result.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.STOPPED}:
-            self._reconcile_cost(state, operation_key, self._job_cost(result))
+            self._reconcile_cost(
+                state,
+                operation_key,
+                self._job_cost(result, fallback=self.phase_cost_estimates.get(kind, 0.0)),
+            )
         self._emit(
             "job.submitted",
             state.run_id,
@@ -960,7 +1064,13 @@ class AutonomousRunSupervisor:
             job_id=_safe_job_id(result),
         )
         if result.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.STOPPED}:
-            self._emit_job_terminal(state.run_id, number, operation_key, result)
+            self._emit_job_terminal(
+                state.run_id,
+                number,
+                operation_key,
+                result,
+                cost_usd=self._job_cost(result, fallback=self.phase_cost_estimates.get(kind, 0.0)),
+            )
             return result
         for _ in range(self.max_polls):
             current = self._reload(state.run_id)
@@ -968,13 +1078,20 @@ class AutonomousRunSupervisor:
             if control.request_provider_stop:
                 stop_method = getattr(self.provider, f"stop_{kind}", None)
                 if callable(stop_method):
-                    await _await(stop_method(request.job_name))
+                    try:
+                        await _invoke(stop_method, request.job_name)
+                    except (TransientProviderError, TimeoutError, ConnectionError) as exc:
+                        stop_attempts += 1
+                        if stop_attempts >= 3:
+                            raise SupervisorRecoverable(
+                                f"provider {kind} stop is retryable"
+                            ) from exc
             if control.action.name in {"SAFE_STOP", "APPROVAL_EXPIRED"}:
                 # Drain the active provider job, but never submit a later phase.
                 pass
             try:
                 result = _require_job_result(
-                    await _await(getattr(self.provider, f"get_{kind}_status")(request.job_name))
+                    await _invoke(getattr(self.provider, f"get_{kind}_status"), request.job_name)
                 )
             except (TransientProviderError, TimeoutError, ConnectionError) as exc:
                 raise SupervisorRecoverable(f"provider {kind} status is retryable") from exc
@@ -986,34 +1103,60 @@ class AutonomousRunSupervisor:
                     RunOperationStatus.FAILED,
                     RunOperationStatus.CANCELLED,
                 }:
+                    self._assert_lease(self._reload(state.run_id))
                     self.repository.record_operation_result(
                         state.run_id,
                         operation_key,
                         provider_id=_safe_job_id(result),
                         status=_operation_status(result.status),
-                        result={"job_name": result.job_name, "cost_usd": self._job_cost(result)},
+                        result={
+                            "job_name": result.job_name,
+                            "cost_usd": self._job_cost(
+                                result, fallback=self.phase_cost_estimates.get(kind, 0.0)
+                            ),
+                        },
                     )
                 self._reconcile_cost(
-                    self._reload(state.run_id), operation_key, self._job_cost(result)
+                    self._reload(state.run_id),
+                    operation_key,
+                    self._job_cost(result, fallback=self.phase_cost_estimates.get(kind, 0.0)),
                 )
-                self._emit_job_terminal(state.run_id, number, operation_key, result)
+                self._emit_job_terminal(
+                    state.run_id,
+                    number,
+                    operation_key,
+                    result,
+                    cost_usd=self._job_cost(
+                        result, fallback=self.phase_cost_estimates.get(kind, 0.0)
+                    ),
+                )
                 return result
             if self.poll_interval_seconds:
                 await asyncio.sleep(self.poll_interval_seconds)
         raise SupervisorRecoverable("provider polling timed out")
 
     @staticmethod
-    def _job_cost(job: JobResult) -> float:
+    def _job_cost(job: JobResult, *, fallback: float | None = None) -> float:
         values = job.raw_response
         if not isinstance(values, Mapping):
-            return 0.0
+            if fallback is None:
+                raise SupervisorProviderFailure("provider cost evidence is unavailable")
+            return _finite_cost(fallback)
         for key in ("actual_cost_usd", "cost_usd", "cost"):
             if key in values:
                 return _finite_cost(values[key])
-        return 0.0
+        if fallback is None:
+            raise SupervisorProviderFailure("provider cost evidence is unavailable")
+        return _finite_cost(fallback)
 
     def _emit_job_terminal(
-        self, run_id: str, number: int, operation_key: str, result: JobResult
+        self,
+        run_id: str,
+        number: int,
+        operation_key: str,
+        result: JobResult,
+        *,
+        cost_usd: float,
     ) -> None:
         self._emit(
             "job.completed" if result.status is JobStatus.COMPLETED else "job.failed",
@@ -1021,7 +1164,7 @@ class AutonomousRunSupervisor:
             number,
             operation_key=operation_key,
             job_id=_safe_job_id(result),
-            cost_usd=self._job_cost(result),
+            cost_usd=cost_usd,
         )
 
     async def _control(
@@ -1079,6 +1222,11 @@ class AutonomousRunSupervisor:
     def _encode_evaluation_evidence(evidence: EvaluationEvidence) -> dict[str, Any]:
         return {
             "evaluation": evidence.evaluation.model_dump(mode="json"),
+            "champion_evaluation": (
+                evidence.champion_evaluation.model_dump(mode="json")
+                if evidence.champion_evaluation is not None
+                else None
+            ),
             "artifact_ids": list(evidence.artifact_ids),
             "cost_usd": _finite_cost(evidence.cost_usd),
         }
@@ -1086,20 +1234,20 @@ class AutonomousRunSupervisor:
     @staticmethod
     def _decode_evaluation_evidence(result: Mapping[str, Any]) -> EvaluationEvidence:
         try:
-            raw_artifacts = result["artifact_ids"]
-            if not isinstance(raw_artifacts, list) or any(
-                not isinstance(item, str) or not item.strip() for item in raw_artifacts
-            ):
-                raise TypeError("evaluation artifact references are invalid")
+            raw_artifacts = _reference_sequence(result["artifact_ids"], "evaluation artifact")
+            raw_champion = result["champion_evaluation"]
             return EvaluationEvidence(
                 evaluation=MultiRunEvaluation.model_validate(result["evaluation"]),
-                artifact_ids=tuple(raw_artifacts),
+                artifact_ids=raw_artifacts,
+                champion_evaluation=(
+                    MultiRunEvaluation.model_validate(raw_champion)
+                    if isinstance(raw_champion, Mapping)
+                    else None
+                ),
                 cost_usd=_finite_cost(result.get("cost_usd", 0.0)),
             )
         except SupervisorError:
             raise
-        except (TransientProviderError, TimeoutError, ConnectionError) as exc:
-            raise SupervisorRecoverable("dataset provider request is retryable") from exc
         except Exception as exc:
             raise SupervisorBlocked("durable evaluation evidence is invalid") from exc
 
@@ -1117,24 +1265,13 @@ class AutonomousRunSupervisor:
         try:
             if not isinstance(result, Mapping):
                 raise TypeError("benchmark result must be a mapping")
-            raw_refs = result["trajectory_refs"]
-            raw_artifacts = result["artifact_ids"]
-            if (
-                not isinstance(raw_refs, list)
-                or not raw_refs
-                or any(not isinstance(item, str) or not item.strip() for item in raw_refs)
-                or not isinstance(raw_artifacts, list)
-                or not raw_artifacts
-                or any(not isinstance(item, str) or not item.strip() for item in raw_artifacts)
-            ):
-                raise TypeError("benchmark references are invalid")
+            raw_refs = _reference_sequence(result["trajectory_refs"], "trajectory")
+            raw_artifacts = _reference_sequence(result["artifact_ids"], "artifact")
             evaluation = MultiRunEvaluation.model_validate(result["evaluation"])
-            refs = tuple(raw_refs)
-            artifacts = tuple(raw_artifacts)
             return BenchmarkEvidence(
                 evaluation=evaluation,
-                trajectory_refs=refs,
-                artifact_ids=artifacts,
+                trajectory_refs=raw_refs,
+                artifact_ids=raw_artifacts,
                 cost_usd=_finite_cost(result.get("cost_usd", 0.0)),
             )
         except SupervisorError:
@@ -1181,6 +1318,7 @@ class AutonomousRunSupervisor:
         )
 
     def _complete_promotion(self, run_id: str, operation_key: str) -> AutonomousRunState:
+        self._assert_lease(self._reload(run_id))
         operation = self.repository.get_operation(run_id, operation_key)
         if operation is None or not operation.result:
             raise SupervisorBlocked("promotion intent is incomplete")
@@ -1193,6 +1331,7 @@ class AutonomousRunSupervisor:
         if not any(
             item.experiment_number == record.experiment_number for item in state.experiments
         ):
+            self._assert_lease(self._reload(run_id))
             self.repository.add_experiment(run_id, record)
             state = self._reload(run_id)
         if bool(operation.result.get("promoted")):
@@ -1206,8 +1345,40 @@ class AutonomousRunSupervisor:
             candidate_artifact = operation.result.get("candidate_artifact_id")
             if not isinstance(candidate_artifact, str) or not candidate_artifact:
                 raise SupervisorBlocked("promoted checkpoint artifact is missing")
+            candidate_uri = operation.result.get("candidate_uri")
+            candidate_sha256 = operation.result.get("candidate_sha256")
+            candidate_manifest_sha256 = operation.result.get("candidate_manifest_sha256")
+            if (
+                not isinstance(candidate_uri, str)
+                or not isinstance(candidate_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", candidate_sha256)
+                or (
+                    candidate_manifest_sha256 is not None
+                    and (
+                        not isinstance(candidate_manifest_sha256, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", candidate_manifest_sha256)
+                    )
+                )
+            ):
+                raise SupervisorBlocked("promoted checkpoint provenance is incomplete")
             # Candidate URI/SHA are kept in the phase fields.  Recovery retains
             # the already persisted values if a crash occurred after patching.
+            metadata = {
+                **state.metadata,
+                "champion_evaluation_b64": self._encode_evaluation(candidate),
+                "champion_checkpoint_artifact_id": candidate_artifact,
+            }
+            candidate_artifact_sha256 = operation.result.get("candidate_artifact_sha256")
+            if isinstance(candidate_artifact_sha256, str) and re.fullmatch(
+                r"[0-9a-f]{64}", candidate_artifact_sha256
+            ):
+                metadata["champion_checkpoint_artifact_sha256"] = candidate_artifact_sha256
+            else:
+                metadata.pop("champion_checkpoint_artifact_sha256", None)
+            if isinstance(candidate_manifest_sha256, str):
+                metadata["champion_checkpoint_manifest_sha256"] = candidate_manifest_sha256
+            else:
+                metadata.pop("champion_checkpoint_manifest_sha256", None)
             state = self._patch(
                 state,
                 {
@@ -1216,16 +1387,14 @@ class AutonomousRunSupervisor:
                         **candidate.environment_scores,
                     },
                     "champion_artifact_ids": tuple(artifact_ids),
-                    "champion_checkpoint_uri": operation.result.get("candidate_uri"),
-                    "champion_checkpoint_sha256": operation.result.get("candidate_sha256"),
-                    "metadata": {
-                        **state.metadata,
-                        "champion_evaluation_b64": self._encode_evaluation(candidate),
-                    },
+                    "champion_checkpoint_uri": candidate_uri,
+                    "champion_checkpoint_sha256": candidate_sha256,
+                    "metadata": metadata,
                 },
             )
         terminal = self.repository.get_operation(run_id, operation_key)
         if terminal is not None and terminal.status is RunOperationStatus.INTENT:
+            self._assert_lease(self._reload(run_id))
             self.repository.record_operation_result(
                 run_id,
                 operation_key,
@@ -1245,7 +1414,9 @@ class AutonomousRunSupervisor:
     async def _run_dataset(
         self, state: AutonomousRunState, plan: CuratedDatasetPlan, number: int
     ) -> DatasetArtifact:
+        self._assert_lease(self._reload(state.run_id))
         operation_key = canonical_operation_key(state.run_id, number, "dataset")
+        self._assert_lease(self._reload(state.run_id))
         request_digest = canonical_request_hash(plan.model_dump(mode="json"))
         operation = self.repository.put_operation_intent(
             RunOperation(
@@ -1259,16 +1430,24 @@ class AutonomousRunSupervisor:
         )
         if operation.status is RunOperationStatus.SUCCEEDED:
             return self._decode_dataset(operation.result)
+        control = await self._control(self._reload(state.run_id), active_provider_job=False)
+        if control.should_stop:
+            raise SupervisorControlStop(control.action)
         self._check_budget(state, "dataset")
         try:
-            dataset = await _await(
-                self.objective.build_dataset(state, plan, experiment_number=number)
+            dataset = await _invoke(
+                self.objective.build_dataset, state, plan, experiment_number=number
             )
-            dataset = await _await(
-                self.objective.verify_dataset(
-                    dataset, run_id=state.run_id, experiment_number=number
-                )
+            control = await self._control(self._reload(state.run_id), active_provider_job=False)
+            if control.should_stop:
+                raise SupervisorControlStop(control.action)
+            dataset = await _invoke(
+                self.objective.verify_dataset,
+                dataset,
+                run_id=state.run_id,
+                experiment_number=number,
             )
+            dataset = cast(DatasetArtifact, dataset)
         except SupervisorError:
             raise
         except Exception as exc:
@@ -1290,19 +1469,91 @@ class AutonomousRunSupervisor:
         return dataset
 
     def _transition(
-        self, state: AutonomousRunState, status: AutonomousRunStatus, phase: RunPhase, reason: str
+        self,
+        state: AutonomousRunState,
+        status: AutonomousRunStatus,
+        phase: RunPhase,
+        reason: str,
+        *,
+        use_telemetry: bool = True,
     ) -> AutonomousRunState:
+        self._assert_lease(state)
+        telemetry = self.telemetry if use_telemetry else None
+        run_number = max(1, state.current_experiment_number or len(state.experiments) + 1)
+        experiment_id = f"{state.run_id}:{run_number}"
+        terminal_events = {
+            AutonomousRunStatus.SUCCEEDED: AutonomousEventType.RUN_COMPLETED,
+            AutonomousRunStatus.FAILED: AutonomousEventType.RUN_FAILED,
+            AutonomousRunStatus.BLOCKED: AutonomousEventType.RUN_BLOCKED,
+            AutonomousRunStatus.CANCELLED: AutonomousEventType.RUN_CANCELLED,
+            AutonomousRunStatus.STOPPED: AutonomousEventType.RUN_STOPPED,
+        }
+        event_type = terminal_events.get(status)
+        if event_type is None and status is AutonomousRunStatus.RUNNING and phase != state.phase:
+            event_type = AutonomousEventType.PHASE_STARTED
+
+        if telemetry is not None and phase != state.phase and state.phase in {
+            RunPhase.BASELINE,
+            RunPhase.FAILURE_ANALYSIS,
+            RunPhase.RESEARCH,
+            RunPhase.CURATION,
+            RunPhase.TRAINING,
+            RunPhase.CHECKPOINT_VALIDATION,
+            RunPhase.EVALUATION,
+            RunPhase.PROMOTION,
+        }:
+            exit_event = (
+                AutonomousEventType.PHASE_COMPLETED
+                if status in {AutonomousRunStatus.RUNNING, AutonomousRunStatus.SUCCEEDED}
+                else AutonomousEventType.PHASE_FAILED
+            )
+            self._emit(
+                exit_event.value,
+                state.run_id,
+                run_number,
+                phase=state.phase.value,
+                status=state.status.value,
+            )
+            state = self._reload(state.run_id)
+            self._assert_lease(state)
+
+        if telemetry is not None and event_type is not None:
+            try:
+                return telemetry.transition(
+                    event_type,
+                    run_id=state.run_id,
+                    expected_version=state.version,
+                    status=status,
+                    phase=phase,
+                    reason=reason,
+                    run_number=run_number,
+                    experiment_id=experiment_id,
+                    telemetry_status=status.value,
+                )
+            except (DurableTelemetryError, ValueError) as exc:
+                raise SupervisorTelemetryFailure("durable telemetry failure") from exc
         return self.repository.transition(
             state.run_id, expected_version=state.version, status=status, phase=phase, reason=reason
         )
 
     def _patch(self, state: AutonomousRunState, updates: Mapping[str, Any]) -> AutonomousRunState:
+        self._assert_lease(state)
         return self.repository.update_state(
             state.run_id, expected_version=state.version, updates=updates
         )
 
+    def _assert_lease(self, state: AutonomousRunState) -> None:
+        if self.owner is not None and state.lease_owner != self.owner:
+            raise SupervisorRecoverable("dispatcher lease ownership lost")
+
     def _finish(
-        self, state: AutonomousRunState, reason: str, action: Any, *, blocked: bool = False
+        self,
+        state: AutonomousRunState,
+        reason: str,
+        action: Any,
+        *,
+        blocked: bool = False,
+        skip_telemetry: bool = False,
     ) -> AutonomousRunState:
         if state.status in {
             AutonomousRunStatus.SUCCEEDED,
@@ -1338,7 +1589,9 @@ class AutonomousRunSupervisor:
             AutonomousRunStatus.CANCELLED: "run cancelled",
             AutonomousRunStatus.STOPPED: "run stopped",
         }[status]
-        return self._transition(state, status, phase, transition_reason)
+        return self._transition(
+            state, status, phase, transition_reason, use_telemetry=not skip_telemetry
+        )
 
     def _champion_evaluation(self, run_id: str, state: AutonomousRunState) -> MultiRunEvaluation:
         encoded = state.metadata.get("champion_evaluation_b64")
@@ -1352,9 +1605,29 @@ class AutonomousRunSupervisor:
         raise SupervisorBlocked("champion evidence unavailable")
 
     @staticmethod
-    def _dataset_refs(state: AutonomousRunState) -> tuple[str, ...]:
-        ref = state.metadata.get("dataset_artifact_ref")
-        return (ref,) if isinstance(ref, str) and ref else ()
+    def _agent_evidence_metadata(
+        benchmark: BenchmarkEvidence, *, run_id: str, experiment_number: int
+    ) -> dict[str, dict[str, Any]]:
+        """Build handoff metadata only from the verified benchmark operation result."""
+
+        evidence = benchmark.evaluation.evidence
+        evidence_class = evidence.label.value
+        if not evidence.verified or evidence_class not in {"LIVE", "PRIOR_VERIFIED_RUN"}:
+            raise SupervisorBlocked("agent handoff requires verified benchmark evidence")
+        refs = _reference_sequence(benchmark.trajectory_refs, "trajectory")
+        if len(set(refs)) != len(refs):
+            raise SupervisorBlocked("benchmark evidence contains duplicate trajectory references")
+        return {
+            ref: {
+                "verified": True,
+                "run_id": run_id,
+                "experiment_number": experiment_number,
+                # The trajectory reference itself is the persisted measurement identity.
+                "measurement_id": ref,
+                "evidence_class": evidence_class,
+            }
+            for ref in refs
+        }
 
     @staticmethod
     def _validate_benchmark(
@@ -1370,9 +1643,9 @@ class AutonomousRunSupervisor:
         ):
             raise SupervisorBlocked("benchmark evidence is not verified")
         if (
-            not result.evaluation.run_id
-            or run_id not in result.evaluation.run_id
+            not _exact_run_identity(result.evaluation.run_id, run_id)
             or result.evaluation.evidence.manifest_sha256 is None
+            or result.evaluation.run_number != max(0, number - 1)
         ):
             raise SupervisorBlocked("benchmark provenance is incomplete")
         if (
@@ -1389,8 +1662,8 @@ class AutonomousRunSupervisor:
                 or evidence.model_id != state.model_id
             ):
                 raise SupervisorBlocked("benchmark provenance does not match run scope")
-        if not result.trajectory_refs or not result.artifact_ids:
-            raise SupervisorBlocked("benchmark artifacts are missing")
+        _reference_sequence(result.trajectory_refs, "trajectory")
+        _reference_sequence(result.artifact_ids, "artifact")
         _finite_cost(result.cost_usd)
 
     @staticmethod
@@ -1414,6 +1687,19 @@ class AutonomousRunSupervisor:
             or not re.fullmatch(r"[0-9a-f]{64}", candidate.sha256)
         ):
             raise SupervisorBlocked("checkpoint artifact is incomplete")
+        AutonomousRunSupervisor._checkpoint_manifest_sha256(candidate)
+
+    @staticmethod
+    def _checkpoint_manifest_sha256(candidate: object) -> str | None:
+        """Return only a verifier-supplied inner manifest digest, if available."""
+
+        manifest_sha256 = getattr(candidate, "manifest_sha256", None)
+        if manifest_sha256 is not None and (
+            not isinstance(manifest_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256)
+        ):
+            raise SupervisorBlocked("checkpoint manifest digest is invalid")
+        return manifest_sha256
 
     @staticmethod
     def _validate_evaluation(
@@ -1423,16 +1709,31 @@ class AutonomousRunSupervisor:
         run_id: str | None = None,
         state: AutonomousRunState | None = None,
     ) -> None:
+        champion = evidence.champion_evaluation
         if (
-            evidence.evaluation.run_number != number
+            evidence.evaluation.run_number < 1
+            or evidence.evaluation.run_number > (state.max_experiments if state else 5)
             or not evidence.evaluation.evidence.verified
             or evidence.evaluation.evidence.label.value not in {"LIVE", "PRIOR_VERIFIED_RUN"}
             or evidence.evaluation.evidence.benchmark_id != "service-recovery-v1"
             or evidence.evaluation.evidence.suite != "AgentGym/AgentEval"
             or evidence.evaluation.evidence.suite_version != "agent-eval-v1"
+            or champion is None
+            or not champion.evidence.verified
+            or champion.evidence.label.value not in {"LIVE", "PRIOR_VERIFIED_RUN"}
+            or evidence.evaluation.champion_run_id != champion.run_id
+            or evidence.evaluation.run_number != champion.run_number + 1
+            or (run_id is not None and not _exact_run_identity(champion.run_id, run_id))
         ):
             raise SupervisorBlocked("evaluation evidence is not verified")
-        if run_id is not None and run_id not in evidence.evaluation.run_id:
+        candidate_evidence = evidence.evaluation.evidence
+        champion_evidence = champion.evidence if champion is not None else None
+        if champion_evidence is None or any(
+            getattr(candidate_evidence, field) != getattr(champion_evidence, field)
+            for field in ("manifest_sha256", "seed", "model_id", "suite", "suite_version")
+        ):
+            raise SupervisorBlocked("paired champion/candidate provenance does not match")
+        if run_id is not None and not _exact_run_identity(evidence.evaluation.run_id, run_id):
             raise SupervisorBlocked("evaluation evidence belongs to another run")
         if state is not None:
             signed = evidence.evaluation.evidence
@@ -1442,6 +1743,7 @@ class AutonomousRunSupervisor:
                 or signed.model_id != state.model_id
             ):
                 raise SupervisorBlocked("evaluation provenance does not match run scope")
+        _reference_sequence(evidence.artifact_ids, "evaluation artifact")
         _finite_cost(evidence.cost_usd)
 
     def _emit(self, event_type: str, run_id: str, number: int, **kwargs: Any) -> None:
@@ -1449,6 +1751,15 @@ class AutonomousRunSupervisor:
             return
         try:
             reason = {
+                "run.started": "run started",
+                "run.completed": "run completed",
+                "run.failed": "run failed",
+                "run.blocked": "run blocked",
+                "run.cancelled": "run cancelled",
+                "run.stopped": "run stopped",
+                "phase.started": "phase started",
+                "phase.completed": "phase completed",
+                "phase.failed": "phase failed",
                 "job.submitted": "job submitted",
                 "job.completed": "job completed",
                 "job.failed": "job failed",
@@ -1466,7 +1777,7 @@ class AutonomousRunSupervisor:
                 phase=kwargs.pop("phase", self._reload(run_id).phase.value),
                 **kwargs,
             )
-        except DurableTelemetryError as exc:
+        except (DurableTelemetryError, ValueError) as exc:
             raise SupervisorTelemetryFailure("durable telemetry failure") from exc
         except Exception:
             return

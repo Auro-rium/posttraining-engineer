@@ -16,12 +16,12 @@ import os
 import re
 import time
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from math import isfinite
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast
 from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -114,10 +114,19 @@ class ApprovalPacket(BaseModel):
     # Defaults preserve the low-level signing helper for generic packets;
     # controller validation rejects empty provenance values for execution.
     target_model: str = ""
+    benchmark_id: str = "service-recovery-v1"
     objective_suite: str = ""
     objective_suite_version: str = ""
     seed: int = 0
     reasoning_model_id: str = ""
+    # Benchmark cardinality is part of the cost/evidence envelope.  Defaults
+    # retain compatibility for low-level signing callers; live construction
+    # always fills these from the immutable deployment configuration.
+    baseline_episodes: int = Field(default=10, ge=1)
+    held_out_episodes: int = Field(default=15, ge=1)
+    # The URI is included when the API prepares a production packet.  It is
+    # optional only for generic packet tests and legacy signing helpers.
+    checkpoint_s3_uri: str = ""
     manifest_sha256: str
     checkpoint_sha256: str
     issued_at: datetime
@@ -158,12 +167,33 @@ class ApprovalPacket(BaseModel):
             raise ValueError("approval hashes must be lowercase 64-character SHA-256 digests")
         return value
 
+    @field_validator("checkpoint_s3_uri")
+    @classmethod
+    def validate_checkpoint_uri(cls, value: str) -> str:
+        if value:
+            parsed = urlparse(value)
+            if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+                raise ValueError("checkpoint_s3_uri must be an s3:// URI")
+        return value
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def require_aware_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("approval timestamps must include a timezone")
+        return value.astimezone(UTC)
+
     @model_validator(mode="after")
     def validate_window(self) -> ApprovalPacket:
         if self.packet_version != "v1":
             raise ValueError("unsupported approval packet version")
         if self.expires_at <= self.issued_at:
             raise ValueError("approval expiry must be after issuance")
+        now = datetime.now(UTC)
+        if self.issued_at > now + timedelta(seconds=30):
+            raise ValueError("approval issuance cannot be in the future")
+        if self.expires_at - self.issued_at > timedelta(days=1):
+            raise ValueError("approval expiry window is too long")
         return self
 
     def canonical_bytes(self) -> bytes:
@@ -269,12 +299,11 @@ class LiveExecutionConfig(BaseModel):
     training_image: str
     evaluation_image: str
     objective_worker_url: str
-    objective_worker_auth_token: str | None = Field(
-        default=None, repr=False, exclude=True
-    )
+    objective_worker_auth_token: str | None = Field(default=None, repr=False, exclude=True)
     hf_repo_id: str
     hf_revision: str
     target_model: str = "google/functiongemma-270m-it"
+    benchmark_id: str = "service-recovery-v1"
     objective_suite: str = "AgentGym/AgentEval"
     objective_suite_version: str = "agent-eval-v1"
     seed: int = 7
@@ -368,8 +397,10 @@ class LiveExecutionConfig(BaseModel):
     @model_validator(mode="after")
     def validate_cost_ceiling(self) -> LiveExecutionConfig:
         runtime_hours = self.max_runtime_seconds / 3600
-        worst_case = self.max_runs * runtime_hours * (
-            self.training_hourly_cost_usd + self.evaluation_hourly_cost_usd
+        worst_case = (
+            self.max_runs
+            * runtime_hours
+            * (self.training_hourly_cost_usd + self.evaluation_hourly_cost_usd)
         )
         if worst_case > self.max_cost_usd:
             raise ValueError(
@@ -543,6 +574,18 @@ class PreflightRunner:
         )
         checks.append(
             self._check(
+                "sagemaker_training_input",
+                lambda: self._check_input_readiness("training"),
+            )
+        )
+        checks.append(
+            self._check(
+                "sagemaker_evaluation_input",
+                lambda: self._check_input_readiness("evaluation"),
+            )
+        )
+        checks.append(
+            self._check(
                 "pinned_checkpoint_artifact",
                 lambda: self._check_checkpoint_readiness(),
             )
@@ -566,6 +609,7 @@ class PreflightRunner:
                 lambda: self._check_worker_readiness(),
             )
         )
+        checks.append(self._check_approval_secret())
         checks.append(
             CheckResult(
                 name="cost_ceiling",
@@ -594,9 +638,7 @@ class PreflightRunner:
             )
         )
         classification = (
-            blocked_classifications[0]
-            if blocked_classifications
-            else PreflightClassification.READY
+            blocked_classifications[0] if blocked_classifications else PreflightClassification.READY
         )
         status = (
             PreflightStatus.READY
@@ -614,6 +656,25 @@ class PreflightRunner:
             gpu_instance_allowlist=self.config.gpu_instance_allowlist,
             gpu_quota_status=self._gpu_quota_status,
             gpu_capacity_status=self._gpu_capacity_status,
+        )
+
+    def _check_approval_secret(self) -> CheckResult:
+        """Require the one-run approval secret without exposing its value."""
+
+        secret_name = self.config.approval_secret_env
+        secret = os.getenv(secret_name, "")
+        if not secret:
+            return CheckResult(
+                name="approval_secret",
+                status=CheckStatus.BLOCKED,
+                detail="approval secret is not configured",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        return CheckResult(
+            name="approval_secret",
+            status=CheckStatus.PASSED,
+            detail="approval secret is configured",
+            metadata={"binding": "HMAC-SHA256"},
         )
 
     def _check_hugging_face(self) -> CheckResult:
@@ -637,7 +698,11 @@ class PreflightRunner:
 
     def _check_s3_readiness(self) -> Mapping[str, Any]:
         client = self._client("s3")
-        client.head_bucket(Bucket=self.config.artifact_bucket)
+        # Do not call HeadBucket here: it requires s3:ListBucket without a
+        # prefix condition, while the deployed coordinator role deliberately
+        # grants only prefix-scoped ListBucket access. The bucket-scoped
+        # location, encryption, and versioning probes below establish the
+        # required bucket properties without widening that IAM policy.
         location = client.get_bucket_location(Bucket=self.config.artifact_bucket).get(
             "LocationConstraint"
         )
@@ -678,6 +743,55 @@ class PreflightRunner:
             "encryption": sorted(supported_encryption)[0],
             "versioning": "Enabled",
         }
+
+    def _check_input_readiness(self, split: str) -> Mapping[str, Any]:
+        """Verify the configured SageMaker input prefix exists and is readable."""
+
+        input_fields = {
+            "training": "training_input_s3_uri",
+            "evaluation": "evaluation_input_s3_uri",
+        }
+        field_name = input_fields.get(split)
+        if field_name is None:
+            raise ValueError("unsupported SageMaker input split")
+        uri = str(getattr(self.config, field_name))
+        parsed = urlparse(uri)
+        expected_prefix = self.config.artifact_prefix.strip("/")
+        path = parsed.path.strip("/")
+        if (
+            parsed.scheme != "s3"
+            or parsed.netloc != self.config.artifact_bucket
+            or not path
+            or parsed.query
+            or parsed.fragment
+            or ".." in path.split("/")
+            or not expected_prefix
+            or not path.startswith(f"{expected_prefix}/")
+        ):
+            raise LiveExecutionBlocked(
+                f"{split} input must use the configured artifact bucket and prefix",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+
+        prefix = path.rstrip("/") + "/"
+        response = self._client("s3").list_objects_v2(
+            Bucket=self.config.artifact_bucket,
+            Prefix=prefix,
+            MaxKeys=1,
+        )
+        contents = response.get("Contents", [])
+        if not isinstance(contents, list) or not any(
+            isinstance(item, Mapping)
+            and isinstance(item.get("Key"), str)
+            and type(item.get("Size")) is int
+            and item["Size"] > 0
+            for item in contents
+        ):
+            raise LiveExecutionBlocked(
+                f"{split} input prefix is empty",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        return {"status": "available"}
 
     def _check_checkpoint_readiness(self) -> Mapping[str, Any]:
         uri = self.config.checkpoint_s3_uri
@@ -729,9 +843,7 @@ class PreflightRunner:
         }
 
     def _check_bedrock_readiness(self) -> Mapping[str, Any]:
-        response = self._client("bedrock").get_foundation_model(
-            modelIdentifier=NEMOTRON_MODEL_ID
-        )
+        response = self._client("bedrock").get_foundation_model(modelIdentifier=NEMOTRON_MODEL_ID)
         if not isinstance(response, Mapping):
             raise ValueError("Bedrock catalog returned an invalid response")
         summary = response.get("modelDetails", {})
@@ -754,7 +866,22 @@ class PreflightRunner:
         table = description.get("Table", {})
         if table.get("TableStatus") != "ACTIVE":
             raise ValueError("DynamoDB table is not ACTIVE")
-        return {"table": self.config.dynamodb_table, "status": str(table.get("TableStatus"))}
+        raw_schema = table.get("KeySchema", [])
+        schema = {
+            str(item.get("AttributeName", "")): str(item.get("KeyType", ""))
+            for item in raw_schema
+            if isinstance(item, Mapping)
+        } if isinstance(raw_schema, list) else {}
+        if schema != {"pk": "HASH", "sk": "RANGE"} or len(raw_schema) != 2:
+            raise LiveExecutionBlocked(
+                "DynamoDB table key schema must use pk HASH and sk RANGE",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        return {
+            "table": self.config.dynamodb_table,
+            "status": str(table.get("TableStatus")),
+            "key_schema": "pk/sk",
+        }
 
     def _check_sagemaker_readiness(self) -> Mapping[str, Any]:
         identity = self._client("sts").get_caller_identity()
@@ -773,7 +900,44 @@ class PreflightRunner:
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
         role_name = self.config.training_role_arn.split(":role/", 1)[1]
-        self._client("iam").get_role(RoleName=role_name)
+        role_response = self._client("iam").get_role(RoleName=role_name)
+        role = role_response.get("Role", {})
+        assume_policy = (
+            role.get("AssumeRolePolicyDocument", {}) if isinstance(role, Mapping) else {}
+        )
+        statements = (
+            assume_policy.get("Statement", []) if isinstance(assume_policy, Mapping) else []
+        )
+        if isinstance(statements, Mapping):
+            statements = [statements]
+        trust_verified = False
+        if isinstance(statements, list):
+            for statement in statements:
+                if not isinstance(statement, Mapping) or statement.get("Effect") != "Allow":
+                    continue
+                actions = statement.get("Action", [])
+                if isinstance(actions, str):
+                    actions = [actions]
+                principal = statement.get("Principal", {})
+                services = principal.get("Service", []) if isinstance(principal, Mapping) else []
+                if isinstance(services, str):
+                    services = [services]
+                if (
+                    isinstance(actions, list)
+                    and "sts:AssumeRole" in actions
+                    and isinstance(services, list)
+                    and any(
+                        service in {"sagemaker.amazonaws.com", "sagemaker.amazonaws.com.cn"}
+                        for service in services
+                    )
+                ):
+                    trust_verified = True
+                    break
+        if not trust_verified:
+            raise LiveExecutionBlocked(
+                "SageMaker training role lacks the required SageMaker service trust",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
         ecr = self._client("ecr")
         for image in (self.config.training_image, self.config.evaluation_image):
             image_match = re.match(
@@ -939,12 +1103,38 @@ class PreflightRunner:
             "healthy",
         }:
             raise ValueError("objective worker did not report ready")
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            readiness = _http_json(
+                urljoin(self.config.objective_worker_url, "v1/readiness"),
+                method="GET",
+                timeout=self.config.preflight_timeout_seconds,
+                headers=headers,
+            )
+        except Exception as exc:
+            raise LiveExecutionBlocked(
+                "objective worker execution readiness could not be verified",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            ) from exc
+        capabilities = readiness.get("capabilities", {}) if isinstance(readiness, Mapping) else {}
+        if (
+            not isinstance(readiness, Mapping)
+            or readiness.get("status") != "ready"
+            or readiness.get("service") != "objective-worker"
+            or not isinstance(capabilities, Mapping)
+            or capabilities.get("benchmark") is not True
+            or capabilities.get("verify-curation") is not True
+        ):
+            raise LiveExecutionBlocked(
+                "objective worker execution readiness is incomplete",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
         _verify_objective_worker_auth(
             self.config.objective_worker_url,
             timeout=self.config.preflight_timeout_seconds,
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
         )
-        return {"endpoint": "configured", "status": "ready"}
+        return {"endpoint": "configured", "status": "ready", "capabilities": "verified"}
 
 
 def _http_json(
@@ -1051,37 +1241,55 @@ class ObjectiveWorkerClient:
             raise LiveExecutionFailed("objective worker returned a non-object benchmark response")
         return ObjectiveBenchmarkResult.model_validate(response)
 
-    def evaluate(
+    def verify_curation(
         self,
         *,
-        model_uri: str,
         run_id: str,
-        split: str,
-        episodes: int,
-        output_s3_uri: str,
-        suite: str = "AgentGym/AgentEval",
-        suite_version: str = "agent-eval-v1",
-        seed: int = 7,
-    ) -> ObjectiveBenchmarkResult:
+        experiment_id: str,
+        trajectory_references: Sequence[Any],
+    ) -> Mapping[str, Any]:
+        """Ask the isolated objective worker to replay and admit a dataset."""
+
+        from app.objective.models import ObjectiveSplit, TrajectoryReference
+
+        try:
+            references = tuple(
+                item
+                if isinstance(item, TrajectoryReference)
+                else TrajectoryReference.model_validate(item)
+                for item in trajectory_references
+            )
+        except Exception as exc:
+            raise LiveExecutionFailed(
+                "objective curation received malformed trajectory provenance"
+            ) from exc
+        if not references:
+            raise LiveExecutionFailed("objective curation requires selected trajectory references")
+        splits = {reference.split for reference in references}
+        if len(splits) != 1 or not splits.issubset(
+            {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}
+        ):
+            raise LiveExecutionFailed("objective curation requires one allowed train/replay split")
+        if any(not reference.verified for reference in references):
+            raise LiveExecutionFailed("objective curation requires verifier-confirmed references")
+
         response = _http_json(
-            urljoin(self.base_url, "v1/evaluate"),
+            urljoin(self.base_url, "v1/verify-curation"),
             method="POST",
             timeout=self.timeout_seconds,
             headers=self._headers(),
             payload={
                 "run_id": run_id,
-                "model_uri": model_uri,
-                "suite": suite,
-                "suite_version": suite_version,
-                "seed": seed,
-                "num_episodes": episodes,
-                "split": split,
-                "output_s3_uri": output_s3_uri,
+                "experiment_id": experiment_id,
+                "split": references[0].split.value,
+                "trajectory_references": [
+                    reference.model_dump(mode="json") for reference in references
+                ],
             },
         )
         if not isinstance(response, Mapping):
-            raise LiveExecutionFailed("objective worker returned a non-object evaluation response")
-        return ObjectiveBenchmarkResult.model_validate(response)
+            raise LiveExecutionFailed("objective worker returned a non-object curation response")
+        return response
 
 
 class RunSlotStore(Protocol):
@@ -1288,12 +1496,14 @@ class AutonomousRunController:
             )
             training_job = self.provider.submit_training(training_request)
             self._require_provider_id(training_job, "training")
-            job_metadata_artifacts.append(self._persist_job_metadata(
-                run_id,
-                phase="training",
-                job=training_job,
-                manifest_sha256=manifest_sha256,
-            ))
+            job_metadata_artifacts.append(
+                self._persist_job_metadata(
+                    run_id,
+                    phase="training",
+                    job=training_job,
+                    manifest_sha256=manifest_sha256,
+                )
+            )
             self._event(
                 EventType.JOB_SUBMITTED,
                 run_id,
@@ -1336,12 +1546,14 @@ class AutonomousRunController:
             )
             evaluation_job = self.provider.submit_evaluation(evaluation_request)
             self._require_provider_id(evaluation_job, "evaluation")
-            job_metadata_artifacts.append(self._persist_job_metadata(
-                run_id,
-                phase="evaluation",
-                job=evaluation_job,
-                manifest_sha256=manifest_sha256,
-            ))
+            job_metadata_artifacts.append(
+                self._persist_job_metadata(
+                    run_id,
+                    phase="evaluation",
+                    job=evaluation_job,
+                    manifest_sha256=manifest_sha256,
+                )
+            )
             self._event(
                 EventType.JOB_SUBMITTED,
                 run_id,
@@ -1488,9 +1700,7 @@ class AutonomousRunController:
             status=RunStatus.FAILED,
             manifest_sha256=manifest_sha256,
             artifact_refs=tuple(
-                item
-                for item in (manifest_artifact, *job_metadata_artifacts)
-                if item is not None
+                item for item in (manifest_artifact, *job_metadata_artifacts) if item is not None
             ),
             decision_reasons=("live execution failed before verified evidence",),
         )
@@ -1582,10 +1792,14 @@ class AutonomousRunController:
             max_experiments=self.config.max_runs,
             max_cost_usd=self.config.max_cost_usd,
             target_model=self.config.target_model,
+            benchmark_id=self.config.benchmark_id,
             objective_suite=self.config.objective_suite,
             objective_suite_version=self.config.objective_suite_version,
             seed=self.config.seed,
             reasoning_model_id=NEMOTRON_MODEL_ID,
+            baseline_episodes=self.config.baseline_episodes,
+            held_out_episodes=self.config.held_out_episodes,
+            checkpoint_s3_uri=checkpoint_uri,
             manifest_sha256=manifest_sha256,
             checkpoint_sha256=checkpoint_sha256,
             issued_at=now,
@@ -1629,6 +1843,7 @@ class AutonomousRunController:
             "parent_run_id": parent_run_id,
             "champion_run_id": champion_run_id,
             "target_model": self.config.target_model,
+            "benchmark_id": self.config.benchmark_id,
             "hf_repo_id": self.config.hf_repo_id,
             "hf_revision": self.config.hf_revision,
             "checkpoint_sha256": checkpoint_sha256,
@@ -1638,6 +1853,8 @@ class AutonomousRunController:
             "suite": self.config.objective_suite,
             "suite_version": self.config.objective_suite_version,
             "seed": self.config.seed,
+            "baseline_episodes": self.config.baseline_episodes,
+            "held_out_episodes": self.config.held_out_episodes,
             "model_reasoning_id": NEMOTRON_MODEL_ID,
             "training_role_arn": self.config.training_role_arn,
             "training_image": self.config.training_image,
@@ -1650,9 +1867,7 @@ class AutonomousRunController:
             "max_cost_usd": self.config.max_cost_usd,
         }
 
-    def _validate_approval_packet(
-        self, packet: ApprovalPacket, preflight: PreflightReport
-    ) -> None:
+    def _validate_approval_packet(self, packet: ApprovalPacket, preflight: PreflightReport) -> None:
         if packet.instance_type != self.config.instance_type:
             raise LiveExecutionBlocked("approval packet GPU instance does not match configuration")
         if packet.instance_count != self.config.instance_count:
@@ -1673,14 +1888,37 @@ class AutonomousRunController:
             )
         if (
             packet.target_model != self.config.target_model
+            or packet.benchmark_id != self.config.benchmark_id
             or packet.objective_suite != self.config.objective_suite
             or packet.objective_suite_version != self.config.objective_suite_version
             or packet.seed != self.config.seed
             or packet.reasoning_model_id != NEMOTRON_MODEL_ID
+            or packet.baseline_episodes != self.config.baseline_episodes
+            or packet.held_out_episodes != self.config.held_out_episodes
         ):
             raise LiveExecutionBlocked(
                 "approval packet benchmark provenance does not match configuration"
             )
+        if not packet.checkpoint_s3_uri:
+            raise LiveExecutionBlocked("approval packet checkpoint URI is required")
+        checkpoint_uri = urlparse(packet.checkpoint_s3_uri)
+        if (
+            checkpoint_uri.scheme != "s3"
+            or not checkpoint_uri.netloc
+            or not checkpoint_uri.path.strip("/")
+            or not parse_qs(checkpoint_uri.query).get("versionId", [""])[0]
+            or packet.checkpoint_s3_uri != self._checkpoint_uri()
+        ):
+            raise LiveExecutionBlocked("approval packet checkpoint URI is not version pinned")
+        now = datetime.now(UTC)
+        if packet.issued_at > now + timedelta(seconds=30):
+            raise LiveExecutionBlocked("approval packet issuance is in the future")
+        if packet.expires_at <= now:
+            raise LiveExecutionBlocked("approval packet is expired")
+        if packet.expires_at - packet.issued_at > timedelta(
+            seconds=self.config.approval_ttl_seconds
+        ):
+            raise LiveExecutionBlocked("approval packet expiry exceeds configured approval window")
         if preflight.gpu_capacity_status is not GpuCapacityStatus.VERIFIED_BY_QUOTA:
             raise LiveExecutionBlocked("GPU quota/capacity is not verified for this run")
 
@@ -1703,6 +1941,10 @@ class AutonomousRunController:
         output_s3_uri: str,
         manifest_sha256: str,
     ) -> ObjectiveBenchmarkResult:
+        if split not in {"train", "replay"}:
+            raise LiveExecutionFailed(
+                "sealed baseline/candidate comparisons must use the paired evaluator"
+            )
         request = ObjectiveBenchmarkRequest(
             run_id=run_id,
             model_uri=model_uri,
@@ -1710,7 +1952,7 @@ class AutonomousRunController:
             suite_version=self.config.objective_suite_version,
             seed=self.config.seed,
             num_episodes=episodes,
-            split=split,
+            split=cast(Literal["train", "replay"], split),
             output_s3_uri=output_s3_uri,
         )
         result = execute_objective_benchmark(self.objective_worker, request)
@@ -1719,13 +1961,19 @@ class AutonomousRunController:
                 f"objective {split} result manifest does not match the run manifest"
             )
         if (
-            result.evidence_label
-            not in {EvidenceLabel.LIVE, EvidenceLabel.PRIOR_VERIFIED_RUN}
+            result.run_id != run_id
+            or result.suite != self.config.objective_suite
+            or result.suite_version != self.config.objective_suite_version
+            or result.seed != self.config.seed
+            or result.split != split
+            or result.benchmark_id != self.config.benchmark_id
+        ):
+            raise LiveExecutionFailed("objective result provenance does not match the run scope")
+        if (
+            result.evidence_label not in {EvidenceLabel.LIVE, EvidenceLabel.PRIOR_VERIFIED_RUN}
             or not result.verified
         ):
-            raise LiveExecutionFailed(
-                f"objective {split} result is not verified live evidence"
-            )
+            raise LiveExecutionFailed(f"objective {split} result is not verified live evidence")
         return result
 
     def _gate(
@@ -1741,9 +1989,7 @@ class AutonomousRunController:
         champion = MultiRunEvaluation(
             run_id=champion_run_id or f"baseline-{run_id}",
             run_number=(
-                champion_run_number or run_number - 1
-                if champion_run_id
-                else run_number - 1
+                champion_run_number or run_number - 1 if champion_run_id else run_number - 1
             ),
             aggregate_score=baseline.metrics.aggregate,
             environment_scores=dict(baseline.metrics.per_environment),
@@ -1764,13 +2010,9 @@ class AutonomousRunController:
         for artifact in record.artifact_refs:
             if artifact.artifact_id == record.candidate_artifact_id:
                 if artifact.kind is not ArtifactKind.CHECKPOINT:
-                    raise LiveExecutionBlocked(
-                        "promoted champion artifact is not a checkpoint"
-                    )
+                    raise LiveExecutionBlocked("promoted champion artifact is not a checkpoint")
                 if urlparse(artifact.uri).scheme != "s3":
-                    raise LiveExecutionBlocked(
-                        "promoted champion checkpoint is not an S3 URI"
-                    )
+                    raise LiveExecutionBlocked("promoted champion checkpoint is not an S3 URI")
                 return artifact
         raise LiveExecutionBlocked("promoted champion artifact reference is missing")
 
@@ -1838,12 +2080,9 @@ class AutonomousRunController:
         parsed = urlparse(job.artifact_uri)
         version_values = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
         if len(version_values) > 1 or (
-            version_values
-            and (not version_values[0] or version_values[0].lower() == "null")
+            version_values and (not version_values[0] or version_values[0].lower() == "null")
         ):
-            raise LiveExecutionFailed(
-                "provider artifact must be an immutable versioned S3 URI"
-            )
+            raise LiveExecutionFailed("provider artifact must be an immutable versioned S3 URI")
         try:
             # Versioned output is parsed strictly.  A normal SageMaker output
             # may omit VersionId, but only the scoped canonicalizer below may
@@ -1851,16 +2090,12 @@ class AutonomousRunController:
             if version_values:
                 ArtifactRef.from_live_uri(job.artifact_uri, sha256="0" * 64, size_bytes=0)
         except (ArtifactIntegrityError, ValueError) as exc:
-            raise LiveExecutionFailed(
-                "provider artifact must be a valid S3 output URI"
-            ) from exc
+            raise LiveExecutionFailed("provider artifact must be a valid S3 output URI") from exc
 
         canonicalize = getattr(self.artifact_store, "canonicalize_sagemaker_output", None)
         verify = getattr(self.artifact_store, "verify_immutable", None)
         if not callable(canonicalize) or not callable(verify):
-            raise LiveExecutionFailed(
-                "artifact store cannot verify and retain provider artifacts"
-            )
+            raise LiveExecutionFailed("artifact store cannot verify and retain provider artifacts")
         try:
             retained = canonicalize(
                 job.artifact_uri,
@@ -1982,6 +2217,919 @@ class AutonomousRunController:
         return packet
 
 
+class LiveObjectiveAdapter:
+    """Translate authenticated objective-worker results to supervisor evidence."""
+
+    def __init__(self, client: ObjectiveWorkerClient, config: LiveExecutionConfig) -> None:
+        self.client = client
+        self.config = config
+
+    def _model_uri(self, state: Any) -> str:
+        uri = getattr(state, "champion_checkpoint_uri", None) or getattr(
+            state, "base_checkpoint_uri", None
+        )
+        if not uri:
+            uri = getattr(state, "metadata", {}).get("checkpoint_uri")
+        if not isinstance(uri, str) or not uri:
+            raise LiveExecutionBlocked("a verified checkpoint URI is required")
+        return uri
+
+    @staticmethod
+    def _evidence(result: ObjectiveBenchmarkResult, *, run_number: int) -> Any:
+        from app.autonomous.supervisor import BenchmarkEvidence
+        from app.objective.models import ObjectiveSplit, encode_trajectory_reference
+
+        artifact_ids = tuple(
+            artifact.artifact_id
+            for artifact in (result.trajectory_artifact, result.report_artifact)
+            if artifact is not None
+        )
+        if not artifact_ids or not result.verified:
+            raise LiveExecutionFailed("objective result lacks verified artifacts")
+        if not result.trajectory_references:
+            raise LiveExecutionFailed("objective result lacks verified trajectory references")
+        if result.split not in {ObjectiveSplit.TRAIN.value, ObjectiveSplit.REPLAY.value}:
+            raise LiveExecutionFailed(
+                "objective trajectory references are outside train/replay scope"
+            )
+        if any(
+            not reference.verified or reference.split.value != result.split
+            for reference in result.trajectory_references
+        ):
+            raise LiveExecutionFailed("objective trajectory reference provenance is inconsistent")
+        trajectory_refs = tuple(
+            encode_trajectory_reference(reference) for reference in result.trajectory_references
+        )
+        from app.posttraining.models import Evidence, EvidenceKind
+        from app.posttraining.multi_run_gate import MultiRunEvaluation
+
+        evidence = Evidence(
+            evidence_id=result.benchmark_id,
+            kind=EvidenceKind.BENCHMARK,
+            label=result.evidence_label,
+            artifact_ids=artifact_ids,
+            metrics={"aggregate": result.metrics.aggregate, **result.metrics.per_environment},
+            verified=result.verified,
+            benchmark_id=result.benchmark_id,
+            suite=result.suite,
+            suite_version=result.suite_version,
+            manifest_sha256=result.manifest_sha256,
+            seed=result.seed,
+            model_id=result.model_id,
+        )
+        evaluation = MultiRunEvaluation(
+            run_id=result.run_id,
+            run_number=run_number,
+            aggregate_score=result.metrics.aggregate,
+            environment_scores=result.metrics.per_environment,
+            evidence=evidence,
+        )
+        return BenchmarkEvidence(
+            evaluation=evaluation,
+            trajectory_refs=trajectory_refs,
+            artifact_ids=artifact_ids,
+        )
+
+    def benchmark(self, state: Any, *, split: str, experiment_number: int) -> Any:
+        if split not in {"train", "replay"}:
+            raise LiveExecutionFailed(
+                "sealed baseline/candidate comparisons must use the paired evaluator"
+            )
+        request = ObjectiveBenchmarkRequest(
+            run_id=state.run_id,
+            model_uri=self._model_uri(state),
+            suite=self.config.objective_suite,
+            suite_version=self.config.objective_suite_version,
+            seed=self.config.seed,
+            num_episodes=(
+                self.config.baseline_episodes
+                if split == "baseline"
+                else self.config.held_out_episodes
+            ),
+            split=cast(Literal["train", "replay"], split),
+            output_s3_uri=(
+                f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/"
+                f"{state.run_id}/{split}/{experiment_number}"
+            ),
+        )
+        return self._evidence(
+            self._checked_result(self.client.execute_benchmark(request), request),
+            run_number=0 if split == "baseline" else experiment_number,
+        )
+
+    def _checked_result(
+        self, result: ObjectiveBenchmarkResult, request: ObjectiveBenchmarkRequest
+    ) -> ObjectiveBenchmarkResult:
+        if (
+            result.run_id != request.run_id
+            or result.suite != request.suite
+            or result.suite_version != request.suite_version
+            or result.seed != request.seed
+            or result.split != request.split
+            or result.benchmark_id != self.config.benchmark_id
+        ):
+            raise LiveExecutionFailed("objective result provenance does not match the run scope")
+        return result
+
+    def build_dataset(self, state: Any, plan: Any, *, experiment_number: int) -> Any:
+        from app.autonomous.supervisor import DatasetArtifact
+        from app.objective.models import (
+            Dataset,
+            ObjectiveSplit,
+            decode_trajectory_reference,
+        )
+
+        try:
+            references = tuple(
+                decode_trajectory_reference(value)
+                for value in plan.selected_trajectory_refs
+            )
+        except Exception as exc:
+            raise LiveExecutionFailed(
+                "curation plan contains malformed trajectory provenance"
+            ) from exc
+        if not references:
+            raise LiveExecutionFailed("curation plan selected no trajectory references")
+        if len({reference.trajectory_id for reference in references}) != len(references):
+            raise LiveExecutionFailed("curation plan contains duplicate trajectory references")
+        splits = {reference.split for reference in references}
+        if len(splits) != 1 or not splits.issubset(
+            {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}
+        ):
+            raise LiveExecutionFailed("curation plan must use one actual train/replay split")
+
+        response = self.client.verify_curation(
+            run_id=state.run_id,
+            experiment_id=f"{state.run_id}-{experiment_number}",
+            trajectory_references=references,
+        )
+        try:
+            dataset = Dataset.model_validate(response)
+        except Exception as exc:
+            raise LiveExecutionFailed(
+                "objective curation response is not a verified dataset"
+            ) from exc
+        expected_provenance = tuple(
+            (reference.trajectory_id, reference.task_id, reference.split)
+            for reference in references
+        )
+        actual_provenance = tuple(
+            (row.source_trajectory_id, row.task_id, row.split) for row in dataset.rows
+        )
+        if (
+            dataset.manifest.run_id != state.run_id
+            or dataset.manifest.experiment_id != f"{state.run_id}-{experiment_number}"
+            or dataset.manifest.source_trajectory_ids
+            != tuple(reference.trajectory_id for reference in references)
+            or actual_provenance != expected_provenance
+            or any(
+                not row.verifier_confirmed or row.source_type != "verified_replay"
+                for row in dataset.rows
+            )
+        ):
+            raise LiveExecutionFailed("objective dataset provenance does not match curation input")
+        return DatasetArtifact(
+            dataset_id=dataset.manifest.dataset_id,
+            uri=dataset.manifest.s3_uri,
+            sha256=dataset.manifest.sha256,
+            artifact_id=f"dataset://{dataset.manifest.dataset_id}",
+        )
+
+    def verify_dataset(self, dataset: Any, *, run_id: str, experiment_number: int) -> Any:
+        parsed = urlparse(dataset.uri)
+        version_ids = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
+        key_parts = parsed.path.strip("/").split("/")
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or len(version_ids) != 1
+            or not version_ids[0]
+            or version_ids[0].lower() == "null"
+            or set(parse_qs(parsed.query, keep_blank_values=True)) != {"versionId"}
+            or len(key_parts) < 3
+            or key_parts[-1] != "dataset.jsonl"
+            or key_parts[-2] != dataset.sha256
+            or dataset.artifact_id != f"dataset://{dataset.dataset_id}"
+            or not re.fullmatch(r"[0-9a-f]{64}", dataset.sha256)
+        ):
+            raise LiveExecutionFailed("objective dataset artifact is not immutable")
+        if run_id not in key_parts or f"{run_id}-{experiment_number}" not in key_parts:
+            raise LiveExecutionFailed("objective dataset artifact scope does not match run")
+        return dataset
+
+
+class LiveRequestFactory:
+    """Build pinned SageMaker requests from durable state and verified handoffs."""
+
+    def __init__(self, config: LiveExecutionConfig) -> None:
+        self.config = config
+
+    def _approved(self, state: Any, name: str, configured: Any) -> Any:
+        scope = getattr(state, "approval_scope", None)
+        if not isinstance(scope, Mapping) or name not in scope:
+            raise LiveExecutionBlocked("durable approved execution scope is incomplete")
+        value = scope[name]
+        if value != configured:
+            raise LiveExecutionBlocked(f"approved {name} does not match configuration")
+        return value
+
+    @staticmethod
+    def _versioned_content_uri(uri: object, digest: object, *, suffix: str) -> str:
+        if not isinstance(uri, str) or not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+            raise LiveExecutionBlocked("approved content-addressed artifact is incomplete")
+        parsed = urlparse(uri)
+        versions = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or parsed.fragment
+            or len(versions) != 1
+            or not versions[0]
+            or versions[0].lower() == "null"
+            or set(parse_qs(parsed.query, keep_blank_values=True)) != {"versionId"}
+            or parsed.path.rstrip("/").rsplit("/", 1)[-1] != f"{digest}{suffix}"
+            or any(char.isspace() for char in uri)
+        ):
+            raise LiveExecutionBlocked(
+                "artifact URI is not an exact versioned content-addressed reference"
+            )
+        return f"s3://{parsed.netloc}{parsed.path}"
+
+    @classmethod
+    def _dataset_prefix(cls, dataset: Any) -> str:
+        uri = getattr(dataset, "uri", None)
+        digest = getattr(dataset, "sha256", None)
+        if not isinstance(uri, str) or not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+            raise LiveExecutionBlocked("approved dataset identity is incomplete")
+        parsed = urlparse(uri)
+        versions = parse_qs(parsed.query, keep_blank_values=True).get("versionId", [])
+        parts = parsed.path.strip("/").split("/")
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or parsed.fragment
+            or len(versions) != 1
+            or not versions[0]
+            or versions[0].lower() == "null"
+            or set(parse_qs(parsed.query, keep_blank_values=True)) != {"versionId"}
+            or len(parts) < 4
+            or parts[-1] != "dataset.jsonl"
+            or parts[-2] != digest
+            or any(char.isspace() for char in uri)
+        ):
+            raise LiveExecutionBlocked(
+                "dataset URI is not an exact versioned content-addressed reference"
+            )
+        return f"s3://{parsed.netloc}/" + "/".join(parts[:-1])
+
+    @staticmethod
+    def _sha(value: object, name: str) -> str:
+        if not isinstance(value, str) or not _SHA256.fullmatch(value):
+            raise LiveExecutionBlocked(f"approved {name} is missing or invalid")
+        return value
+
+    def training(
+        self, state: Any, *, experiment_number: int, dataset: Any, config: Any
+    ) -> TrainingJobRequest:
+        instance_type = self._approved(state, "instance_type", self.config.instance_type)
+        instance_count = self._approved(state, "instance_count", self.config.instance_count)
+        volume_size_gb = self._approved(state, "volume_size_gb", self.config.volume_size_gb)
+        max_runtime_seconds = self._approved(
+            state, "max_runtime_seconds", self.config.max_runtime_seconds
+        )
+        dataset_id = getattr(dataset, "dataset_id", None)
+        artifact_id = getattr(dataset, "artifact_id", None)
+        dataset_sha = self._sha(getattr(dataset, "sha256", None), "dataset SHA-256")
+        if (
+            not isinstance(dataset_id, str)
+            or not dataset_id
+            or artifact_id != f"dataset://{dataset_id}"
+        ):
+            raise LiveExecutionBlocked(
+                "approved dataset artifact identity is missing or mismatched"
+            )
+        model_id = getattr(state, "model_id", self.config.target_model)
+        model_revision = getattr(state, "checkpoint_revision", self.config.hf_revision)
+        if model_id != self.config.target_model or model_revision != self.config.hf_revision:
+            raise LiveExecutionBlocked("approved base model identity does not match configuration")
+        qlora_config = config.model_dump(mode="json")
+        if not isinstance(qlora_config, Mapping):
+            raise LiveExecutionBlocked("approved QLoRA configuration is invalid")
+        experiment_id = f"{state.run_id}-{experiment_number}"
+        environment = {
+            "RUN_ID": state.run_id,
+            "EXPERIMENT_ID": experiment_id,
+            "DATASET_ID": dataset_id,
+            "DATASET_SHA256": dataset_sha,
+            "APPROVED_DATASET_ARTIFACT_ID": artifact_id,
+            "BASE_MODEL_ID": model_id,
+            "BASE_MODEL_REVISION": model_revision,
+            "QLORA_CONFIG": json.dumps(dict(qlora_config), sort_keys=True, separators=(",", ":")),
+        }
+        parent_uri = None
+        if experiment_number > 1:
+            metadata = getattr(state, "metadata", {})
+            if not isinstance(metadata, Mapping):
+                raise LiveExecutionBlocked("approved parent adapter metadata is unavailable")
+            parent_uri = self._versioned_content_uri(
+                getattr(state, "champion_checkpoint_uri", None),
+                getattr(state, "champion_checkpoint_sha256", None),
+                suffix=".tar.gz",
+            )
+            parent_artifact_id = metadata.get("champion_checkpoint_artifact_id")
+            if not isinstance(parent_artifact_id, str) or not parent_artifact_id.startswith("checkpoint://"):
+                raise LiveExecutionBlocked("approved parent adapter artifact ID is unavailable")
+            parent_artifact_sha = self._sha(
+                metadata.get("champion_checkpoint_artifact_sha256"),
+                "parent artifact SHA-256",
+            )
+            environment.update(
+                {
+                    "APPROVED_PARENT_ARTIFACT_ID": parent_artifact_id,
+                    "APPROVED_PARENT_MANIFEST_SHA256": self._sha(
+                        metadata.get("champion_checkpoint_manifest_sha256"),
+                        "parent manifest SHA-256",
+                    ),
+                    "APPROVED_PARENT_ARTIFACT_SHA256": parent_artifact_sha,
+                    "APPROVED_PARENT_ARCHIVE_SHA256": self._sha(
+                        getattr(state, "champion_checkpoint_sha256", None), "parent archive SHA-256"
+                    ),
+                }
+            )
+        return TrainingJobRequest(
+            job_name=f"pending-{state.run_id}-{experiment_number}",
+            role_arn=self.config.training_role_arn,
+            image_uri=self.config.training_image,
+            input_s3_uri=self._dataset_prefix(dataset),
+            output_s3_uri=f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/{state.run_id}/train/{experiment_number}",
+            instance_type=cast(str, instance_type),
+            parent_adapter_s3_uri=parent_uri,
+            instance_count=cast(int, instance_count),
+            volume_size_gb=cast(int, volume_size_gb),
+            max_runtime_seconds=cast(int, max_runtime_seconds),
+            hyperparameters=dict(qlora_config),
+            environment=environment,
+        )
+
+    def evaluation(
+        self, state: Any, *, experiment_number: int, candidate: Any
+    ) -> EvaluationJobRequest:
+        instance_type = self._approved(state, "instance_type", self.config.instance_type)
+        instance_count = self._approved(state, "instance_count", self.config.instance_count)
+        volume_size_gb = self._approved(state, "volume_size_gb", self.config.volume_size_gb)
+        max_runtime_seconds = self._approved(
+            state, "max_runtime_seconds", self.config.max_runtime_seconds
+        )
+        candidate_uri = self._versioned_content_uri(
+            getattr(candidate, "uri", None), getattr(candidate, "sha256", None), suffix=".tar.gz"
+        )
+        champion_uri_raw = getattr(state, "champion_checkpoint_uri", None) or getattr(
+            state, "base_checkpoint_uri", None
+        )
+        champion_sha = getattr(state, "champion_checkpoint_sha256", None) or getattr(
+            state, "base_checkpoint_sha256", None
+        )
+        champion_uri = self._versioned_content_uri(champion_uri_raw, champion_sha, suffix=".tar.gz")
+        sealed_uri = self.config.evaluation_input_s3_uri
+        sealed = urlparse(sealed_uri)
+        if (
+            sealed.scheme != "s3"
+            or not sealed.netloc
+            or not sealed.path.strip("/")
+            or sealed.query
+            or sealed.fragment
+        ):
+            raise LiveExecutionBlocked("sealed evaluation input must be a query-free S3 URI")
+        manifest_sha = self._sha(
+            getattr(state, "benchmark_manifest_sha256", None), "evaluation manifest SHA-256"
+        )
+        suite_version = getattr(state, "benchmark_version", self.config.objective_suite_version)
+        seed = getattr(state, "benchmark_seed", self.config.seed)
+        return EvaluationJobRequest(
+            job_name=f"pending-{state.run_id}-{experiment_number}-eval",
+            role_arn=self.config.training_role_arn,
+            image_uri=self.config.evaluation_image,
+            input_s3_uri=sealed_uri,
+            output_s3_uri=f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/{state.run_id}/eval/{experiment_number}",
+            model_s3_uri=candidate_uri,
+            candidate_s3_uri=candidate_uri,
+            champion_s3_uri=champion_uri,
+            sealed_s3_uri=sealed_uri,
+            instance_type=cast(str, instance_type),
+            instance_count=cast(int, instance_count),
+            volume_size_gb=cast(int, volume_size_gb),
+            max_runtime_seconds=cast(int, max_runtime_seconds),
+            environment={
+                "RUN_ID": state.run_id,
+                "EXPERIMENT_ID": f"{state.run_id}-{experiment_number}",
+                "EVALUATION_MANIFEST_SHA256": manifest_sha,
+                "EVALUATION_SUITE_VERSION": suite_version,
+                "OBJECTIVE_SEED": str(seed),
+                "CANDIDATE_ARCHIVE_SHA256": self._sha(
+                    getattr(candidate, "sha256", None), "candidate archive SHA-256"
+                ),
+                "CHAMPION_ARCHIVE_SHA256": self._sha(champion_sha, "champion archive SHA-256"),
+            },
+        )
+
+
+class S3LiveArtifactVerifier:
+    """Retain and verify a completed SageMaker output before evidence admission."""
+
+    def __init__(self, store: S3ArtifactStore, config: LiveExecutionConfig) -> None:
+        self.store = store
+        self.config = config
+
+    def verify_checkpoint(self, job: JobResult, *, run_id: str, experiment_number: int) -> Any:
+        import tempfile
+        from pathlib import Path
+
+        from app.autonomous.supervisor import CheckpointArtifact
+        from workers.trainer.train import _extract_checkpoint_archive, verify_parent_adapter
+
+        if not job.artifact_uri:
+            raise LiveExecutionFailed("SageMaker training output URI is missing")
+        retained = self.store.canonicalize_sagemaker_output(
+            job.artifact_uri,
+            retained_prefix=f"{self.config.artifact_prefix}/{run_id}/checkpoints",
+            allowed_source_bucket=self.config.artifact_bucket,
+            allowed_source_prefix=f"{self.config.artifact_prefix}/{run_id}",
+        )
+        with tempfile.TemporaryDirectory(prefix="checkpoint-verify-") as scratch:
+            scratch_path = Path(scratch)
+            archive_path = scratch_path / f"{retained.sha256}.tar.gz"
+            archive_path.write_bytes(self.store.get_bytes(retained))
+            checkpoint_dir = _extract_checkpoint_archive(
+                archive_path, scratch_path / "checkpoint"
+            )
+            manifest = verify_parent_adapter(checkpoint_dir)
+        if (
+            manifest.get("run_id") != run_id
+            or manifest.get("experiment_id") != f"{run_id}-{experiment_number}"
+            or manifest.get("artifact_id", "")
+            != f"checkpoint://{manifest.get('artifact_sha256', '')}"
+        ):
+            raise LiveExecutionFailed(
+                "checkpoint manifest provenance does not match the training request"
+            )
+        return CheckpointArtifact(
+            artifact_id=cast(str, manifest["artifact_id"]),
+            uri=retained.version_ref,
+            sha256=retained.sha256,
+            manifest_sha256=cast(str, manifest["manifest_sha256"]),
+            artifact_sha256=cast(str, manifest["artifact_sha256"]),
+        )
+
+
+class LiveEvaluationReader:
+    """Verify and read the immutable report emitted by the SageMaker evaluator."""
+
+    def __init__(self, artifact_store: S3ArtifactStore, config: LiveExecutionConfig) -> None:
+        self.artifact_store = artifact_store
+        self.config = config
+
+    def read_evaluation(self, job: JobResult, *, state: Any, experiment_number: int) -> Any:
+        import io
+        import tarfile
+
+        from app.autonomous.supervisor import EvaluationEvidence
+        from app.posttraining.models import ArtifactKind, ArtifactReference, Evidence
+        from app.posttraining.run_history import BenchmarkMetrics
+
+        if job.status is not JobStatus.COMPLETED or not job.provider_job_id:
+            raise LiveExecutionFailed("SageMaker evaluator job did not complete with a provider ID")
+        if not job.artifact_uri:
+            raise LiveExecutionFailed("SageMaker evaluator report artifact URI is missing")
+        if not state.current_candidate_uri or not state.current_candidate_sha256:
+            raise LiveExecutionFailed("verified candidate checkpoint provenance is missing")
+        source_prefix = (
+            f"{self.config.artifact_prefix}/{state.run_id}/eval/{experiment_number}"
+        )
+        try:
+            artifact = self.artifact_store.canonicalize_sagemaker_output(
+                job.artifact_uri,
+                retained_prefix=f"{self.config.artifact_prefix}/{state.run_id}/evaluations",
+                allowed_source_bucket=self.config.artifact_bucket,
+                allowed_source_prefix=source_prefix,
+            )
+            if artifact.size_bytes > 16 * 1024 * 1024:
+                raise LiveExecutionFailed(
+                    "SageMaker evaluator artifact exceeds the report size limit"
+                )
+            archive_bytes = self.artifact_store.get_bytes(artifact)
+        except LiveExecutionFailed:
+            raise
+        except Exception as exc:
+            raise LiveExecutionFailed(
+                "SageMaker evaluator artifact could not be retained and verified"
+            ) from exc
+        try:
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+                candidates = []
+                for member in archive.getmembers():
+                    components = member.name.split("/")
+                    if (
+                        member.isfile()
+                        and components[-1] == "evaluation.json"
+                        and not member.name.startswith("/")
+                        and all(part not in {"", ".", ".."} for part in components)
+                    ):
+                        candidates.append(member)
+                if (
+                    len(candidates) != 1
+                    or candidates[0].size < 1
+                    or candidates[0].size > 4 * 1024 * 1024
+                ):
+                    raise ValueError("archive must contain one bounded evaluation.json")
+                report_stream = archive.extractfile(candidates[0])
+                if report_stream is None:
+                    raise ValueError("evaluation report is unreadable")
+                report_bytes = report_stream.read(4 * 1024 * 1024 + 1)
+                if len(report_bytes) != candidates[0].size or len(report_bytes) > 4 * 1024 * 1024:
+                    raise ValueError("evaluation report size does not match archive metadata")
+            report = json.loads(report_bytes.decode("utf-8"))
+            if not isinstance(report, Mapping):
+                raise ValueError("evaluation report must be an object")
+        except LiveExecutionFailed:
+            raise
+        except Exception as exc:
+            raise LiveExecutionFailed(
+                "SageMaker evaluator artifact is not a valid report archive"
+            ) from exc
+
+        report_sha256 = report.get("report_sha256")
+        unsigned = dict(report)
+        unsigned.pop("report_sha256", None)
+        expected_report_sha256 = hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        candidate_manifest_sha256 = report.get("candidate_manifest_sha256")
+        candidate_artifact_sha256 = report.get("candidate_artifact_sha256")
+        champion_manifest_sha256 = report.get("champion_manifest_sha256")
+        champion_artifact_sha256 = report.get("champion_artifact_sha256")
+        champion_checkpoint_sha256 = getattr(state, "champion_checkpoint_sha256", None) or getattr(
+            state, "base_checkpoint_sha256", None
+        )
+        if (
+            report_sha256 != expected_report_sha256
+            or report.get("schema_version") != "evaluation-report-v1"
+            or report.get("suite") != self.config.objective_suite
+            or report.get("suite_version") != self.config.objective_suite_version
+            or report.get("evaluation_manifest_sha256") != state.benchmark_manifest_sha256
+            or report.get("run_id") != state.run_id
+            or report.get("experiment_id") != f"{state.run_id}-{experiment_number}"
+            or not isinstance(candidate_manifest_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", candidate_manifest_sha256)
+            or not isinstance(candidate_artifact_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", candidate_artifact_sha256)
+            or candidate_artifact_sha256 != state.current_candidate_sha256
+            or not isinstance(champion_manifest_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", champion_manifest_sha256)
+            or not isinstance(champion_artifact_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", champion_artifact_sha256)
+            or champion_artifact_sha256 != champion_checkpoint_sha256
+        ):
+            raise LiveExecutionFailed(
+                "SageMaker evaluator report provenance or checksum is invalid"
+            )
+
+        try:
+            def parse_metrics(prefix: str) -> tuple[BenchmarkMetrics, int, Mapping[str, Any]]:
+                metrics_value = report.get(f"{prefix}_metrics")
+                if not isinstance(metrics_value, Mapping):
+                    raise ValueError(f"{prefix} metrics are missing")
+                task_count = metrics_value["task_count"]
+                successful_tasks = metrics_value["successful_tasks"]
+                success_rate = metrics_value["success_rate"]
+                invalid_action_tasks = metrics_value["invalid_action_tasks"]
+                environments = metrics_value["by_environment"]
+                if (
+                    type(task_count) is not int
+                    or task_count < 1
+                    or type(successful_tasks) is not int
+                    or not 0 <= successful_tasks <= task_count
+                    or type(invalid_action_tasks) is not int
+                    or not 0 <= invalid_action_tasks <= task_count
+                    or isinstance(success_rate, bool)
+                    or not isinstance(success_rate, (int, float))
+                    or not isfinite(float(success_rate))
+                    or abs(float(success_rate) - successful_tasks / task_count) > 1e-12
+                    or report.get(f"{prefix}_task_count") != task_count
+                    or report.get(f"{prefix}_successful_tasks") != successful_tasks
+                    or report.get(f"{prefix}_success_rate") != success_rate
+                    or report.get(f"{prefix}_invalid_action_tasks") != invalid_action_tasks
+                    or not isinstance(environments, Mapping)
+                    or not environments
+                ):
+                    raise ValueError(f"{prefix} metrics are inconsistent")
+                environment_scores: dict[str, float] = {}
+                environment_counts: dict[str, int] = {}
+                environment_tasks = 0
+                environment_successes = 0
+                for environment, item in environments.items():
+                    if not isinstance(environment, str) or not isinstance(item, Mapping):
+                        raise ValueError("environment aggregate is malformed")
+                    count = item.get("task_count")
+                    successes = item.get("successful_tasks")
+                    rate = item.get("success_rate")
+                    if (
+                        type(count) is not int
+                        or count < 1
+                        or type(successes) is not int
+                        or not 0 <= successes <= count
+                        or isinstance(rate, bool)
+                        or not isinstance(rate, (int, float))
+                        or not isfinite(float(rate))
+                        or abs(float(rate) - successes / count) > 1e-12
+                    ):
+                        raise ValueError("environment aggregate is inconsistent")
+                    environment_scores[environment] = float(rate)
+                    environment_counts[environment] = count
+                    environment_tasks += count
+                    environment_successes += successes
+                if environment_tasks != task_count or environment_successes != successful_tasks:
+                    raise ValueError("environment aggregates do not match task totals")
+                return (
+                    BenchmarkMetrics(
+                        aggregate=float(success_rate), per_environment=environment_scores
+                    ),
+                    task_count,
+                    environment_counts,
+                )
+
+            candidate_metrics, candidate_count, candidate_environment_counts = parse_metrics(
+                "candidate"
+            )
+            champion_metrics, champion_count, champion_environment_counts = parse_metrics(
+                "champion"
+            )
+            candidate_outcomes = report.get("candidate_task_successes")
+            champion_outcomes = report.get("champion_task_successes")
+            candidate_environments = report.get("candidate_task_environments")
+            champion_environments = report.get("champion_task_environments")
+            if (
+                candidate_count != champion_count
+                or candidate_environment_counts != champion_environment_counts
+                or not isinstance(candidate_outcomes, list)
+                or not isinstance(champion_outcomes, list)
+                or not isinstance(candidate_environments, list)
+                or not isinstance(champion_environments, list)
+                or len(candidate_outcomes) != candidate_count
+                or len(champion_outcomes) != champion_count
+                or len(candidate_environments) != candidate_count
+                or len(champion_environments) != champion_count
+                or any(
+                    type(value) is not bool
+                    for value in (*candidate_outcomes, *champion_outcomes)
+                )
+                or any(
+                    not isinstance(value, str)
+                    for value in (*candidate_environments, *champion_environments)
+                )
+                or candidate_environments != champion_environments
+                or sum(candidate_outcomes) != report.get("candidate_successful_tasks")
+                or sum(champion_outcomes) != report.get("champion_successful_tasks")
+            ):
+                raise ValueError("paired candidate/champion task outcomes are inconsistent")
+            for prefix, outcomes, environments in (
+                ("candidate", candidate_outcomes, candidate_environments),
+                ("champion", champion_outcomes, champion_environments),
+            ):
+                grouped: dict[str, list[bool]] = {}
+                for environment, success in zip(environments, outcomes, strict=True):
+                    grouped.setdefault(environment, []).append(success)
+                summary = report[f"{prefix}_metrics"]["by_environment"]
+                if set(grouped) != set(summary):
+                    raise ValueError("paired outcomes do not match environment summaries")
+                for environment, results in grouped.items():
+                    item = summary[environment]
+                    if (
+                        item["task_count"] != len(results)
+                        or item["successful_tasks"] != sum(results)
+                        or abs(item["success_rate"] - sum(results) / len(results)) > 1e-12
+                    ):
+                        raise ValueError("paired outcomes do not match environment metrics")
+            paired_outcomes = {
+                "candidate": candidate_outcomes,
+                "champion": champion_outcomes,
+                "environments": candidate_environments,
+            }
+            paired_digest = hashlib.sha256(
+                json.dumps(paired_outcomes, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            regressions = sum(
+                champion and not candidate
+                for candidate, champion in zip(candidate_outcomes, champion_outcomes, strict=True)
+            )
+            improvements = sum(
+                candidate and not champion
+                for candidate, champion in zip(candidate_outcomes, champion_outcomes, strict=True)
+            )
+            regression_evidence = {
+                "candidate_manifest_sha256": candidate_manifest_sha256,
+                "champion_manifest_sha256": champion_manifest_sha256,
+                "candidate_artifact_sha256": candidate_artifact_sha256,
+                "champion_artifact_sha256": champion_artifact_sha256,
+                "task_count": candidate_count,
+                "regression_count": regressions,
+                "improvement_count": improvements,
+                "unchanged_count": candidate_count - regressions - improvements,
+                "candidate_task_successes": candidate_outcomes,
+                "champion_task_successes": champion_outcomes,
+                "candidate_task_environments": candidate_environments,
+                "champion_task_environments": champion_environments,
+            }
+            expected_regression_digest = hashlib.sha256(
+                json.dumps(
+                    regression_evidence, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            expected_decision = (
+                "REGRESSED" if regressions else "IMPROVED" if improvements else "UNCHANGED"
+            )
+            if (
+                report.get("paired_outcomes_sha256") != paired_digest
+                or report.get("regression_evidence_sha256") != expected_regression_digest
+                or report.get("regression_count") != regressions
+                or report.get("improvement_count") != improvements
+                or report.get("unchanged_count") != candidate_count - regressions - improvements
+                or report.get("regression_decision") != expected_decision
+            ):
+                raise ValueError("paired sealed evaluation digest is invalid")
+        except Exception as exc:
+            raise LiveExecutionFailed(
+                "SageMaker evaluator report metrics or paired provenance are invalid"
+            ) from exc
+
+        artifact_id = f"evaluation-report://{artifact.sha256}"
+        artifact_ref = ArtifactReference(
+            artifact_id=artifact_id,
+            kind=ArtifactKind.REPORT,
+            uri=artifact.version_ref,
+            sha256=artifact.sha256,
+            size_bytes=artifact.size_bytes,
+        )
+        signed_evidence = Evidence(
+            evidence_id=artifact_id,
+            kind=EvidenceKind.EVALUATION,
+            label=EvidenceLabel.LIVE,
+            artifact_ids=(artifact_id,),
+            metrics={"aggregate": candidate_metrics.aggregate, **candidate_metrics.per_environment},
+            verified=True,
+            benchmark_id=state.benchmark_id,
+            suite=self.config.objective_suite,
+            suite_version=self.config.objective_suite_version,
+            manifest_sha256=state.benchmark_manifest_sha256,
+            seed=state.benchmark_seed,
+            model_id=state.model_id,
+        )
+        champion_evidence = signed_evidence.model_copy(
+            update={
+                "metrics": {
+                    "aggregate": champion_metrics.aggregate,
+                    **champion_metrics.per_environment,
+                }
+            }
+        )
+        champion_run_id = f"eval://{state.run_id}/checkpoint/{champion_artifact_sha256}"
+        candidate_run_id = f"eval://{state.run_id}/checkpoint/{candidate_artifact_sha256}"
+        champion_run_number = 0
+        metadata = getattr(state, "metadata", {})
+        if isinstance(metadata, Mapping):
+            encoded_champion = metadata.get("champion_evaluation_b64")
+            if isinstance(encoded_champion, str) and encoded_champion:
+                try:
+                    stored = json.loads(urlsafe_b64decode(encoded_champion.encode("ascii")))
+                    stored_number = (
+                        stored.get("run_number") if isinstance(stored, Mapping) else None
+                    )
+                    if type(stored_number) is not int or stored_number < 0:
+                        raise ValueError("stored champion run number is invalid")
+                    champion_run_number = stored_number
+                except Exception as exc:
+                    raise LiveExecutionFailed("stored champion evaluation is invalid") from exc
+        if champion_run_number == 0:
+            records = getattr(state, "experiments", ())
+            champion_run_number = max(
+                (
+                    item.experiment_number
+                    for item in records
+                    if getattr(getattr(item, "status", None), "value", None) == "SUCCEEDED"
+                ),
+                default=0,
+            )
+        evaluation = MultiRunEvaluation(
+            run_id=candidate_run_id,
+            run_number=champion_run_number + 1,
+            champion_run_id=champion_run_id,
+            aggregate_score=candidate_metrics.aggregate,
+            environment_scores=candidate_metrics.per_environment,
+            evidence=signed_evidence,
+        )
+        champion_evaluation = MultiRunEvaluation(
+            run_id=champion_run_id,
+            run_number=champion_run_number,
+            aggregate_score=champion_metrics.aggregate,
+            environment_scores=champion_metrics.per_environment,
+            evidence=champion_evidence,
+        )
+        return EvaluationEvidence(
+            evaluation=evaluation,
+            artifact_ids=(artifact_ref.artifact_id,),
+            champion_evaluation=champion_evaluation,
+            cost_usd=0.0,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AutonomousLiveComponents:
+    """Concrete, lazy-safe AWS components used by the live API lifecycle."""
+
+    repository: Any
+    supervisor: Any
+    dispatcher: Any
+
+
+def create_autonomous_live_components(
+    config: LiveExecutionConfig,
+    *,
+    repository: Any,
+    telemetry: Any | None = None,
+    model: Any | None = None,
+    provider: Any | None = None,
+    objective_worker: ObjectiveWorkerClient | None = None,
+    artifact_store: S3ArtifactStore | None = None,
+    owner: str | None = None,
+) -> AutonomousLiveComponents:
+    """Construct real supervisor adapters without provisioning cloud resources.
+
+    Every dependency is either supplied by the deployment or built from the
+    configured AWS SDK wrappers.  No fake objective, model, metric, or
+    provider adapter is ever selected when construction fails.
+    """
+
+    from app.autonomous.agents import AutonomousAgentAdapters
+    from app.autonomous.dispatcher import AutonomousRunDispatcher
+    from app.autonomous.supervisor import AutonomousRunSupervisor
+    from app.autonomous.telemetry import DurableTelemetryBridge
+    from app.providers.bedrock import BedrockStrandsModel
+
+    if repository is None:
+        raise LiveExecutionBlocked("durable autonomous repository is required")
+    worker = objective_worker or ObjectiveWorkerClient(
+        config.objective_worker_url,
+        auth_token=config.objective_worker_auth_token,
+    )
+    sagemaker = provider or SageMakerProvider(region_name=config.aws_region)
+    store = artifact_store or S3ArtifactStore(
+        config.artifact_bucket,
+        prefix=config.artifact_prefix,
+    )
+    reasoning = model or BedrockStrandsModel(
+        NEMOTRON_MODEL_ID,
+        region_name=config.aws_region,
+        auth_mode="sigv4",
+    )
+    agents = AutonomousAgentAdapters(reasoning)
+    objective = LiveObjectiveAdapter(worker, config)
+    request_factory = LiveRequestFactory(config)
+    artifacts = S3LiveArtifactVerifier(store, config)
+    evaluator = LiveEvaluationReader(store, config)
+    durable_telemetry = DurableTelemetryBridge(repository, recorder=telemetry)
+
+    def readiness(_: Any) -> bool:
+        return PreflightRunner(config).run().ready
+
+    def approval_verifier(state: Any) -> datetime | None:
+        expiry = getattr(state, "approval_expires_at", None)
+        return expiry if isinstance(expiry, datetime) else None
+
+    supervisor = AutonomousRunSupervisor(
+        repository=repository,
+        objective=objective,
+        agents=cast(Any, agents),
+        provider=sagemaker,
+        request_factory=request_factory,
+        artifacts=artifacts,
+        evaluator=evaluator,
+        readiness=cast(Any, readiness),
+        approval_verifier=approval_verifier,
+        telemetry=cast(Any, durable_telemetry),
+        max_polls=120,
+        poll_interval_seconds=30.0,
+    )
+    dispatcher = AutonomousRunDispatcher(
+        repository=repository,
+        supervisor=supervisor,
+        owner=owner or f"api-{uuid4().hex}",
+    )
+    return AutonomousLiveComponents(
+        repository=repository,
+        supervisor=supervisor,
+        dispatcher=dispatcher,
+    )
+
+
 def config_from_environment(environ: Mapping[str, str] | None = None) -> LiveExecutionConfig:
     """Build live configuration from explicit environment variables."""
 
@@ -2082,14 +3230,18 @@ def create_aws_controller(config: LiveExecutionConfig) -> AutonomousRunControlle
 __all__ = [
     "NEMOTRON_MODEL_ID",
     "ApprovalPacket",
+    "AutonomousLiveComponents",
     "AutonomousRunController",
     "CheckResult",
     "CheckStatus",
     "GpuCapacityStatus",
     "GpuQuotaStatus",
+    "LiveEvaluationReader",
     "LiveExecutionBlocked",
     "LiveExecutionConfig",
     "LiveExecutionFailed",
+    "LiveObjectiveAdapter",
+    "LiveRequestFactory",
     "LiveRunConfig",
     "LiveRunSummary",
     "ObjectiveWorkerClient",
@@ -2097,8 +3249,10 @@ __all__ = [
     "PreflightRunner",
     "PreflightStatus",
     "RunSlotStore",
+    "S3LiveArtifactVerifier",
     "_RegistrySlotStore",
     "config_from_environment",
+    "create_autonomous_live_components",
     "create_aws_controller",
     "issue_approval_token",
     "safe_json_print",

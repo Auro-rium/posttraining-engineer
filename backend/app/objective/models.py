@@ -13,7 +13,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -26,6 +26,12 @@ ALLOWED_TOOLS: tuple[str, ...] = (
     "run_healthcheck",
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TRAJECTORY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_TRAJECTORY_REFERENCE_HANDLE = re.compile(
+    r"^trajectory://(train|replay|validation)/"
+    r"([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})/"
+    r"([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})/verified$"
+)
 
 
 def deterministic_dataset_created_at(dataset_id: str, sha256: str) -> datetime:
@@ -123,6 +129,40 @@ class BenchmarkExecutionResult(ContractModel):
     trajectories: tuple[Trajectory, ...] = Field(default_factory=tuple)
 
 
+class ObjectiveWorkerCapabilities(ContractModel):
+    benchmark: bool
+    verify_curation: bool = Field(alias="verify-curation")
+
+
+class ObjectiveReadinessResponse(ContractModel):
+    """Authenticated, non-invasive execution readiness attestation."""
+
+    status: Literal["ready", "blocked"]
+    service: Literal["objective-worker"] = "objective-worker"
+    model_id: Literal["google/functiongemma-270m-it"] = "google/functiongemma-270m-it"
+    capabilities: ObjectiveWorkerCapabilities
+    blockers: tuple[
+        Literal[
+            "functiongemma_adapter_unavailable",
+            "checkpoint_unverified",
+            "inference_runtime_unavailable",
+            "artifact_store_incomplete",
+        ],
+        ...,
+    ] = Field(default_factory=tuple)
+
+    @model_validator(mode="after")
+    def status_matches_capabilities(self) -> ObjectiveReadinessResponse:
+        capabilities_ready = self.capabilities.benchmark and self.capabilities.verify_curation
+        if self.status == "ready" and (not capabilities_ready or self.blockers):
+            raise ValueError("ready status requires both capabilities and no blockers")
+        if self.status == "blocked" and (capabilities_ready and not self.blockers):
+            raise ValueError("blocked status requires a missing capability or blocker")
+        if not capabilities_ready and not self.blockers:
+            raise ValueError("blocked capabilities require a blocker")
+        return self
+
+
 class ReplayResult(ContractModel):
     trajectory: Trajectory
     verified: bool
@@ -211,6 +251,52 @@ class TrajectoryReference(ContractModel):
     split: ObjectiveSplit
     verified: bool
 
+    @field_validator("trajectory_id", "task_id")
+    @classmethod
+    def validate_identifier(cls, value: str) -> str:
+        if not _TRAJECTORY_IDENTIFIER.fullmatch(value) or value.lower() == "unknown":
+            raise ValueError("trajectory reference identifiers must be path-safe")
+        return value
+
+    @model_validator(mode="after")
+    def public_reference_only(self) -> TrajectoryReference:
+        if self.split is ObjectiveSplit.HIDDEN:
+            raise ValueError("hidden trajectory references cannot cross the objective boundary")
+        return self
+
+
+def encode_trajectory_reference(reference: TrajectoryReference) -> str:
+    """Encode actual safe trajectory provenance in a restart-stable handoff ID."""
+
+    if not reference.verified:
+        raise ValueError("only verifier-confirmed trajectory references may be handed off")
+    if reference.split is ObjectiveSplit.HIDDEN:
+        raise ValueError("hidden trajectory references cannot cross the objective boundary")
+    return (
+        f"trajectory://{reference.split.value}/{reference.trajectory_id}/"
+        f"{reference.task_id}/verified"
+    )
+
+
+def decode_trajectory_reference(value: str) -> TrajectoryReference:
+    """Decode only the canonical, public reference format persisted by the supervisor."""
+
+    if not isinstance(value, str):
+        raise ValueError("trajectory handoff reference must be a string")
+    match = _TRAJECTORY_REFERENCE_HANDLE.fullmatch(value)
+    if match is None:
+        raise ValueError("trajectory handoff reference is malformed or not verifier-confirmed")
+    split, trajectory_id, task_id = match.groups()
+    reference = TrajectoryReference(
+        trajectory_id=trajectory_id,
+        task_id=task_id,
+        split=ObjectiveSplit(split),
+        verified=True,
+    )
+    if encode_trajectory_reference(reference) != value:
+        raise ValueError("trajectory handoff reference is not canonical")
+    return reference
+
 
 class BenchmarkResponse(ContractModel):
     benchmark_id: str = Field(min_length=1)
@@ -233,15 +319,17 @@ class CurationRequest(ContractModel):
 
     @field_validator("split")
     @classmethod
-    def replay_scope_only(cls, value: ObjectiveSplit) -> ObjectiveSplit:
-        if value is not ObjectiveSplit.REPLAY:
-            raise ValueError(f"split {value.value!r} is outside replay scope")
+    def curation_scope_only(cls, value: ObjectiveSplit) -> ObjectiveSplit:
+        if value not in {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}:
+            raise ValueError(f"split {value.value!r} is outside the train/replay curation scope")
         return value
 
     @model_validator(mode="after")
     def require_trajectory_input(self) -> CurationRequest:
         if not self.trajectories and not self.trajectory_references:
             raise ValueError("trajectories or trajectory_references is required")
+        if any(reference.split is not self.split for reference in self.trajectory_references):
+            raise ValueError("trajectory reference split does not match curation scope")
         return self
 
 

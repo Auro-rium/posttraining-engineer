@@ -12,11 +12,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
+import tarfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from app.objective.engine import ServiceRecoveryEngine
@@ -128,6 +130,72 @@ def _channels(
     return parsed
 
 
+def _extract_checkpoint_channel(
+    channel_dir: Path, *, name: str, expected_sha256: str, destination: Path
+) -> Path:
+    archives = tuple(channel_dir.glob("*.tar.gz"))
+    if (
+        not _SHA256.fullmatch(expected_sha256)
+        or len(archives) != 1
+        or archives[0].name != f"{expected_sha256}.tar.gz"
+        or _file_sha256(archives[0]) != expected_sha256
+    ):
+        raise EvaluationArtifactError(f"{name} checkpoint archive is not content-addressed")
+    root = destination.resolve()
+    destination.mkdir(parents=True, exist_ok=False)
+    total_size = 0
+    file_count = 0
+    try:
+        with tarfile.open(archives[0], mode="r:gz") as archive:
+            for member in archive.getmembers():
+                if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+                    raise EvaluationArtifactError(
+                        "checkpoint archive contains a link or special file"
+                    )
+                if member.size < 0 or member.size > 2 * 1024**3:
+                    raise EvaluationArtifactError("checkpoint archive member is oversized")
+                parts = tuple(
+                    part for part in PurePosixPath(member.name).parts if part not in {"", "."}
+                )
+                if not parts or PurePosixPath(member.name).is_absolute() or ".." in parts:
+                    raise EvaluationArtifactError("checkpoint archive contains an unsafe path")
+                target = destination.joinpath(*parts)
+                try:
+                    target.resolve().relative_to(root)
+                except ValueError as exc:
+                    raise EvaluationArtifactError("checkpoint archive escapes its channel") from exc
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    raise EvaluationArtifactError(
+                        "checkpoint archive contains an unsupported entry"
+                    )
+                file_count += 1
+                total_size += member.size
+                if file_count > 20_000 or total_size > 4 * 1024**3:
+                    raise EvaluationArtifactError("checkpoint archive exceeds extraction limits")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise EvaluationArtifactError("checkpoint archive member is unreadable")
+                with source, target.open("xb") as output:
+                    remaining = member.size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise EvaluationArtifactError("checkpoint archive member is truncated")
+                        output.write(chunk)
+                        remaining -= len(chunk)
+    except EvaluationArtifactError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        raise EvaluationArtifactError("checkpoint archive is invalid") from exc
+    if file_count == 0:
+        raise EvaluationArtifactError("checkpoint archive is empty")
+    return destination
+
+
 def parse_evaluation_inputs(
     env: Mapping[str, str] | None = None,
     channels: Mapping[str, str | Path] | None = None,
@@ -158,6 +226,19 @@ def parse_evaluation_inputs(
     if output_dir.exists() and not output_dir.is_dir():
         raise EvaluationWorkerError("SM_OUTPUT_DATA_DIR must be a directory")
     output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("candidate", "champion"):
+        channel = parsed_channels.get(name)
+        if channel is None or (channel / "manifest.json").is_file():
+            continue
+        if not tuple(channel.glob("*.tar.gz")):
+            continue
+        expected = _required(values, f"{name.upper()}_ARCHIVE_SHA256")
+        parsed_channels[name] = _extract_checkpoint_channel(
+            channel,
+            name=name,
+            expected_sha256=expected,
+            destination=output_dir / f"_{name}_checkpoint",
+        )
     suite_version = _required(values, "EVALUATION_SUITE_VERSION")
     if suite_version != EVALUATION_SUITE_VERSION:
         raise EvaluationWorkerError(
@@ -196,6 +277,73 @@ def _artifact_digest(files: Sequence[Mapping[str, Any]]) -> str:
     return hashlib.sha256(
         json.dumps(list(files), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _verify_trained_adapter(directory: Path, payload: Mapping[str, Any]) -> None:
+    """Reject self-consistent manifests that describe logs rather than a trained PEFT adapter."""
+
+    qlora_config = payload.get("qlora_config")
+    if not isinstance(qlora_config, Mapping):
+        raise EvaluationArtifactError("checkpoint QLoRA config is absent")
+    try:
+        from app.autonomous.agents import validate_qlora_config
+
+        expected = validate_qlora_config(qlora_config).model_dump(mode="json")
+    except Exception as exc:
+        raise EvaluationArtifactError(
+            "checkpoint QLoRA config is outside the fixed search space"
+        ) from exc
+    config_path = directory / "adapter_config.json"
+    if not config_path.is_file() or config_path.is_symlink():
+        raise EvaluationArtifactError("checkpoint adapter_config.json is absent")
+    try:
+        adapter_config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvaluationArtifactError("checkpoint adapter_config.json is not valid JSON") from exc
+    if not isinstance(adapter_config, dict):
+        raise EvaluationArtifactError("checkpoint adapter_config.json must be a JSON object")
+    target_modules = adapter_config.get("target_modules")
+    if not isinstance(target_modules, (list, tuple, set)) or any(
+        not isinstance(module, str) for module in target_modules
+    ):
+        raise EvaluationArtifactError("checkpoint adapter target modules are invalid")
+    if (
+        adapter_config.get("base_model_name_or_path") != "google/functiongemma-270m-it"
+        or adapter_config.get("peft_type") != "LORA"
+        or adapter_config.get("task_type") != "CAUSAL_LM"
+        or adapter_config.get("r") != expected["rank"]
+        or adapter_config.get("lora_alpha") != expected["alpha"]
+        or adapter_config.get("lora_dropout") != expected["dropout"]
+        or set(target_modules) != set(expected["target_modules"])
+    ):
+        raise EvaluationArtifactError("checkpoint adapter config does not match its QLoRA manifest")
+    weights = tuple(
+        path
+        for suffix in (".safetensors", ".bin")
+        for path in directory.glob(f"adapter_model*{suffix}")
+        if path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+    )
+    if not weights:
+        raise EvaluationArtifactError("checkpoint contains no non-empty adapter weights")
+    metrics = payload.get("training_metrics")
+    loss = metrics.get("train_loss") if isinstance(metrics, Mapping) else None
+    if (
+        not isinstance(metrics, Mapping)
+        or not metrics
+        or not isinstance(loss, (int, float))
+        or isinstance(loss, bool)
+        or not math.isfinite(float(loss))
+    ):
+        raise EvaluationArtifactError("checkpoint training metrics lack a finite train_loss")
+    metrics_path = directory / "training_metrics.json"
+    if not metrics_path.is_file() or metrics_path.is_symlink():
+        raise EvaluationArtifactError("checkpoint training_metrics.json is absent")
+    try:
+        persisted_metrics = json.loads(metrics_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvaluationArtifactError("checkpoint training_metrics.json is not valid JSON") from exc
+    if persisted_metrics != dict(metrics):
+        raise EvaluationArtifactError("checkpoint metrics file does not match its manifest")
 
 
 def verify_checkpoint_artifact(
@@ -290,6 +438,7 @@ def verify_checkpoint_artifact(
     }
     if actual_paths != listed_paths:
         raise EvaluationArtifactError("checkpoint manifest is not complete for directory contents")
+    _verify_trained_adapter(directory, payload)
     return payload
 
 

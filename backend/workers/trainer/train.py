@@ -10,13 +10,14 @@ hard failure; this worker never emits a fabricated checkpoint manifest.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
+import math
 import os
 import re
+import tarfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 BASE_MODEL_ID = "google/functiongemma-270m-it"
@@ -55,8 +56,7 @@ class TrainingInputs:
     approved_parent_artifact_id: str | None = None
     approved_parent_manifest_sha256: str | None = None
     approved_parent_artifact_sha256: str | None = None
-    dataset_provenance_signature: str | None = None
-    dataset_provenance_key: str | None = None
+    approved_parent_archive_sha256: str | None = None
     dataset_artifact_id: str | None = None
 
 
@@ -88,15 +88,77 @@ def _normalise_channels(channels: Mapping[str, str | Path]) -> dict[str, Path]:
         key = str(name).strip().lower()
         if key in _SEALED_NAMES or any(part in _SEALED_NAMES for part in key.split("_")):
             raise TrainingWorkerError(f"trainer cannot consume sealed/evaluation channel {name!r}")
-        if key != "train":
+        if key not in {"train", "parent_adapter"}:
             raise TrainingWorkerError(
-                f"unsupported trainer channel {name!r}; only train is allowed"
+                f"unsupported trainer channel {name!r}; use train or parent_adapter"
             )
         candidate = Path(value).expanduser()
         if not candidate.exists() or not candidate.is_dir():
             raise TrainingWorkerError("train channel must be an existing directory")
         normalised[key] = candidate.resolve()
     return normalised
+
+
+def _extract_checkpoint_archive(archive_path: Path, destination: Path) -> Path:
+    """Safely unpack a SageMaker checkpoint archive into a fresh directory."""
+
+    root = destination.resolve()
+    if destination.exists():
+        raise TrainingWorkerError("parent adapter extraction directory already exists")
+    destination.mkdir(parents=True)
+    total_size = 0
+    file_count = 0
+    try:
+        with tarfile.open(archive_path, mode="r:gz") as archive:
+            for member in archive.getmembers():
+                if member.islnk() or member.issym() or member.isdev() or member.isfifo():
+                    raise TrainingWorkerError(
+                        "parent adapter archive contains a link or special file"
+                    )
+                if member.size < 0 or member.size > 2 * 1024**3:
+                    raise TrainingWorkerError("parent adapter archive member is oversized")
+                parts = tuple(
+                    part for part in PurePosixPath(member.name).parts if part not in {"", "."}
+                )
+                if not parts or PurePosixPath(member.name).is_absolute() or ".." in parts:
+                    raise TrainingWorkerError("parent adapter archive contains an unsafe path")
+                target = destination.joinpath(*parts)
+                try:
+                    target.resolve().relative_to(root)
+                except ValueError as exc:
+                    raise TrainingWorkerError(
+                        "parent adapter archive escapes its extraction directory"
+                    ) from exc
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    raise TrainingWorkerError(
+                        "parent adapter archive contains an unsupported entry"
+                    )
+                file_count += 1
+                total_size += member.size
+                if file_count > 20_000 or total_size > 4 * 1024**3:
+                    raise TrainingWorkerError("parent adapter archive exceeds extraction limits")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise TrainingWorkerError("parent adapter archive member is unreadable")
+                with source, target.open("xb") as output:
+                    remaining = member.size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise TrainingWorkerError("parent adapter archive member is truncated")
+                        output.write(chunk)
+                        remaining -= len(chunk)
+    except TrainingWorkerError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        raise TrainingWorkerError("parent adapter archive is invalid") from exc
+    if file_count == 0:
+        raise TrainingWorkerError("parent adapter archive is empty")
+    return destination
 
 
 def parse_training_inputs(
@@ -110,13 +172,16 @@ def parse_training_inputs(
     for env_name, env_value in values.items():
         if env_name.startswith("SM_CHANNEL_") and env_value.strip():
             channel_name = env_name.removeprefix("SM_CHANNEL_").lower()
-            if channel_name != "train":
+            if channel_name not in {"train", "parent_adapter"}:
                 _normalise_channels({channel_name: env_value})
     train_env = values.get("SM_CHANNEL_TRAIN", "").strip()
     if not train_env and "train" not in channel_values:
         raise TrainingWorkerError("SM_CHANNEL_TRAIN is required")
     if train_env:
         channel_values.setdefault("train", train_env)
+    parent_channel = values.get("SM_CHANNEL_PARENT_ADAPTER", "").strip()
+    if parent_channel:
+        channel_values.setdefault("parent_adapter", parent_channel)
     channel_paths = _normalise_channels(channel_values)
     train_dir = channel_paths["train"]
     model_dir = Path(_required(values, "SM_MODEL_DIR")).expanduser().resolve()
@@ -131,6 +196,26 @@ def parse_training_inputs(
         raise TrainingWorkerError(f"BASE_MODEL_ID must equal {BASE_MODEL_ID!r}")
     parent = values.get("PARENT_ADAPTER_DIR", "").strip()
     parent_path = _path(parent, "PARENT_ADAPTER_DIR") if parent else None
+    parent_archive_sha = values.get("APPROVED_PARENT_ARCHIVE_SHA256", "").strip() or None
+    if parent_archive_sha is not None:
+        _digest(parent_archive_sha, "APPROVED_PARENT_ARCHIVE_SHA256")
+    parent_channel_dir = channel_paths.get("parent_adapter")
+    if parent_channel_dir is not None:
+        if parent_path is not None:
+            raise TrainingWorkerError("parent adapter must use one channel source")
+        archives = tuple(parent_channel_dir.glob("*.tar.gz"))
+        if len(archives) != 1 or parent_archive_sha is None:
+            raise TrainingWorkerError(
+                "parent adapter channel needs one approved checkpoint archive"
+            )
+        if archives[0].name != f"{parent_archive_sha}.tar.gz":
+            raise TrainingWorkerError("parent adapter archive name does not match approved digest")
+        digest = file_sha256(archives[0])
+        if digest != parent_archive_sha:
+            raise TrainingWorkerError("parent adapter archive bytes do not match approved digest")
+        parent_path = _extract_checkpoint_archive(
+            archives[0], model_dir.parent / f"{model_dir.name}-approved-parent-adapter"
+        )
     config_text = values.get("QLORA_CONFIG", "").strip()
     config: Mapping[str, Any] | None = None
     if config_text:
@@ -163,19 +248,21 @@ def parse_training_inputs(
     if parent_artifact_digest is not None:
         _digest(parent_artifact_digest, "APPROVED_PARENT_ARTIFACT_SHA256")
     if parent_path is not None and (
-        not parent_id or not parent_manifest_digest or not parent_artifact_digest
+        not parent_id
+        or not parent_manifest_digest
+        or not parent_artifact_digest
+        or not parent_archive_sha
     ):
         raise TrainingWorkerError(
             "approved parent artifact ID and manifest/artifact digests are required"
         )
-    provenance_signature = values.get("DATASET_PROVENANCE_SIGNATURE", "").strip() or None
-    if provenance_signature is not None:
-        _digest(provenance_signature, "DATASET_PROVENANCE_SIGNATURE")
     dataset_artifact_id = (
         values.get("APPROVED_DATASET_ARTIFACT_ID", "").strip()
         or values.get("DATASET_ARTIFACT_ID", "").strip()
         or None
     )
+    if dataset_artifact_id != f"dataset://{_required(values, 'DATASET_ID')}":
+        raise TrainingWorkerError("APPROVED_DATASET_ARTIFACT_ID is not bound to DATASET_ID")
     return TrainingInputs(
         train_dir=train_dir,
         model_dir=model_dir,
@@ -190,8 +277,7 @@ def parse_training_inputs(
         approved_parent_artifact_id=parent_id,
         approved_parent_manifest_sha256=parent_manifest_digest,
         approved_parent_artifact_sha256=parent_artifact_digest,
-        dataset_provenance_signature=provenance_signature,
-        dataset_provenance_key=values.get("DATASET_PROVENANCE_KEY", "").strip() or None,
+        approved_parent_archive_sha256=parent_archive_sha,
         dataset_artifact_id=dataset_artifact_id,
     )
 
@@ -225,6 +311,81 @@ def _artifact_files(output_dir: Path) -> list[dict[str, Any]]:
         }
         for item in files
     ]
+
+
+def _training_metrics_from_output(
+    output_dir: Path, supplied: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    metrics_path = output_dir / "training_metrics.json"
+    if not metrics_path.is_file() or metrics_path.is_symlink():
+        raise TrainingArtifactError("training output is missing regular training_metrics.json")
+    try:
+        metrics = json.loads(metrics_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TrainingArtifactError("training_metrics.json is not valid JSON") from exc
+    if not isinstance(metrics, dict) or not metrics:
+        raise TrainingArtifactError("training output lacks actual SFT metrics")
+    if supplied is not None and metrics != dict(supplied):
+        raise TrainingArtifactError("training_metrics.json does not match the training result")
+    loss = metrics.get("train_loss")
+    if (
+        not isinstance(loss, (int, float))
+        or isinstance(loss, bool)
+        or not math.isfinite(float(loss))
+        or any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            for value in metrics.values()
+        )
+    ):
+        raise TrainingArtifactError("training metrics must include finite numeric train_loss")
+    return metrics
+
+
+def _validate_trained_adapter(
+    output_dir: Path,
+    *,
+    qlora_config: Mapping[str, Any],
+    training_metrics: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Require the files that prove this is a trained PEFT adapter, not a log bundle."""
+
+    adapter_config_path = output_dir / "adapter_config.json"
+    if not adapter_config_path.is_file() or adapter_config_path.is_symlink():
+        raise TrainingArtifactError("training output is missing a regular adapter_config.json")
+    try:
+        adapter_config = json.loads(adapter_config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TrainingArtifactError("adapter_config.json is not valid JSON") from exc
+    if not isinstance(adapter_config, dict):
+        raise TrainingArtifactError("adapter_config.json must be a JSON object")
+    target_modules = adapter_config.get("target_modules")
+    if not isinstance(target_modules, (list, tuple, set)) or any(
+        not isinstance(module, str) for module in target_modules
+    ):
+        raise TrainingArtifactError("adapter_config.json target modules are invalid")
+    expected = _validate_qlora(qlora_config)
+    if (
+        adapter_config.get("base_model_name_or_path") != BASE_MODEL_ID
+        or adapter_config.get("peft_type") != "LORA"
+        or adapter_config.get("task_type") != "CAUSAL_LM"
+        or adapter_config.get("r") != expected["rank"]
+        or adapter_config.get("lora_alpha") != expected["alpha"]
+        or adapter_config.get("lora_dropout") != expected["dropout"]
+        or set(target_modules) != set(expected["target_modules"])
+    ):
+        raise TrainingArtifactError("adapter_config.json does not match the pinned QLoRA job")
+    weight_files = tuple(
+        path
+        for suffix in (".safetensors", ".bin")
+        for path in output_dir.glob(f"adapter_model*{suffix}")
+        if path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+    )
+    if not weight_files:
+        raise TrainingArtifactError("training output contains no non-empty PEFT adapter weights")
+    _training_metrics_from_output(output_dir, training_metrics)
+    return adapter_config
 
 
 def _artifact_digest(files: list[dict[str, Any]]) -> str:
@@ -396,6 +557,13 @@ def _verify_manifest_directory(directory: Path, *, label: str) -> dict[str, Any]
         or not files
     ):
         raise TrainingWorkerError(f"{label} manifest is incomplete")
+    qlora_config = payload.get("qlora_config")
+    training_metrics = payload.get("training_metrics")
+    if not isinstance(qlora_config, Mapping) or not isinstance(training_metrics, Mapping):
+        raise TrainingWorkerError(f"{label} manifest has no QLoRA config or SFT metrics")
+    _validate_trained_adapter(
+        directory, qlora_config=qlora_config, training_metrics=training_metrics
+    )
     unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
     if _manifest_digest(unsigned) != digest:
         raise TrainingWorkerError(f"{label} manifest checksum does not match content")
@@ -479,6 +647,8 @@ def write_training_manifest(
         raise TrainingWorkerError("dataset manifest does not match training input")
     files = _artifact_files(output_dir)
     config = _validate_qlora(qlora_config)
+    metrics = _training_metrics_from_output(output_dir, training_metrics)
+    _validate_trained_adapter(output_dir, qlora_config=config, training_metrics=metrics)
     parent: dict[str, Any] | None = None
     if parent_manifest is not None:
         parent = {
@@ -533,16 +703,8 @@ def write_training_manifest(
     }
     if parent is not None:
         payload["parent_adapter"] = parent
-    if training_metrics is not None:
-        metrics = json.loads(json.dumps(dict(training_metrics), sort_keys=True))
-        if not isinstance(metrics, dict) or not metrics:
-            raise TrainingWorkerError("training metrics must be a non-empty mapping")
-        if any(
-            not isinstance(value, (int, float)) or isinstance(value, bool)
-            for value in metrics.values()
-        ):
-            raise TrainingWorkerError("training metrics must contain numeric values")
-        payload["training_metrics"] = metrics
+    metrics = json.loads(json.dumps(metrics, sort_keys=True, allow_nan=False))
+    payload["training_metrics"] = metrics
     payload["manifest_sha256"] = _manifest_digest(payload)
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
@@ -614,32 +776,18 @@ def load_training_dataset(inputs: TrainingInputs) -> Any:
     return dataset
 
 
-def _dataset_provenance_payload(dataset: Any, artifact_id: str) -> bytes:
-    """Canonical bytes authenticated by the coordinator's dataset signer."""
-
-    manifest = dataset.manifest.model_dump(mode="json")
-    return json.dumps(
-        {"artifact_id": artifact_id, "manifest": manifest, "row_digest": manifest["sha256"]},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-
-
 def _verify_dataset_provenance(dataset: Any, inputs: TrainingInputs) -> None:
-    signature = inputs.dataset_provenance_signature
-    key = inputs.dataset_provenance_key
     artifact_id = inputs.dataset_artifact_id
-    if not signature or not key or not artifact_id:
+    if (
+        artifact_id != f"dataset://{dataset.manifest.dataset_id}"
+        or dataset.manifest.dataset_id != inputs.dataset_id
+        or dataset.manifest.run_id != inputs.run_id
+        or dataset.manifest.experiment_id != inputs.experiment_id
+        or dataset.manifest.sha256 != inputs.dataset_sha256
+    ):
         raise TrainingWorkerError(
-            "authenticated dataset provenance requires artifact ID, signature, and key"
+            "dataset provenance is not bound to its verified manifest and rows"
         )
-    expected = hmac.new(
-        key.encode("utf-8"),
-        _dataset_provenance_payload(dataset, artifact_id),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected, signature):
-        raise TrainingWorkerError("dataset provenance authentication failed")
 
 
 def _validate_qlora(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -654,6 +802,10 @@ def _validate_qlora(config: Mapping[str, Any]) -> dict[str, Any]:
 def run_training(inputs: TrainingInputs) -> Path:
     """Run actual Transformers/PEFT QLoRA training and return its manifest."""
 
+    if not inputs.model_dir.exists() or not inputs.model_dir.is_dir():
+        raise TrainingWorkerError("SM_MODEL_DIR must be an existing empty directory")
+    if any(inputs.model_dir.iterdir()):
+        raise TrainingWorkerError("SM_MODEL_DIR must be empty before a new training run")
     dataset = load_training_dataset(inputs)
     config = _validate_qlora(inputs.qlora_config or {})
     parent_manifest: dict[str, Any] | None = None

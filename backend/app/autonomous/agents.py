@@ -199,7 +199,7 @@ class ResearchHypothesis(_HandoffModel):
 
 
 class CuratedDatasetPlan(_HandoffModel):
-    """Selection of verified trajectory references eligible for SFT."""
+    """Judgment-only selection; the objective worker creates the dataset artifact later."""
 
     plan_id: StrictStr = Field(
         min_length=1,
@@ -211,16 +211,15 @@ class CuratedDatasetPlan(_HandoffModel):
             "selected_trajectory_refs", "trajectory_references", "selected_record_ids"
         ),
     )
-    dataset_artifact_ref: StrictStr = Field(
+    target_failure_classes: tuple[StrictStr, ...] = Field(
         min_length=1,
-        validation_alias=AliasChoices("dataset_artifact_ref", "dataset_reference"),
+        validation_alias=AliasChoices("target_failure_classes", "failure_classes"),
     )
-    record_count: StrictInt | None = Field(
-        default=None,
+    record_count: StrictInt = Field(
         ge=1,
         validation_alias=AliasChoices("record_count", "selected_record_count"),
     )
-    evidence_class: StrictStr = "LIVE"
+    evidence_class: StrictStr
 
     @model_validator(mode="after")
     def validate_evidence(self) -> CuratedDatasetPlan:
@@ -228,10 +227,12 @@ class CuratedDatasetPlan(_HandoffModel):
             raise ValueError("curated datasets require LIVE or PRIOR_VERIFIED_RUN evidence")
         if any(not _REFERENCE_PATTERN.fullmatch(ref) for ref in self.selected_trajectory_refs):
             raise ValueError("selected_trajectory_refs must contain non-empty references")
-        if self.record_count is not None and self.record_count != len(
-            self.selected_trajectory_refs
-        ):
+        if self.record_count != len(self.selected_trajectory_refs):
             raise ValueError("record_count must equal selected_trajectory_refs length")
+        if len(set(self.target_failure_classes)) != len(self.target_failure_classes) or any(
+            not item.strip() for item in self.target_failure_classes
+        ):
+            raise ValueError("target_failure_classes must be non-empty and unique")
         return self
 
     @property
@@ -311,15 +312,58 @@ def _json_response(raw: Any) -> Any:
     if isinstance(raw, (Mapping, list)):
         return raw
     if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProviderHandoffError("provider returned invalid UTF-8 JSON") from exc
     if not isinstance(raw, str):
-        for attribute in ("text", "output", "content"):
-            value = getattr(raw, attribute, None)
-            if value is not None:
-                return _json_response(value)
-        raise ProviderHandoffError("provider returned a non-JSON response")
+        message = getattr(raw, "message", None)
+        if message is not None:
+            if not isinstance(message, Mapping):
+                raise ProviderHandoffError("Strands AgentResult message must be an object")
+            blocks = message.get("content")
+            if not isinstance(blocks, list) or not blocks:
+                raise ProviderHandoffError("Strands AgentResult has no text content blocks")
+            text_blocks: list[str] = []
+            for block in blocks:
+                if (
+                    not isinstance(block, Mapping)
+                    or set(block) != {"text"}
+                    or not isinstance(block.get("text"), str)
+                ):
+                    raise ProviderHandoffError(
+                        "Strands AgentResult contains a non-text or malformed content block"
+                    )
+                text_blocks.append(block["text"])
+            # Strands represents the assistant turn as text content blocks;
+            # concatenate them without coercing other block types to strings.
+            raw = "".join(text_blocks)
+        else:
+            for attribute in ("text", "output", "content"):
+                value = getattr(raw, attribute, None)
+                if value is not None:
+                    return _json_response(value)
+            raise ProviderHandoffError("provider returned a non-JSON response")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ProviderHandoffError(f"provider JSON contains duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_non_json_constant(value: str) -> None:
+        raise ProviderHandoffError(f"provider JSON contains invalid constant: {value}")
+
     try:
-        return json.loads(raw)
+        return json.loads(
+            raw,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_non_json_constant,
+        )
+    except ProviderHandoffError:
+        raise
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ProviderHandoffError("provider returned invalid strict JSON") from exc
 
@@ -484,17 +528,29 @@ class AutonomousAgentAdapters:
         self,
         trajectory_references: Sequence[str],
         experiment_history: Sequence[Any] = (),
+        *,
+        evidence_class: str,
     ) -> tuple[FailureCluster, ...]:
         refs = _references(trajectory_references, "trajectory_references")
+        if evidence_class not in _VERIFIED_CLASSES:
+            raise ProviderHandoffError(
+                "failure analysis requires coordinator-verified evidence_class"
+            )
         history = _mapping_history(experiment_history)
         response = self._call(
             "FailureAnalystAgent",
-            {"trajectory_references": refs, "experiment_history": history},
+            {
+                "trajectory_references": refs,
+                "experiment_history": history,
+                "evidence_class": evidence_class,
+            },
         )
         try:
             raw_items, response_class = _collection(response, "clusters")
-            if response_class not in _VERIFIED_CLASSES:
-                raise ProviderHandoffError("failure analysis must cite verified evidence")
+            if response_class != evidence_class:
+                raise ProviderHandoffError(
+                    "failure-analysis evidence_class must match coordinator provenance"
+                )
             for item in raw_items:
                 if not isinstance(item, Mapping) or item.get("evidence_class") != response_class:
                     raise ProviderHandoffError(
@@ -519,9 +575,16 @@ class AutonomousAgentAdapters:
         self,
         failure_clusters: Sequence[FailureCluster | Mapping[str, Any]],
         experiment_history: Sequence[Any] = (),
+        *,
+        run_id: str,
+        experiment_number: int,
         verified_evidence_references: Sequence[str] | None = None,
         verified_evidence_metadata: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> tuple[ResearchHypothesis, ...]:
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ProviderHandoffError("research requires coordinator run_id")
+        if type(experiment_number) is not int or not 1 <= experiment_number <= 5:
+            raise ProviderHandoffError("research requires experiment_number from 1 through 5")
         cluster_models = tuple(
             item if isinstance(item, FailureCluster) else FailureCluster.model_validate(item)
             for item in failure_clusters
@@ -535,7 +598,10 @@ class AutonomousAgentAdapters:
         if not cluster_refs.issubset(verified_refs):
             raise ProviderHandoffError("failure-cluster evidence is not coordinator-verified")
         evidence_metadata = _coordinator_evidence_metadata(
-            verified_evidence_metadata, verified_refs
+            verified_evidence_metadata,
+            verified_refs,
+            run_id=run_id,
+            experiment_number=experiment_number,
         )
         clusters = [item.model_dump(mode="json") for item in cluster_models]
         history = _mapping_history(experiment_history)
@@ -543,6 +609,8 @@ class AutonomousAgentAdapters:
             "ResearchAgent",
             {
                 "failure_clusters": clusters,
+                "run_id": run_id,
+                "experiment_number": experiment_number,
                 "verified_evidence_references": sorted(verified_refs),
                 "verified_evidence_metadata": evidence_metadata,
                 "experiment_history": history,
@@ -569,6 +637,8 @@ class AutonomousAgentAdapters:
         self._reject_failed_duplicates(
             hypotheses,
             history,
+            run_id=run_id,
+            experiment_number=experiment_number,
             verified_refs=verified_refs,
             evidence_metadata=evidence_metadata,
         )
@@ -581,10 +651,20 @@ class AutonomousAgentAdapters:
         verified_trajectory_references: Sequence[str],
         hypotheses: Sequence[ResearchHypothesis | Mapping[str, Any]] = (),
         experiment_history: Sequence[Any] = (),
-        verified_dataset_artifact_references: Sequence[str] | None = None,
+        *,
+        failure_clusters: Sequence[FailureCluster | Mapping[str, Any]],
+        verified_trajectory_metadata: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> CuratedDatasetPlan:
         refs = _references(verified_trajectory_references, "verified_trajectory_references")
         history = _mapping_history(experiment_history)
+        cluster_models = tuple(
+            item if isinstance(item, FailureCluster) else FailureCluster.model_validate(item)
+            for item in failure_clusters
+        )
+        if not cluster_models:
+            raise ProviderHandoffError("curation requires coordinator-verified failure clusters")
+        if any(not set(item.evidence_refs).issubset(set(refs)) for item in cluster_models):
+            raise ProviderHandoffError("failure-cluster evidence is not coordinator-verified")
         hypothesis_models = tuple(
             item
             if isinstance(item, ResearchHypothesis)
@@ -594,22 +674,22 @@ class AutonomousAgentAdapters:
         verified_refs = set(refs)
         if any(not set(item.evidence_refs).issubset(verified_refs) for item in hypothesis_models):
             raise ProviderHandoffError("hypothesis evidence_refs are not coordinator-verified")
-        if verified_dataset_artifact_references is None:
+        cluster_ids = {item.cluster_id for item in cluster_models}
+        if any(item.cluster_id not in cluster_ids for item in hypothesis_models):
             raise ProviderHandoffError(
-                "curation requires coordinator-owned dataset artifact provenance"
+                "hypothesis references a failure cluster outside coordinator input"
             )
-        verified_dataset_refs = set(
-            _references(
-                verified_dataset_artifact_references,
-                "verified_dataset_artifact_references",
-            )
+        trajectory_metadata = _coordinator_trajectory_metadata(
+            verified_trajectory_metadata, set(refs)
         )
+        clusters = [item.model_dump(mode="json") for item in cluster_models]
         hypothesis_values = [item.model_dump(mode="json") for item in hypothesis_models]
         response = self._call(
             "DataCuratorAgent",
             {
                 "verified_trajectory_references": refs,
-                "verified_dataset_artifact_references": sorted(verified_dataset_refs),
+                "verified_trajectory_metadata": trajectory_metadata,
+                "failure_clusters": clusters,
                 "hypotheses": hypothesis_values,
                 "experiment_history": history,
             },
@@ -629,9 +709,19 @@ class AutonomousAgentAdapters:
             raise ProviderHandoffError(
                 "curation selected a trajectory outside verified input references"
             )
-        if plan.dataset_artifact_ref not in verified_dataset_refs:
+        allowed_failure_classes = {item.failure_type for item in cluster_models}
+        if not set(plan.target_failure_classes).issubset(allowed_failure_classes):
             raise ProviderHandoffError(
-                "curation returned a dataset artifact without coordinator provenance"
+                "curation selected a failure class outside coordinator-verified clusters"
+            )
+        selected_classes = {
+            trajectory_metadata[ref]["evidence_class"]
+            for ref in plan.selected_trajectory_refs
+        }
+        if len(selected_classes) != 1 or plan.evidence_class not in selected_classes:
+            raise ProviderHandoffError(
+                "curation evidence_class must match coordinator provenance for selected "
+                "trajectories"
             )
         return plan
 
@@ -671,46 +761,71 @@ class AutonomousAgentAdapters:
         hypotheses: Sequence[ResearchHypothesis],
         history: Sequence[Mapping[str, Any]],
         *,
+        run_id: str,
+        experiment_number: int,
         verified_refs: set[str],
         evidence_metadata: Mapping[str, Mapping[str, Any]],
     ) -> None:
+        observed_fingerprints: set[str] = set()
+        for hypothesis in hypotheses:
+            if hypothesis.fingerprint in observed_fingerprints:
+                raise DuplicateHypothesisError(
+                    "provider returned duplicate hypotheses in the same response"
+                )
+            observed_fingerprints.add(hypothesis.fingerprint)
+
         failed = [
             item
             for item in history
             if str(item.get("status", "")).lower() in {"failed", "rejected"}
+            and item.get("run_id", run_id) == run_id
         ]
-        prior: dict[str, set[str]] = {}
+        prior: dict[str, list[tuple[set[str], int | None]]] = {}
         for item in failed:
             fingerprint = item.get("fingerprint")
             if isinstance(fingerprint, str):
-                prior.setdefault(fingerprint, set()).update(_history_refs(item))
+                prior.setdefault(fingerprint, []).append(
+                    (_history_refs(item), _history_experiment_number(item))
+                )
             try:
-                prior.setdefault(hypothesis_fingerprint(item), set()).update(_history_refs(item))
+                prior.setdefault(hypothesis_fingerprint(item), []).append(
+                    (_history_refs(item), _history_experiment_number(item))
+                )
             except (TypeError, ValueError):
                 continue
         for hypothesis in hypotheses:
-            previous_refs = prior.get(hypothesis.fingerprint)
-            if previous_refs is None:
+            previous_attempts = prior.get(hypothesis.fingerprint)
+            if not previous_attempts:
                 continue
             current_refs = set(hypothesis.evidence_refs)
-            new_refs = current_refs.difference(previous_refs)
-            if new_refs and not new_refs.issubset(verified_refs):
-                raise DuplicateHypothesisError(
-                    f"hypothesis {hypothesis.hypothesis_id!r} cites unverified new evidence"
-                )
-            if new_refs and not new_refs.issubset(evidence_metadata):
-                raise DuplicateHypothesisError(
-                    f"hypothesis {hypothesis.hypothesis_id!r} cites evidence without "
-                    "a new measurement"
-                )
-            # A new reference is accepted only when it is coordinator-owned
-            # and has not merely been appended to bypass this guard.  The
-            # current run's verified references are the coordinator's source
-            # of truth; without one, the proposal remains a duplicate.
-            if not new_refs:
-                raise DuplicateHypothesisError(
-                    f"hypothesis {hypothesis.hypothesis_id!r} repeats a failed hypothesis"
-                )
+            for previous_refs, previous_experiment_number in previous_attempts:
+                if previous_experiment_number is None:
+                    raise DuplicateHypothesisError(
+                        "failed hypothesis history is missing experiment_number scope"
+                    )
+                if experiment_number <= previous_experiment_number:
+                    raise DuplicateHypothesisError(
+                        f"hypothesis {hypothesis.hypothesis_id!r} repeats a failed hypothesis "
+                        "within the same run/experiment scope"
+                    )
+                new_refs = current_refs.difference(previous_refs)
+                if not new_refs:
+                    raise DuplicateHypothesisError(
+                        f"hypothesis {hypothesis.hypothesis_id!r} repeats a failed hypothesis"
+                    )
+                if not new_refs.issubset(verified_refs):
+                    raise DuplicateHypothesisError(
+                        f"hypothesis {hypothesis.hypothesis_id!r} cites unverified new evidence"
+                    )
+                if any(
+                    evidence_metadata[ref]["run_id"] != run_id
+                    or evidence_metadata[ref]["experiment_number"] != experiment_number
+                    for ref in new_refs
+                ):
+                    raise DuplicateHypothesisError(
+                        f"hypothesis {hypothesis.hypothesis_id!r} lacks new evidence for the "
+                        "current run/experiment"
+                    )
 
 
 def _history_refs(item: Mapping[str, Any]) -> set[str]:
@@ -730,40 +845,82 @@ def _history_refs(item: Mapping[str, Any]) -> set[str]:
     return references
 
 
-def _coordinator_evidence_metadata(
+def _history_experiment_number(item: Mapping[str, Any]) -> int | None:
+    value = item.get("experiment_number")
+    return value if type(value) is int and 1 <= value <= 5 else None
+
+
+def _coordinator_trajectory_metadata(
     metadata: Mapping[str, Mapping[str, Any]] | None,
     verified_refs: set[str],
 ) -> dict[str, dict[str, Any]]:
-    """Validate coordinator-owned proof for evidence that bypasses a duplicate."""
+    """Validate coordinator-owned source provenance for every trajectory ref."""
 
     if metadata is None:
-        return {}
-    result: dict[str, dict[str, Any]] = {}
+        raise ProviderHandoffError("handoff requires coordinator-verified trajectory metadata")
+    if set(metadata) != verified_refs:
+        raise ProviderHandoffError(
+            "trajectory metadata must cover exactly the coordinator-verified references"
+        )
     allowed = {
         "verified",
         "run_id",
-        "experiment_id",
+        "experiment_number",
         "measurement_id",
         "artifact_id",
         "evidence_class",
     }
+    result: dict[str, dict[str, Any]] = {}
     for ref, value in metadata.items():
-        if not isinstance(ref, str) or not _REFERENCE_PATTERN.fullmatch(ref):
-            raise ValueError("coordinator evidence metadata has an invalid reference")
-        if ref not in verified_refs:
-            raise ValueError("coordinator evidence metadata contains an unverified reference")
         if not isinstance(value, Mapping) or set(value).difference(allowed):
-            raise ValueError("coordinator evidence metadata must be allowlisted metadata")
+            raise ProviderHandoffError(
+                "trajectory metadata must be allowlisted coordinator metadata"
+            )
         if value.get("verified") is not True:
-            raise ValueError("coordinator evidence must be explicitly verified")
-        if not isinstance(value.get("run_id"), str) or not value["run_id"].strip():
-            raise ValueError("coordinator evidence requires an owning run_id")
-        measurement = value.get("measurement_id", value.get("artifact_id"))
-        if not isinstance(measurement, str) or not _REFERENCE_PATTERN.fullmatch(measurement):
-            raise ValueError("coordinator evidence requires a verified measurement or artifact")
+            raise ProviderHandoffError("trajectory evidence must be explicitly verified")
+        if (
+            not isinstance(value.get("run_id"), str)
+            or not value["run_id"].strip()
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", value["run_id"]) is None
+        ):
+            raise ProviderHandoffError("trajectory evidence requires an opaque source run_id")
+        experiment_number = value.get("experiment_number")
+        if type(experiment_number) is not int or not 1 <= experiment_number <= 5:
+            raise ProviderHandoffError("trajectory evidence requires source experiment_number 1..5")
         if value.get("evidence_class") not in _VERIFIED_CLASSES:
-            raise ValueError("coordinator evidence must use verified evidence_class")
+            raise ProviderHandoffError("trajectory evidence must use LIVE or PRIOR_VERIFIED_RUN")
+        artifact_ref = value.get("artifact_id", value.get("measurement_id"))
+        if not isinstance(artifact_ref, str) or not _REFERENCE_PATTERN.fullmatch(artifact_ref):
+            raise ProviderHandoffError("trajectory evidence requires a verified artifact reference")
+        for key in ("artifact_id", "measurement_id"):
+            candidate = value.get(key)
+            if candidate is not None and (
+                not isinstance(candidate, str) or not _REFERENCE_PATTERN.fullmatch(candidate)
+            ):
+                raise ProviderHandoffError(f"trajectory metadata {key} must be an opaque reference")
         result[ref] = dict(value)
+    return result
+
+
+def _coordinator_evidence_metadata(
+    metadata: Mapping[str, Mapping[str, Any]] | None,
+    verified_refs: set[str],
+    *,
+    run_id: str,
+    experiment_number: int,
+) -> dict[str, dict[str, Any]]:
+    """Validate coordinator-owned proof and bind it to this run/experiment."""
+
+    result = _coordinator_trajectory_metadata(metadata, verified_refs)
+    for _, value in result.items():
+        if value.get("run_id") != run_id:
+            raise ValueError("coordinator evidence run_id must match the active run")
+        if value.get("experiment_number") != experiment_number or type(
+            value.get("experiment_number")
+        ) is not int:
+            raise ValueError(
+                "coordinator evidence experiment_number must match the active experiment"
+            )
     return result
 
 

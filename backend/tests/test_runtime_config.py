@@ -49,3 +49,37 @@ def test_telemetry_can_be_disabled_for_local_diagnostics() -> None:
 def test_bedrock_auth_mode_rejects_bearer_fallback() -> None:
     with pytest.raises(ValidationError, match="bedrock_auth_mode"):
         RuntimeConfig(_env_file=None, bedrock_auth_mode="bearer")
+
+
+def test_objective_role_requires_durable_artifacts_and_auth_token() -> None:
+    with pytest.raises(ValidationError, match="objective"):
+        RuntimeConfig(_env_file=None, service_role="objective")
+
+    with pytest.raises(ValidationError, match="objective_auth_token"):
+        RuntimeConfig(
+            _env_file=None,
+            service_role="objective",
+            s3_artifact_bucket="objective-artifacts",
+        )
+
+    with pytest.raises(ValidationError, match="s3_artifact_bucket"):
+        RuntimeConfig(
+            _env_file=None,
+            service_role="objective",
+            objective_auth_token="token-value",
+        )
+
+
+def test_aws_objective_role_does_not_require_coordinator_adapters() -> None:
+    settings = RuntimeConfig(
+        _env_file=None,
+        app_mode="aws",
+        service_role="objective",
+        s3_artifact_bucket="objective-artifacts",
+        s3_artifact_prefix="objective",
+        objective_auth_token="token-value",
+    )
+
+    assert settings.service_role == "objective"
+    assert settings.s3_artifact_bucket == "objective-artifacts"
+    assert settings.objective_auth_token == "token-value"

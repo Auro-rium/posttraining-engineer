@@ -23,6 +23,13 @@
 - Persist a transition before the next side effect and reconcile deterministic provider operations after restart.
 - Use TDD: each behavior test is run red before production implementation and green afterward.
 
+## Live deployment checkpoint (2026-09-12)
+
+- **Scope:** AWS deployment and live-run activity is limited to this AWS Agents for Humans hackathon project; do not change unrelated AWS resources.
+- **Quota status:** Operator-reported SageMaker GPU quota request `9a3453884e2c4230a6e8bb0004c8cca57FuK8VC5` is `PENDING` as of 2026-09-12. This is not an approval or a placement reservation.
+- **Evidence boundary:** No completed end-to-end live post-training run is claimed by this checkpoint. Local tests, CDK synthesis, Bedrock connectivity smoke, and agent prompt calls do not substitute for SageMaker training, held-out evaluation, artifact verification, and deterministic promotion.
+- **Next safe gate:** Refresh the quota request and AWS account state, then require a fresh read-only preflight and explicit one-run approval before submitting compute. Record deployment and run results only after independent live verification.
+
 ---
 
 ### Task 1: Durable autonomous run state and repository
