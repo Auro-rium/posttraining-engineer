@@ -499,11 +499,12 @@ def test_functiongemma_prompt_explicitly_activates_function_calling_mode() -> No
     messages = _messages(task, ())
 
     assert messages[0]["role"] == "developer"
-    assert (
+    assert messages[0]["content"] == (
         "You are a model that can do function calling with the following functions"
-        in messages[0]["content"]
     )
-    assert "one call at a time" in messages[0]["content"]
+    assert messages[1]["role"] == "user"
+    assert task.service_name in messages[1]["content"]
+    assert task.objective in messages[1]["content"]
 
 
 def test_function_parse_failure_telemetry_uses_safe_categorical_code(

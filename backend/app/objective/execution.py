@@ -626,21 +626,15 @@ def _messages(task: Task, observations: Sequence[Mapping[str, Any]]) -> list[dic
     messages = [
         {
             "role": "developer",
-            "content": (
-                "You are a model that can do function calling with the following functions. "
-                "Use the provided service-recovery functions one call at a time."
-            ),
+            # FunctionGemma's documented activation prompt is intentionally
+            # exact: additional directives degrade the base model's tool-call
+            # emission before task-specific fine-tuning.
+            "content": "You are a model that can do function calling with the following functions",
         },
         {
             "role": "user",
-            "content": json.dumps(
-                {
-                    "task_id": task.task_id,
-                    "objective": task.objective,
-                    "service": task.service_name,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+            "content": (
+                f"The {task.service_name} service failed its health check. {task.objective}."
             ),
         },
     ]
