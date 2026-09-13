@@ -1,5 +1,13 @@
 # Change Log
 
+## 2026-09-13 — `FUNCTIONGEMMA-TOOLCALL-ACTIVATION-001`
+
+- **Goal:** Resolve the deployed FunctionGemma objective request's `FUNCTION_PARSE` failure without exposing generated content.
+- **Evidence and fix:** CloudWatch for correlation `a361258cd868494db89c1353d4443c99` showed checkpoint/processor/model load, prompt rendering, generation, and decoding succeeded; the strict parser failed before an environment action. Google's FunctionGemma formatting guide requires the developer instruction `You are a model that can do function calling with the following functions`; the existing message omitted that activation phrase. Updated only the developer prompt and added a regression test. Added a backend-only CodeBuild buildspec to republish the changed coordinator/objective image without rebuilding unchanged CUDA worker images.
+- **Affected files and components:** Objective prompt, objective execution test, backend-only CodeBuild buildspec, `Flow.md`, `Decisions.md`, and this log.
+- **Validation:** The new regression test failed before the prompt change and passed afterward; the full objective execution test module and Ruff checks passed. Runtime deployment is complete at commit `69560c0`, but the prompt-fix image is not yet built or deployed.
+- **Current live status:** The real one-episode request returned HTTP 503 at `FUNCTION_PARSE`; no environment step or trajectory/report was produced. `/api/live/readiness` is `BLOCKED` because model-load/generation readiness is false. No SageMaker training or Processing job has been submitted. Next gate: build/deploy this backend fix, rerun the real objective episode, verify a versioned S3 artifact, then proceed only if that passes.
+
 ## 2026-09-13 — `OBJECTIVE-STAGE-TRACE-001`
 
 - **Goal:** Diagnose and then resolve the first real objective-worker HTTP 503 without leaking prompts, task data, completions, or credentials.

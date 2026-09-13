@@ -607,7 +607,10 @@ def _messages(task: Task, observations: Sequence[Mapping[str, Any]]) -> list[dic
     messages = [
         {
             "role": "developer",
-            "content": "Use the provided service-recovery functions one call at a time.",
+            "content": (
+                "You are a model that can do function calling with the following functions. "
+                "Use the provided service-recovery functions one call at a time."
+            ),
         },
         {
             "role": "user",

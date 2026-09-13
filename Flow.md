@@ -32,8 +32,9 @@ Any deployment and live-run actions described here are scoped only to this AWS
 Agents for Humans hackathon. A read-only Service Quotas query on 2026-09-12
 confirmed an allowance of one `ml.g5.xlarge` training job in `us-east-1`; this
 is not a placement reservation. The live preflight remains blocked because the
-post-training runtime resources and pinned artifacts have not been configured
-or deployed. No completed end-to-end live post-training result is claimed.
+runtime and pinned artifacts are now deployed, but the real objective benchmark
+has not passed its strict FunctionGemma tool-call parser. Readiness is therefore
+blocked and no completed end-to-end live post-training result is claimed.
 
 ## Run history and observation contracts
 
@@ -442,6 +443,19 @@ AgentGym assets. These S3 writes do not prove a runtime deployment, checkpoint
 load, successful `/v1/benchmark`, or real FunctionGemma trajectory hash. The
 adapter is implemented, but contract tests with test doubles do not establish
 live inference or a completed benchmark.
+
+After that historical observation, commit `69560c01b5254901393862bb1e04298a8a405cfa`
+was built in AWS CodeBuild and deployed. The public `/health` endpoint reported
+that exact backend commit and ECR digest. A real one-episode request then passed
+checkpoint resolution, processor/model load, prompt rendering, generation, and
+decoding, but failed at `FUNCTION_PARSE` (correlation
+`a361258cd868494db89c1353d4443c99`). The generated content was not logged or
+returned; no environment action, verified trajectory, or S3 report resulted.
+Authenticated objective readiness remains `BLOCKED`, specifically because a
+valid tool call has not yet been generated. Source now includes FunctionGemma's
+documented tool-calling activation instruction plus a regression test; that fix
+still needs to be built, deployed, and proven by another real S3-backed episode.
+No SageMaker training or Processing job has been submitted.
 
 ## Trainer and evaluator image smoke contract
 

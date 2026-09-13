@@ -19,6 +19,7 @@ from app.objective.execution import (
     FunctionGemmaLocalPolicy,
     ObjectiveExecutionUnavailable,
     _DeferredLocalPolicy,
+    _messages,
     _parse_function_call,
     _tool_schemas,
     build_benchmark_execution_adapter,
@@ -487,6 +488,22 @@ def test_functiongemma_tool_schemas_are_closed_and_match_engine_arguments() -> N
     )
     assert by_name["edit_config"]["required"] == ["service", "content"]
     assert by_name["edit_config"]["properties"]["content"]["type"] == "string"
+
+
+def test_functiongemma_prompt_explicitly_activates_function_calling_mode() -> None:
+    task = ServiceRecoveryEngine(seed=7).reset(
+        split=ObjectiveSplit.TRAIN,
+        task_id="train-prompt-contract",
+    )
+
+    messages = _messages(task, ())
+
+    assert messages[0]["role"] == "developer"
+    assert (
+        "You are a model that can do function calling with the following functions"
+        in messages[0]["content"]
+    )
+    assert "one call at a time" in messages[0]["content"]
 
 
 def test_objective_application_passes_explicit_model_identity_to_execution_factory(

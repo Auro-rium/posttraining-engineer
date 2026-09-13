@@ -526,3 +526,15 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** The first valid FunctionGemma tool call is required before model-load/generation readiness becomes true. Artifact-store interface readiness alone does not prove an S3 write; the benchmark smoke must verify a real version-pinned artifact.
 - **Affected components:** Objective benchmark service and model adapter, objective readiness response, coordinator shallow health/build-info response, runtime task configuration, and focused tests.
 - **Validation:** Full backend test suite passed when run from `backend/` with the dev extra; targeted Ruff and mypy passed for the objective/live-path files. Read-only AWS checks confirmed both stacks deployed, `/health` HTTP 200, `/api/live/readiness` returning READY, and no SageMaker jobs. The previously deployed image still returned a generic objective 503; this source change has not yet been deployed and must not be represented as live inference evidence.
+
+## DEC-046 — Explicitly activate FunctionGemma tool-calling mode
+
+- **Date / run:** 2026-09-13 / `FUNCTIONGEMMA-TOOLCALL-ACTIVATION-001`
+- **Status:** Accepted
+- **Context:** A real AWS objective trace confirmed that the immutable checkpoint, processor, model, prompt rendering, and generation worked, but generated output did not pass the strict allow-list parser. The developer prompt said only to use service-recovery functions.
+- **Decision:** Use FunctionGemma's documented activation instruction, `You are a model that can do function calling with the following functions`, before the existing one-call-at-a-time instruction. Keep parser strict: do not extract arbitrary text, accept prose fallbacks, or execute unrecognized calls. Require a real post-deploy objective request and versioned artifact before marking model-generation readiness.
+- **Alternatives:** Relax the parser to accept unconstrained text; synthesize a tool action when parsing fails; leave the model prompt unchanged.
+- **Reason:** FunctionGemma's documented format uses a specific tool-use trigger; adding it addresses the actual observed failure while retaining closed-world tool validation. Reference: https://ai.google.dev/gemma/docs/functiongemma/formatting-and-best-practices
+- **Trade-offs:** This remains a prompt-level hypothesis until a deployed real generation parses, executes, verifies, and persists successfully.
+- **Affected components:** Objective prompt, focused regression test, AWS backend image publication and deployment.
+- **Validation:** Regression test observed failing before the prompt change and passing afterward; real AWS trace of the pre-fix image identified `FUNCTION_PARSE`; post-fix live validation is pending.
