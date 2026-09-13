@@ -401,8 +401,9 @@ block the benchmark.
 Each authenticated `/v1/benchmark` request receives a server-generated
 correlation ID, also returned in `X-Objective-Correlation-ID`. The worker logs
 only that ID, an allow-listed stage, elapsed milliseconds, pinned checkpoint
-revision, optional process RSS, outcome, and (on failure) exception class. It
-never returns exception details or logs prompts, completions, credentials,
+revision, optional process RSS, outcome, and (on failure) exception class. For
+known parser rejections only, it also emits a closed-set failure code; no
+exception text is emitted. It never returns exception details or logs prompts, completions, credentials,
 authorization headers, or trajectory/task contents. Instrumented stages are
 `CHECKPOINT_RESOLVE`, `PROCESSOR_LOAD`, `MODEL_LOAD`, `PROMPT_RENDER`,
 `MODEL_GENERATE`, `MODEL_DECODE`, `FUNCTION_PARSE`, `ENVIRONMENT_STEP`,
@@ -452,10 +453,18 @@ decoding, but failed at `FUNCTION_PARSE` (correlation
 `a361258cd868494db89c1353d4443c99`). The generated content was not logged or
 returned; no environment action, verified trajectory, or S3 report resulted.
 Authenticated objective readiness remains `BLOCKED`, specifically because a
-valid tool call has not yet been generated. Source now includes FunctionGemma's
-documented tool-calling activation instruction plus a regression test; that fix
-still needs to be built, deployed, and proven by another real S3-backed episode.
-No SageMaker training or Processing job has been submitted.
+valid tool call has not yet been generated. Commit
+`7bd5e713648b6c1995dfa4d0346c65e35ae0585f` then deployed the documented
+FunctionGemma tool-calling activation instruction. On 2026-09-13, an
+authenticated one-episode request against that image again loaded the staged
+checkpoint/model and completed generation/decode, then failed at
+`FUNCTION_PARSE` (correlation `e63a795724ff453ca848d94eae6b9ce5`). Readiness
+reported configuration/checkpoint/artifact-store ready but model-load and
+generation attestations false until a valid call is generated. No environment
+step, verified trajectory, or S3 report resulted; no SageMaker training or
+Processing job has been submitted. The next diagnostic build adds only a
+closed-set parser failure code to metadata telemetry; the deployed image does
+not yet contain that code and no model output is logged or returned.
 
 ## Trainer and evaluator image smoke contract
 

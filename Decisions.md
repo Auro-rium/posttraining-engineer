@@ -538,3 +538,15 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** This remains a prompt-level hypothesis until a deployed real generation parses, executes, verifies, and persists successfully.
 - **Affected components:** Objective prompt, focused regression test, AWS backend image publication and deployment.
 - **Validation:** Regression test observed failing before the prompt change and passing afterward; real AWS trace of the pre-fix image identified `FUNCTION_PARSE`; post-fix live validation is pending.
+
+## DEC-047 — Classify known FunctionGemma parser rejections without logging output
+
+- **Date / run:** 2026-09-13 / `FUNCTIONGEMMA-PARSE-DIAGNOSTICS-001`
+- **Status:** Accepted
+- **Context:** The deployed prompt activation fix did not resolve the real AWS objective 503. Stage telemetry isolated the failure to `FUNCTION_PARSE`, but the model output and parser message are intentionally excluded from logs.
+- **Decision:** Map only the parser's fixed, repository-defined rejection messages to a finite allow-list of categorical failure codes in the `FUNCTION_PARSE` stage event. Never include generated text, raw exception messages, task contents, or credentials.
+- **Alternatives:** Log completion text; log arbitrary exception strings; relax the parser to accept unverified output; make another prompt-only change without identifying the rejection branch.
+- **Reason:** A specific parser branch will guide the next minimal fix while preserving the objective worker's content confidentiality and strict tool allow-list.
+- **Trade-offs:** Unknown errors remain visible only as exception classes; the categorical-code image must be deployed before it can clarify the live parser rejection.
+- **Affected components:** Objective stage telemetry, objective execution tests, `Flow.md`, and AWS backend image release.
+- **Validation:** New safe-telemetry regression failed before implementation and passed afterward; all objective execution tests, focused Ruff, and targeted mypy passed. The deployed one-episode smoke still failed at `FUNCTION_PARSE` before this diagnostic change was built; no trajectory or S3 report was produced and no SageMaker job was submitted.

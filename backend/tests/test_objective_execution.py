@@ -506,6 +506,26 @@ def test_functiongemma_prompt_explicitly_activates_function_calling_mode() -> No
     assert "one call at a time" in messages[0]["content"]
 
 
+def test_function_parse_failure_telemetry_uses_safe_categorical_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from app.objective.execution import _run_objective_stage, objective_stage_trace
+
+    completion = "private-model-output-without-a-call"
+    caplog.set_level(logging.INFO, logger="app.objective.execution")
+    with objective_stage_trace("c" * 32, MODEL_REVISION):
+        with pytest.raises(ObjectiveExecutionUnavailable):
+            _run_objective_stage("FUNCTION_PARSE", lambda: _parse_function_call(completion))
+
+    event = json.loads(caplog.records[-1].message)
+    assert event["stage"] == "FUNCTION_PARSE"
+    assert event["status"] == "failed"
+    assert event["failure_code"] == "missing_function_call_frame"
+    assert completion not in caplog.text
+
+
 def test_objective_application_passes_explicit_model_identity_to_execution_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

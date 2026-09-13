@@ -75,6 +75,22 @@ _OBJECTIVE_STAGE_NAMES = frozenset(
 )
 _OBJECTIVE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _OBJECTIVE_LOGGER = logging.getLogger("app.objective.execution")
+_SAFE_PARSE_FAILURE_CODES = {
+    "FunctionGemma output must be text": "non_text_output",
+    "FunctionGemma output must contain exactly one tool call": "missing_function_call_frame",
+    "FunctionGemma output contained multiple tool calls": "multiple_tool_calls",
+    "FunctionGemma output contained a malformed tool call": "malformed_call_frame",
+    "FunctionGemma emitted a tool outside the allow-list": "tool_not_allowlisted",
+    "FunctionGemma output contained malformed arguments": "malformed_arguments",
+    "FunctionGemma output contained an invalid argument name": "invalid_argument_name",
+    "FunctionGemma output repeated an argument": "repeated_argument",
+    "FunctionGemma output contained an unknown argument": "unknown_argument",
+    "FunctionGemma arguments must use escaped string values": "unescaped_string_value",
+    "FunctionGemma output contained an unterminated value": "unterminated_string_value",
+    "FunctionGemma output contained an invalid string value": "invalid_string_value",
+    "FunctionGemma output contained a trailing argument separator": "trailing_argument_separator",
+    "FunctionGemma output omitted a required argument": "missing_required_arguments",
+}
 
 
 class ObjectiveExecutionUnavailable(RuntimeError):
@@ -123,6 +139,9 @@ def _emit_objective_stage(stage: str, *, started_at: float, error: BaseException
     }
     if error is not None:
         event["exception_class"] = type(error).__name__
+        failure_code = _SAFE_PARSE_FAILURE_CODES.get(str(error))
+        if stage == "FUNCTION_PARSE" and failure_code is not None:
+            event["failure_code"] = failure_code
     try:
         _OBJECTIVE_LOGGER.info(json.dumps(event, sort_keys=True, separators=(",", ":")))
     except Exception:

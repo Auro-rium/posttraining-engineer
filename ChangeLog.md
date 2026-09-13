@@ -352,3 +352,11 @@ This file is append-only. Entries describe repository changes and the verificati
 - **Affected files and components:** `backend/tests/test_autonomous_supervisor.py`, durable dispatcher recovery, supervisor operation intents, and SageMaker reconciliation contracts.
 - **Verification:** Focused dispatcher, supervisor, repository, live API, and SageMaker reconciliation suites passed (124 tests); scoped Ruff and production-file mypy passed; living-document sync and `git diff --check` passed.
 - **Known limitations:** The regression uses in-memory repositories and a SageMaker contract double. It does not validate a deployed DynamoDB lease, SageMaker control-plane timing, or a live AWS recovery.
+
+## 2026-09-13 — `FUNCTIONGEMMA-PARSE-DIAGNOSTICS-001`
+
+- **Goal:** Identify the strict parser rejection behind the live FunctionGemma objective 503 without exposing generated model content.
+- **Summary of changes:** Added a finite mapping from the parser's fixed rejection messages to safe categorical `failure_code` values on the `FUNCTION_PARSE` stage event. The original message, prompt, completion, and task data remain excluded from telemetry and HTTP responses.
+- **Affected files and components:** `backend/app/objective/execution.py`, `backend/tests/test_objective_execution.py`, `Flow.md`, and `Decisions.md`.
+- **Verification:** The new telemetry test failed before the change and passed after it. All 31 objective execution tests passed; focused Ruff and targeted mypy passed. Docs sync and diff checks remain to be run before release.
+- **Live status:** Deployed image `7bd5e713648b6c1995dfa4d0346c65e35ae0585f` still fails at `FUNCTION_PARSE` (correlation `e63a795724ff453ca848d94eae6b9ce5`). This diagnostic source has not yet been built or deployed. No real verified trajectory/report exists, and no SageMaker training or Processing job was submitted.
