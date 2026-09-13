@@ -851,14 +851,24 @@ class FunctionGemmaLocalPolicy:
                 key: value.to(device) if hasattr(value, "to") else value
                 for key, value in encoded.items()
             }
+            eos_token_id = getattr(self.processor, "eos_token_id", None)
+            if eos_token_id is None:
+                raise ObjectiveExecutionUnavailable(
+                    "FunctionGemma processor has no configured EOS token"
+                )
             generated = _run_objective_stage(
                 "MODEL_GENERATE",
-                lambda: self.model.generate(**encoded, max_new_tokens=256),
+                lambda: self.model.generate(
+                    **encoded,
+                    pad_token_id=eos_token_id,
+                    max_new_tokens=128,
+                    do_sample=False,
+                ),
             )
             completion = generated[0, input_ids.shape[-1] :]
             text = _run_objective_stage(
                 "MODEL_DECODE",
-                lambda: self.processor.decode(completion, skip_special_tokens=False),
+                lambda: self.processor.decode(completion, skip_special_tokens=True),
             )
             action = cast(
                 ToolCall,

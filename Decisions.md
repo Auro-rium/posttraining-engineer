@@ -550,3 +550,15 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** Unknown errors remain visible only as exception classes; the categorical-code image must be deployed before it can clarify the live parser rejection.
 - **Affected components:** Objective stage telemetry, objective execution tests, `Flow.md`, and AWS backend image release.
 - **Validation:** New safe-telemetry regression failed before implementation and passed afterward; all objective execution tests, focused Ruff, and targeted mypy passed. The deployed one-episode smoke still failed at `FUNCTION_PARSE` before this diagnostic change was built; no trajectory or S3 report was produced and no SageMaker job was submitted.
+
+## DEC-048 — Match FunctionGemma's documented generation and decode contract
+
+- **Date / run:** 2026-09-13 / `FUNCTIONGEMMA-DECODE-CONTRACT-001`
+- **Status:** Accepted
+- **Context:** A real AWS request against the diagnostic image failed with safe category `missing_function_call_frame` after model generation and decoding. Our implementation used `skip_special_tokens=False` and left `pad_token_id` implicit; Google's official FunctionGemma Transformers example uses `skip_special_tokens=True`, passes `processor.eos_token_id` as `pad_token_id`, and generates 128 tokens.
+- **Decision:** Follow that documented generation contract, explicitly use deterministic decoding (`do_sample=False`), and retain the strict allow-list parser. Do not strip arbitrary text or synthesize tool calls.
+- **Alternatives:** Weaken the parser; log raw completions; keep guessing prompt wording; ignore terminal special-token handling.
+- **Reason:** The live parser category and an official working inference reference identify a concrete mismatch at the generation/decode boundary while preserving the closed tool protocol.
+- **Trade-offs:** The source-level inference is not confirmed until the new image passes a real objective episode and writes a verified versioned S3 artifact.
+- **Affected components:** FunctionGemma local inference, objective execution tests, and AWS backend image release.
+- **Validation:** The regression test failed against the old decode contract and passed after the source change; all objective execution tests passed, as did focused Ruff and targeted mypy. The fix is not yet deployed and no objective artifact, training, or evaluation is claimed.

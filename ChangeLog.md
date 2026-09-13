@@ -358,5 +358,13 @@ This file is append-only. Entries describe repository changes and the verificati
 - **Goal:** Identify the strict parser rejection behind the live FunctionGemma objective 503 without exposing generated model content.
 - **Summary of changes:** Added a finite mapping from the parser's fixed rejection messages to safe categorical `failure_code` values on the `FUNCTION_PARSE` stage event. The original message, prompt, completion, and task data remain excluded from telemetry and HTTP responses.
 - **Affected files and components:** `backend/app/objective/execution.py`, `backend/tests/test_objective_execution.py`, `Flow.md`, and `Decisions.md`.
-- **Verification:** The new telemetry test failed before the change and passed after it. All 31 objective execution tests passed; focused Ruff and targeted mypy passed. Docs sync and diff checks remain to be run before release.
-- **Live status:** Deployed image `7bd5e713648b6c1995dfa4d0346c65e35ae0585f` still fails at `FUNCTION_PARSE` (correlation `e63a795724ff453ca848d94eae6b9ce5`). This diagnostic source has not yet been built or deployed. No real verified trajectory/report exists, and no SageMaker training or Processing job was submitted.
+- **Verification at entry:** The new telemetry test failed before the change and passed after it. All 31 objective execution tests passed; focused Ruff and targeted mypy passed.
+- **Live status at entry:** Deployed image `7bd5e713648b6c1995dfa4d0346c65e35ae0585f` failed at `FUNCTION_PARSE` (correlation `e63a795724ff453ca848d94eae6b9ce5`). The diagnostic change was pending deployment at that point. No real verified trajectory/report existed and no SageMaker job was submitted.
+
+## 2026-09-13 — `FUNCTIONGEMMA-DECODE-CONTRACT-001`
+
+- **Goal:** Fix the FunctionGemma strict-parser rejection using the documented local inference contract.
+- **Summary of changes:** After the diagnostic image was deployed, a real AWS one-episode request failed with safe category `missing_function_call_frame` at decode/parse. Updated local inference to set the processor EOS ID as `pad_token_id`, use `skip_special_tokens=True`, cap generation at 128 tokens, and explicitly disable sampling. The closed tool parser remains unchanged.
+- **Affected files and components:** `backend/app/objective/execution.py`, `backend/tests/test_objective_execution.py`, `Flow.md`, and `Decisions.md`.
+- **Verification:** The focused contract test failed before the inference change. All 31 objective execution tests passed afterward; focused Ruff, targeted mypy, docs sync, and diff checks passed.
+- **AWS evidence:** Diagnostic commit `a4909c5982e40c730218824163ba8919aaad004f` was deployed as digest `sha256:b5f183284fd255f1d53e8e442340d5087659883c11096e9808744d51b15ff2a7`. Live request `objective-smoke-11613481ac594f91`, correlation `5226e2446bb345039317ef35a1f16f53`, reached parser and failed with that categorical code. No trajectory/report was produced. The new inference fix is not yet committed, built, or deployed; no SageMaker training or Processing job has been submitted.

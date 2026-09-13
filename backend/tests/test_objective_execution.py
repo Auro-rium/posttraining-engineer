@@ -656,13 +656,15 @@ def test_benchmark_stage_events_are_safe_and_cover_real_local_inference(
             return self
 
     class _Processor:
+        eos_token_id = 2
+
         def apply_chat_template(self, messages: object, **kwargs: Any) -> dict[str, _Tensor]:
             del messages, kwargs
             return {"input_ids": _Tensor()}
 
         def decode(self, completion: object, *, skip_special_tokens: bool) -> str:
             del completion
-            assert skip_special_tokens is False
+            assert skip_special_tokens is True
             return (
                 "<start_function_call>call:get_logs{service:<escape>api<escape>}"
                 "<end_function_call>"
@@ -1034,6 +1036,8 @@ def test_local_policy_loads_only_digest_pinned_checkpoint_without_hub_fallback(
             return self
 
     class _Processor:
+        eos_token_id = 2
+
         def apply_chat_template(self, messages: object, **kwargs: Any) -> dict[str, _Tensor]:
             del messages
             calls.append(("template", kwargs))
@@ -1041,7 +1045,7 @@ def test_local_policy_loads_only_digest_pinned_checkpoint_without_hub_fallback(
 
         def decode(self, completion: object, *, skip_special_tokens: bool) -> str:
             del completion
-            assert skip_special_tokens is False
+            assert skip_special_tokens is True
             return (
                 "<start_function_call>call:run_healthcheck{service:<escape>api<escape>}"
                 "<end_function_call>"
@@ -1101,6 +1105,10 @@ def test_local_policy_loads_only_digest_pinned_checkpoint_without_hub_fallback(
     action = policy(task, ())
 
     assert action == ToolCall(tool="run_healthcheck", arguments={"service": "api"})
+    generation = next(item[1] for item in calls if item[0] == "generate")
+    assert generation["pad_token_id"] == 2
+    assert generation["max_new_tokens"] == 128
+    assert generation["do_sample"] is False
     assert all(
         item[1].get("local_files_only") is True for item in calls if item[0] in {"load", "adapter"}
     )

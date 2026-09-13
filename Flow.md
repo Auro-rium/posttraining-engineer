@@ -445,26 +445,30 @@ load, successful `/v1/benchmark`, or real FunctionGemma trajectory hash. The
 adapter is implemented, but contract tests with test doubles do not establish
 live inference or a completed benchmark.
 
-After that historical observation, commit `69560c01b5254901393862bb1e04298a8a405cfa`
-was built in AWS CodeBuild and deployed. The public `/health` endpoint reported
-that exact backend commit and ECR digest. A real one-episode request then passed
-checkpoint resolution, processor/model load, prompt rendering, generation, and
-decoding, but failed at `FUNCTION_PARSE` (correlation
-`a361258cd868494db89c1353d4443c99`). The generated content was not logged or
-returned; no environment action, verified trajectory, or S3 report resulted.
-Authenticated objective readiness remains `BLOCKED`, specifically because a
-valid tool call has not yet been generated. Commit
-`7bd5e713648b6c1995dfa4d0346c65e35ae0585f` then deployed the documented
-FunctionGemma tool-calling activation instruction. On 2026-09-13, an
-authenticated one-episode request against that image again loaded the staged
-checkpoint/model and completed generation/decode, then failed at
-`FUNCTION_PARSE` (correlation `e63a795724ff453ca848d94eae6b9ce5`). Readiness
-reported configuration/checkpoint/artifact-store ready but model-load and
-generation attestations false until a valid call is generated. No environment
-step, verified trajectory, or S3 report resulted; no SageMaker training or
-Processing job has been submitted. The next diagnostic build adds only a
-closed-set parser failure code to metadata telemetry; the deployed image does
-not yet contain that code and no model output is logged or returned.
+Live AWS objective smoke history on 2026-09-13:
+
+- Image commit `69560c01b5254901393862bb1e04298a8a405cfa` loaded and generated,
+  then failed at `FUNCTION_PARSE` (correlation
+  `a361258cd868494db89c1353d4443c99`).
+- Prompt activation commit `7bd5e713648b6c1995dfa4d0346c65e35ae0585f` was
+  deployed, but the next request again failed in that stage (correlation
+  `e63a795724ff453ca848d94eae6b9ce5`).
+- Diagnostic commit `a4909c5982e40c730218824163ba8919aaad004f` was built in
+  CodeBuild and deployed as backend digest
+  `sha256:b5f183284fd255f1d53e8e442340d5087659883c11096e9808744d51b15ff2a7`.
+  The live request `objective-smoke-11613481ac594f91` (correlation
+  `5226e2446bb345039317ef35a1f16f53`) passed checkpoint resolution, processor
+  and model loading, prompt rendering, generation, and decode, then emitted
+  safe parser code `missing_function_call_frame`. The model output was not
+  logged or returned.
+
+No environment step, verified trajectory, or S3 report has yet resulted, and
+no SageMaker training or Processing job has been submitted. Authenticated
+objective readiness remains `BLOCKED` until a valid tool call passes. Current
+source aligns generation with Google's documented FunctionGemma example by
+setting `pad_token_id` to the processor EOS token and decoding with
+`skip_special_tokens=True`; focused tests pass, but this follow-up change is
+not yet committed, built, or deployed and therefore is not live evidence.
 
 ## Trainer and evaluator image smoke contract
 
