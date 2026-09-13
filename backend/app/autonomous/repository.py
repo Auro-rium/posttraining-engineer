@@ -1014,7 +1014,8 @@ class DynamoDBAutonomousRunRepository:
         try:
             self._table_or_create().put_item(
                 Item=self._item(self.STATE_SK, next_state),
-                ConditionExpression="version = :version",
+                ConditionExpression="#version = :version",
+                ExpressionAttributeNames={"#version": "version"},
                 ExpressionAttributeValues={":version": current.version},
             )
         except Exception as exc:
@@ -1062,7 +1063,11 @@ class DynamoDBAutonomousRunRepository:
                         "Put": {
                             "TableName": self.table_name,
                             "Item": self._ddb_item(self.STATE_SK, next_state),
-                            "ConditionExpression": f"version = :version AND {field} = :false",
+                            "ConditionExpression": "#version = :version AND #control = :false",
+                            "ExpressionAttributeNames": {
+                                "#version": "version",
+                                "#control": field,
+                            },
                             "ExpressionAttributeValues": {
                                 ":version": {"N": str(current.version)},
                                 ":false": {"BOOL": False},
@@ -1406,7 +1411,8 @@ class DynamoDBAutonomousRunRepository:
                         "Put": {
                             "TableName": self.table_name,
                             "Item": self._ddb_item(self.STATE_SK, next_state),
-                            "ConditionExpression": "version = :version",
+                            "ConditionExpression": "#version = :version",
+                            "ExpressionAttributeNames": {"#version": "version"},
                             "ExpressionAttributeValues": {":version": {"N": str(expected_version)}},
                         }
                     },
@@ -1496,8 +1502,12 @@ class DynamoDBAutonomousRunRepository:
                             "TableName": self.table_name,
                             "Item": self._ddb_item(self.STATE_SK, next_state),
                             "ConditionExpression": (
-                                "version = :version AND approval_consumed = :false"
+                                "#version = :version AND #approval_consumed = :false"
                             ),
+                            "ExpressionAttributeNames": {
+                                "#version": "version",
+                                "#approval_consumed": "approval_consumed",
+                            },
                             "ExpressionAttributeValues": {
                                 ":version": {"N": str(current.version)},
                                 ":false": {"BOOL": False},
@@ -1549,7 +1559,8 @@ class DynamoDBAutonomousRunRepository:
         try:
             self._table_or_create().put_item(
                 Item=self._item(self.STATE_SK, next_state),
-                ConditionExpression="version = :version",
+                ConditionExpression="#version = :version",
+                ExpressionAttributeNames={"#version": "version"},
                 ExpressionAttributeValues={":version": current.version},
             )
         except Exception as exc:
@@ -1584,7 +1595,8 @@ class DynamoDBAutonomousRunRepository:
         try:
             self._table_or_create().put_item(
                 Item=self._item(self.STATE_SK, next_state),
-                ConditionExpression="version = :version",
+                ConditionExpression="#version = :version",
+                ExpressionAttributeNames={"#version": "version"},
                 ExpressionAttributeValues={":version": current.version},
             )
         except Exception as exc:
@@ -1612,7 +1624,8 @@ class DynamoDBAutonomousRunRepository:
         try:
             self._table_or_create().put_item(
                 Item=self._item(self.STATE_SK, next_state),
-                ConditionExpression="version = :version",
+                ConditionExpression="#version = :version",
+                ExpressionAttributeNames={"#version": "version"},
                 ExpressionAttributeValues={":version": current.version},
             )
         except Exception as exc:
@@ -1753,7 +1766,8 @@ class DynamoDBAutonomousRunRepository:
         try:
             self._table_or_create().put_item(
                 Item=self._item(self._operation_sk(updated.operation_key), updated),
-                ConditionExpression="version = :version",
+                ConditionExpression="#version = :version",
+                ExpressionAttributeNames={"#version": "version"},
                 ExpressionAttributeValues={":version": current.version},
             )
         except Exception as exc:
@@ -1834,7 +1848,8 @@ class DynamoDBAutonomousRunRepository:
                         "Put": {
                             "TableName": table_name,
                             "Item": self._ddb_item(self.STATE_SK, next_state),
-                            "ConditionExpression": "version = :version",
+                            "ConditionExpression": "#version = :version",
+                            "ExpressionAttributeNames": {"#version": "version"},
                             "ExpressionAttributeValues": {":version": {"N": str(state.version)}},
                         }
                     },

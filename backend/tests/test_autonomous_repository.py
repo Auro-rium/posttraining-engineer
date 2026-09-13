@@ -735,7 +735,31 @@ def test_dynamo_update_state_uses_validated_conditional_put() -> None:
     writes = cast(list[dict[str, object]], client.transactions[-1]["TransactItems"])
     assert "Put" in writes[0]
     put = cast(dict[str, object], writes[0]["Put"])
-    assert put["ConditionExpression"] == "version = :version AND cancellation_requested = :false"
+    assert put["ConditionExpression"] == "#version = :version AND #control = :false"
+    assert put["ExpressionAttributeNames"] == {
+        "#version": "version",
+        "#control": "cancellation_requested",
+    }
+
+
+def test_dynamo_approval_consumption_aliases_reserved_version_attribute() -> None:
+    table = StubDynamoTable()
+    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", make_run()))
+    client = StubDynamoClient()
+    repository = DynamoDBAutonomousRunRepository(table=table, client=client)
+
+    consumed = repository.consume_approval("run-1", "c" * 64)
+
+    assert consumed.approval_consumed is True
+    writes = cast(list[dict[str, object]], client.transactions[-1]["TransactItems"])
+    put = cast(dict[str, object], writes[0]["Put"])
+    assert put["ConditionExpression"] == (
+        "#version = :version AND #approval_consumed = :false"
+    )
+    assert put["ExpressionAttributeNames"] == {
+        "#version": "version",
+        "#approval_consumed": "approval_consumed",
+    }
 
 
 def test_dynamo_append_event_reads_exact_sequence_consistently() -> None:
