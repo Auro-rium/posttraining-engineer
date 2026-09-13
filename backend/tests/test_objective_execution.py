@@ -656,8 +656,16 @@ def test_benchmark_stage_events_are_safe_and_cover_real_local_inference(
             del key
             return self
 
+    class _Tokenizer:
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            assert token == "<end_function_call>"
+            return 9
+
     class _Processor:
         eos_token_id = 2
+        tokenizer = _Tokenizer()
 
         def apply_chat_template(self, messages: object, **kwargs: Any) -> dict[str, _Tensor]:
             del messages, kwargs
@@ -1036,8 +1044,16 @@ def test_local_policy_loads_only_digest_pinned_checkpoint_without_hub_fallback(
             del key
             return self
 
+    class _Tokenizer:
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            assert token == "<end_function_call>"
+            return 9
+
     class _Processor:
         eos_token_id = 2
+        tokenizer = _Tokenizer()
 
         def apply_chat_template(self, messages: object, **kwargs: Any) -> dict[str, _Tensor]:
             del messages
@@ -1108,6 +1124,7 @@ def test_local_policy_loads_only_digest_pinned_checkpoint_without_hub_fallback(
     assert action == ToolCall(tool="run_healthcheck", arguments={"service": "api"})
     generation = next(item[1] for item in calls if item[0] == "generate")
     assert generation["pad_token_id"] == 2
+    assert generation["eos_token_id"] == [2, 9]
     assert generation["max_new_tokens"] == 128
     assert generation["do_sample"] is False
     assert all(

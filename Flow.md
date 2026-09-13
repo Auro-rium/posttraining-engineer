@@ -461,14 +461,23 @@ Live AWS objective smoke history on 2026-09-13:
   and model loading, prompt rendering, generation, and decode, then emitted
   safe parser code `missing_function_call_frame`. The model output was not
   logged or returned.
+- Decode/prompt commit `7c7be4948150bd79af50d49bfe05e28a76a73ae7` was deployed
+  as digest `sha256:ad15fed4e27ca21312098573450dd62d71b5302fa50fe311b496f9d8aa559359`.
+  The real one-episode request `objective-smoke-cd7b3ab548744c21` loaded the
+  same staged checkpoint and reached `FUNCTION_PARSE`; safe telemetry classified
+  it as `multiple_tool_calls` (server correlation
+  `90795cd44e6b4003acc505723e83ba32`). The parser rejected the concatenated
+  calls, so no environment action or trajectory was produced.
 
-No environment step, verified trajectory, or S3 report has yet resulted, and
-no SageMaker training or Processing job has been submitted. Authenticated
-objective readiness remains `BLOCKED` until a valid tool call passes. Current
-source aligns generation with Google's documented FunctionGemma example by
-setting `pad_token_id` to the processor EOS token and decoding with
-`skip_special_tokens=True`; focused tests pass, but this follow-up change is
-not yet committed, built, or deployed and therefore is not live evidence.
+No environment step, verified trajectory, or S3 report has yet resulted from
+these attempts, and no SageMaker training or Processing job has been submitted.
+Authenticated objective readiness remains `BLOCKED` until a valid tool call
+passes. The currently deployed image follows Google's documented generation
+and decode contract, but it can emit multiple calls in one generation. Current
+source resolves the `<end_function_call>` token ID and supplies it as an
+additional generation stop token; the closed parser still accepts exactly one
+call. Focused tests pass, but this stop-token change is not yet deployed or live
+verified.
 
 ## Trainer and evaluator image smoke contract
 

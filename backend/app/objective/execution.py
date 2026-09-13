@@ -648,6 +648,29 @@ def _messages(task: Task, observations: Sequence[Mapping[str, Any]]) -> list[dic
     return messages
 
 
+def _function_call_end_token_id(processor: Any) -> int:
+    """Resolve the protocol terminator so generation stops after one action."""
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if not callable(convert_token):
+        raise ObjectiveExecutionUnavailable(
+            "FunctionGemma tokenizer cannot resolve the function-call terminator"
+        )
+    token_id = convert_token(_FUNCTION_END)
+    unknown_token_id = getattr(tokenizer, "unk_token_id", None)
+    if (
+        isinstance(token_id, bool)
+        or not isinstance(token_id, int)
+        or token_id < 0
+        or token_id == unknown_token_id
+    ):
+        raise ObjectiveExecutionUnavailable(
+            "FunctionGemma function-call terminator is not registered"
+        )
+    return cast(int, token_id)
+
+
 def _parse_function_call(text: str) -> ToolCall:
     if not isinstance(text, str):
         raise ObjectiveExecutionUnavailable("FunctionGemma output must be text")
@@ -855,6 +878,10 @@ class FunctionGemmaLocalPolicy:
                 lambda: self.model.generate(
                     **encoded,
                     pad_token_id=eos_token_id,
+                    eos_token_id=[
+                        eos_token_id,
+                        _function_call_end_token_id(self.processor),
+                    ],
                     max_new_tokens=128,
                     do_sample=False,
                 ),

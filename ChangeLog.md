@@ -368,3 +368,11 @@ This file is append-only. Entries describe repository changes and the verificati
 - **Affected files and components:** `backend/app/objective/execution.py`, `backend/tests/test_objective_execution.py`, `Flow.md`, and `Decisions.md`.
 - **Verification:** The focused contract test failed before the inference change. All 31 objective execution tests passed afterward; focused Ruff, targeted mypy, docs sync, and diff checks passed.
 - **AWS evidence:** Diagnostic commit `a4909c5982e40c730218824163ba8919aaad004f` was deployed as digest `sha256:b5f183284fd255f1d53e8e442340d5087659883c11096e9808744d51b15ff2a7`. Live request `objective-smoke-11613481ac594f91`, correlation `5226e2446bb345039317ef35a1f16f53`, reached parser and failed with that categorical code. No trajectory/report was produced. The new inference fix is not yet committed, built, or deployed; no SageMaker training or Processing job has been submitted.
+
+## 2026-09-13 — `FUNCTIONGEMMA-STOP-ACTION-001`
+
+- **Goal:** Keep one FunctionGemma generation to one environment action after a live request exposed concatenated tool calls.
+- **Summary of changes:** Resolve the local tokenizer ID for `<end_function_call>` and include it as an additional generation stop token with normal EOS. If the token cannot be resolved, fail closed. The closed parser remains unchanged and still rejects multiple calls.
+- **Affected files and components:** `backend/app/objective/execution.py`, `backend/tests/test_objective_execution.py`, `Flow.md`, and `Decisions.md`.
+- **Verification:** The focused inference regression failed before the change because generation omitted the tool-call stop token; all 31 objective execution tests passed afterward. Ruff, targeted mypy, and `git diff --check` passed.
+- **Live status:** Commit `7c7be4948150bd79af50d49bfe05e28a76a73ae7` was deployed as digest `sha256:ad15fed4e27ca21312098573450dd62d71b5302fa50fe311b496f9d8aa559359`. The subsequent one-episode smoke `objective-smoke-cd7b3ab548744c21` failed at `FUNCTION_PARSE` with safe category `multiple_tool_calls` (server correlation `90795cd44e6b4003acc505723e83ba32`). No trajectory/report was produced; no SageMaker job was submitted. This stop-token fix is source-only pending build and live validation.

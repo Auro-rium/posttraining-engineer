@@ -562,3 +562,15 @@ This file is append-only. A later decision may supersede an earlier one, but exi
 - **Trade-offs:** The source-level inference is not confirmed until the new image passes a real objective episode and writes a verified versioned S3 artifact.
 - **Affected components:** FunctionGemma local inference, objective execution tests, and AWS backend image release.
 - **Validation:** The regression test failed against the old decode contract and passed after the source change; all objective execution tests passed, as did focused Ruff and targeted mypy. The fix is not yet deployed and no objective artifact, training, or evaluation is claimed.
+
+## DEC-049 — Stop FunctionGemma generation after the first tool-call frame
+
+- **Date / run:** 2026-09-13 / `FUNCTIONGEMMA-STOP-ACTION-001`
+- **Status:** Accepted
+- **Context:** After deploying the official decode contract and exact FunctionGemma activation prompt, a real one-episode AWS request reached `FUNCTION_PARSE` but was rejected with the safe category `multiple_tool_calls`. The model completed more than one function-call frame in one generation, while the environment advances exactly one action per step.
+- **Decision:** Resolve the tokenizer ID for `<end_function_call>` and pass it alongside the normal EOS ID in `generate(eos_token_id=...)`. Keep the parser strict and execute only one tool call per step. Fail closed if the tokenizer cannot resolve the terminator.
+- **Alternatives:** Execute every generated call in one environment step; silently truncate or parse arbitrary output; weaken the allow-list parser; accept repeated 503s.
+- **Reason:** Generation should end as soon as the model completes its first protocol action. This preserves the one-action transition and prevents unreviewed follow-on calls from executing.
+- **Trade-offs:** Transformers must recognize the checkpoint's `<end_function_call>` token ID; live AWS inference must verify that this stop sequence leaves the first frame intact for decoding and parsing.
+- **Affected components:** FunctionGemma generation, objective execution tests, `Flow.md`, and AWS backend image release.
+- **Validation:** The focused policy test failed before the stop-token change because `eos_token_id` was absent. All 31 objective execution tests passed afterward; focused Ruff and targeted mypy passed. The source fix has not yet been built, deployed, or verified in AWS.
