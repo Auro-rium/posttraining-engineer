@@ -24,6 +24,7 @@ from .models import (
 ENGINE_VERSION = "service-recovery-v1"
 _SERVICES = ("api", "web", "database", "cache")
 _FAILURE_MODES = ("config_error", "dependency_failure", "healthcheck_failure")
+_MAX_EPISODE_STEPS = 3
 
 
 class TrajectoryNotAdmissible(ValueError):
@@ -93,7 +94,7 @@ class ServiceRecoveryEngine:
             service_name=self._definition.service_name,
             objective="restore the service and pass its health check",
             allowed_tools=ALLOWED_TOOLS,
-            max_steps=10,
+            max_steps=_MAX_EPISODE_STEPS,
             engine_version=ENGINE_VERSION,
             seed=self.seed,
         )
@@ -109,7 +110,7 @@ class ServiceRecoveryEngine:
             service_name=definition.service_name,
             objective="restore the service and pass its health check",
             allowed_tools=ALLOWED_TOOLS,
-            max_steps=10,
+            max_steps=_MAX_EPISODE_STEPS,
             engine_version=ENGINE_VERSION,
             seed=self.seed,
         )
