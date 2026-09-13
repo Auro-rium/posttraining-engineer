@@ -971,10 +971,15 @@ class DynamoDBAutonomousRunRepository:
     def _client_or_create(self) -> Any:
         if self._client is not None:
             return self._client
-        table = self._table_or_create()
-        self._client = getattr(getattr(table, "meta", None), "client", None)
-        if self._client is None:
-            raise RepositoryError("DynamoDB transaction client is unavailable")
+        try:
+            import boto3  # type: ignore[import-untyped]
+        except ImportError as exc:  # pragma: no cover
+            raise OptionalDependencyError("boto3 is required for DynamoDB persistence") from exc
+        # DynamoDB resources register Python-to-AttributeValue transformers on
+        # their shared client.  Transaction payloads in this repository are
+        # already encoded for the low-level API, so reusing table.meta.client
+        # double-encodes keys (for example S -> M) in real AWS requests.
+        self._client = boto3.client("dynamodb", region_name=self.region_name)
         return self._client
 
     def update_state(

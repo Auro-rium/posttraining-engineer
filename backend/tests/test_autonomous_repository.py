@@ -559,6 +559,23 @@ class StubDynamoClient:
         self.transactions.append(kwargs)
 
 
+def test_dynamo_transactions_use_an_independent_low_level_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = StubDynamoTable()
+    transformed_resource_client = object()
+    table.meta = type("Meta", (), {"client": transformed_resource_client})()
+    low_level_client = StubDynamoClient()
+
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: low_level_client)
+    repository = DynamoDBAutonomousRunRepository(table=table, region_name="us-east-1")
+
+    assert repository._client_or_create() is low_level_client
+    assert repository._client_or_create() is not transformed_resource_client
+
+
 def test_dynamo_idempotency_claim_and_completion_are_conditional_and_replayable() -> None:
     class ConditionalError(Exception):
         pass
