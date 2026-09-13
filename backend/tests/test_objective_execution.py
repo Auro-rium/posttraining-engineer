@@ -19,6 +19,7 @@ from app.objective.execution import (
     FunctionGemmaLocalPolicy,
     ObjectiveExecutionUnavailable,
     _DeferredLocalPolicy,
+    _first_complete_function_call,
     _messages,
     _parse_function_call,
     _tool_schemas,
@@ -488,6 +489,19 @@ def test_functiongemma_tool_schemas_are_closed_and_match_engine_arguments() -> N
     )
     assert by_name["edit_config"]["required"] == ["service", "content"]
     assert by_name["edit_config"]["properties"]["content"]["type"] == "string"
+
+
+def test_local_policy_consumes_only_first_complete_generated_call() -> None:
+    first = "<start_function_call>call:get_logs{service:<escape>api<escape>}<end_function_call>"
+    second = (
+        "<start_function_call>call:restart_service{service:<escape>api<escape>}"
+        "<end_function_call>"
+    )
+
+    assert _first_complete_function_call(first + second) == first
+    assert _parse_function_call(_first_complete_function_call(first + second)) == ToolCall(
+        tool="get_logs", arguments={"service": "api"}
+    )
 
 
 def test_functiongemma_prompt_explicitly_activates_function_calling_mode() -> None:
@@ -1124,7 +1138,7 @@ def test_local_policy_loads_only_digest_pinned_checkpoint_without_hub_fallback(
     assert action == ToolCall(tool="run_healthcheck", arguments={"service": "api"})
     generation = next(item[1] for item in calls if item[0] == "generate")
     assert generation["pad_token_id"] == 2
-    assert generation["eos_token_id"] == [2, 9]
+    assert generation["eos_token_id"] == 2
     assert generation["max_new_tokens"] == 128
     assert generation["do_sample"] is False
     assert all(

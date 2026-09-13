@@ -648,29 +648,6 @@ def _messages(task: Task, observations: Sequence[Mapping[str, Any]]) -> list[dic
     return messages
 
 
-def _function_call_end_token_id(processor: Any) -> int:
-    """Resolve the protocol terminator so generation stops after one action."""
-
-    tokenizer = getattr(processor, "tokenizer", None)
-    convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
-    if not callable(convert_token):
-        raise ObjectiveExecutionUnavailable(
-            "FunctionGemma tokenizer cannot resolve the function-call terminator"
-        )
-    token_id = convert_token(_FUNCTION_END)
-    unknown_token_id = getattr(tokenizer, "unk_token_id", None)
-    if (
-        isinstance(token_id, bool)
-        or not isinstance(token_id, int)
-        or token_id < 0
-        or token_id == unknown_token_id
-    ):
-        raise ObjectiveExecutionUnavailable(
-            "FunctionGemma function-call terminator is not registered"
-        )
-    return cast(int, token_id)
-
-
 def _parse_function_call(text: str) -> ToolCall:
     if not isinstance(text, str):
         raise ObjectiveExecutionUnavailable("FunctionGemma output must be text")
@@ -755,6 +732,27 @@ def _parse_function_call(text: str) -> ToolCall:
         raise ObjectiveExecutionUnavailable(
             "FunctionGemma emitted a tool outside the allow-list"
         ) from exc
+
+
+def _first_complete_function_call(text: str) -> str:
+    """Return precisely the next complete function-call frame.
+
+    FunctionGemma can continue planning after a valid tool call.  The objective
+    environment is deliberately one-action-at-a-time, so only the first complete
+    frame is eligible for execution; later generated text is never interpreted
+    as another action.
+    """
+
+    if not isinstance(text, str) or not text.startswith(_FUNCTION_START):
+        raise ObjectiveExecutionUnavailable(
+            "FunctionGemma output must contain exactly one tool call"
+        )
+    finish = text.find(_FUNCTION_END, len(_FUNCTION_START))
+    if finish < 0:
+        raise ObjectiveExecutionUnavailable(
+            "FunctionGemma output must contain exactly one tool call"
+        )
+    return text[: finish + len(_FUNCTION_END)]
 
 
 class FunctionGemmaLocalPolicy:
@@ -878,10 +876,7 @@ class FunctionGemmaLocalPolicy:
                 lambda: self.model.generate(
                     **encoded,
                     pad_token_id=eos_token_id,
-                    eos_token_id=[
-                        eos_token_id,
-                        _function_call_end_token_id(self.processor),
-                    ],
+                    eos_token_id=eos_token_id,
                     max_new_tokens=128,
                     do_sample=False,
                 ),
@@ -893,7 +888,10 @@ class FunctionGemmaLocalPolicy:
             )
             action = cast(
                 ToolCall,
-                _run_objective_stage("FUNCTION_PARSE", lambda: _parse_function_call(text)),
+                _run_objective_stage(
+                    "FUNCTION_PARSE",
+                    lambda: _parse_function_call(_first_complete_function_call(text)),
+                ),
             )
             self._generation_ready = True
             return action
