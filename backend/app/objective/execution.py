@@ -881,7 +881,11 @@ class FunctionGemmaLocalPolicy:
                     **encoded,
                     pad_token_id=eos_token_id,
                     eos_token_id=eos_token_id,
-                    max_new_tokens=128,
+                    # The HTTPS API Gateway integration has a bounded request
+                    # window.  FunctionGemma tool frames fit comfortably in 48
+                    # tokens; a larger continuation only plans future actions
+                    # that this one-action environment must not execute yet.
+                    max_new_tokens=48,
                     do_sample=False,
                 ),
             )

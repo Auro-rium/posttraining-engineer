@@ -1152,7 +1152,7 @@ def test_local_policy_loads_only_digest_pinned_checkpoint_without_hub_fallback(
     generation = next(item[1] for item in calls if item[0] == "generate")
     assert generation["pad_token_id"] == 2
     assert generation["eos_token_id"] == 2
-    assert generation["max_new_tokens"] == 128
+    assert generation["max_new_tokens"] == 48
     assert generation["do_sample"] is False
     assert all(
         item[1].get("local_files_only") is True for item in calls if item[0] in {"load", "adapter"}
