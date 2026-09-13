@@ -31,6 +31,7 @@ from pydantic import (
 )
 
 from app.agents.prompt_contract import NEMOTRON_MODEL_ID, get_prompt_contract
+from app.objective.models import CorrectionProposal, decode_trajectory_reference
 
 
 class ProviderHandoffError(RuntimeError):
@@ -199,24 +200,27 @@ class ResearchHypothesis(_HandoffModel):
 
 
 class CuratedDatasetPlan(_HandoffModel):
-    """Judgment-only selection; the objective worker creates the dataset artifact later."""
+    """Judgment-only selection and replay proposals; the worker owns admission."""
 
     plan_id: StrictStr = Field(
         min_length=1,
         validation_alias=AliasChoices("plan_id", "dataset_plan_id"),
     )
     selected_trajectory_refs: tuple[StrictStr, ...] = Field(
-        min_length=1,
+        default_factory=tuple,
         validation_alias=AliasChoices(
             "selected_trajectory_refs", "trajectory_references", "selected_record_ids"
         ),
+    )
+    correction_proposals: tuple[CorrectionProposal, ...] = Field(
+        default_factory=tuple, max_length=100
     )
     target_failure_classes: tuple[StrictStr, ...] = Field(
         min_length=1,
         validation_alias=AliasChoices("target_failure_classes", "failure_classes"),
     )
     record_count: StrictInt = Field(
-        ge=1,
+        ge=0,
         validation_alias=AliasChoices("record_count", "selected_record_count"),
     )
     evidence_class: StrictStr
@@ -225,10 +229,18 @@ class CuratedDatasetPlan(_HandoffModel):
     def validate_evidence(self) -> CuratedDatasetPlan:
         if self.evidence_class not in _VERIFIED_EVIDENCE_LABELS:
             raise ValueError("curated datasets require LIVE or PRIOR_VERIFIED_RUN evidence")
+        if not self.selected_trajectory_refs and not self.correction_proposals:
+            raise ValueError("curation plan requires selected trajectories or correction proposals")
         if any(not _REFERENCE_PATTERN.fullmatch(ref) for ref in self.selected_trajectory_refs):
             raise ValueError("selected_trajectory_refs must contain non-empty references")
         if self.record_count != len(self.selected_trajectory_refs):
             raise ValueError("record_count must equal selected_trajectory_refs length")
+        if len(set(self.selected_trajectory_refs)) != len(self.selected_trajectory_refs):
+            raise ValueError("selected_trajectory_refs must be unique")
+        if len({item.proposal_id for item in self.correction_proposals}) != len(
+            self.correction_proposals
+        ):
+            raise ValueError("correction proposals must be unique")
         if len(set(self.target_failure_classes)) != len(self.target_failure_classes) or any(
             not item.strip() for item in self.target_failure_classes
         ):
@@ -709,15 +721,38 @@ class AutonomousAgentAdapters:
             raise ProviderHandoffError(
                 "curation selected a trajectory outside verified input references"
             )
+        correction_refs: set[str] = set()
+        failure_refs = {ref for cluster in cluster_models for ref in cluster.evidence_refs}
+        for proposal in plan.correction_proposals:
+            matching_reference = None
+            for reference_value in refs:
+                try:
+                    reference = decode_trajectory_reference(reference_value)
+                except ValueError:
+                    continue
+                if (
+                    reference.trajectory_id == proposal.source_trajectory_id
+                    and reference.task_id == proposal.task_id
+                    and reference.split is proposal.split
+                ):
+                    matching_reference = reference_value
+                    break
+            if matching_reference is None:
+                raise ProviderHandoffError(
+                    "correction proposal source is outside verified input references"
+                )
+            if matching_reference not in failure_refs:
+                raise ProviderHandoffError(
+                    "correction proposal source is not coordinator-verified failure evidence"
+                )
+            correction_refs.add(matching_reference)
         allowed_failure_classes = {item.failure_type for item in cluster_models}
         if not set(plan.target_failure_classes).issubset(allowed_failure_classes):
             raise ProviderHandoffError(
                 "curation selected a failure class outside coordinator-verified clusters"
             )
-        selected_classes = {
-            trajectory_metadata[ref]["evidence_class"]
-            for ref in plan.selected_trajectory_refs
-        }
+        plan_source_refs = set(plan.selected_trajectory_refs) | correction_refs
+        selected_classes = {trajectory_metadata[ref]["evidence_class"] for ref in plan_source_refs}
         if len(selected_classes) != 1 or plan.evidence_class not in selected_classes:
             raise ProviderHandoffError(
                 "curation evidence_class must match coordinator provenance for selected "
@@ -737,6 +772,9 @@ class AutonomousAgentAdapters:
             if isinstance(dataset_plan, CuratedDatasetPlan)
             else dict(dataset_plan)
         )
+        # Action proposals belong only to the objective replay boundary.  The
+        # training designer needs plan metadata, never candidate trajectories.
+        plan.pop("correction_proposals", None)
         history = _mapping_history(experiment_history)
         response = self._call(
             "TrainingDesignerAgent",
@@ -945,6 +983,7 @@ __all__ = [
     "QLORA_SEARCH_SPACE",
     "AutonomousAgentAdapters",
     "BoundedReasoningAgents",
+    "CorrectionProposal",
     "CuratedDatasetPlan",
     "DuplicateHypothesisError",
     "FailureCluster",

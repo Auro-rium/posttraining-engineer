@@ -132,7 +132,7 @@ def test_adapter_prompt_handoff_schemas_match_typed_contracts() -> None:
             "`plan`",
             "selected_trajectory_refs",
             "target_failure_classes",
-            "worker creates and verifies the dataset artifact after this judgment-only plan",
+            "deterministic objective worker resolves the failed source, replays the actions",
         ),
         "training_designer_agent.md": (
             "`dataset_plan`",

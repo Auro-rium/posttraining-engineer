@@ -15,7 +15,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qs, urlparse
 
 
@@ -69,6 +69,7 @@ class TrainingJobRequest:
     input_s3_uri: str
     output_s3_uri: str
     instance_type: str
+    base_model_s3_uri: str | None = None
     parent_adapter_s3_uri: str | None = None
     instance_count: int = 1
     volume_size_gb: int = 30
@@ -97,11 +98,12 @@ class EvaluationJobRequest:
     instance_type: str
     model_s3_uri: str | None = None
     # ProcessingInput names become SM_CHANNEL_* variables in the evaluator.
-    # Keep the legacy fields as aliases while allowing the live path to state
-    # all three independently and bind each to one exact S3 reference.
+    # Keep the legacy fields as aliases while allowing the live path to bind
+    # every evaluator artifact channel to one exact S3 reference.
     candidate_s3_uri: str | None = None
     champion_s3_uri: str | None = None
     sealed_s3_uri: str | None = None
+    base_model_s3_uri: str | None = None
     instance_count: int = 1
     volume_size_gb: int = 30
     max_runtime_seconds: int = 3600
@@ -199,6 +201,7 @@ def request_fingerprint(request: TrainingJobRequest | EvaluationJobRequest) -> s
             "role_arn": request.role_arn,
             "image_uri": request.image_uri,
             "input_s3_uri": request.input_s3_uri,
+            "base_model_s3_uri": request.base_model_s3_uri,
             "parent_adapter_s3_uri": request.parent_adapter_s3_uri,
             "output_s3_uri": request.output_s3_uri,
             "instance_type": request.instance_type,
@@ -221,6 +224,7 @@ def request_fingerprint(request: TrainingJobRequest | EvaluationJobRequest) -> s
             "candidate_s3_uri": request.candidate_s3_uri,
             "champion_s3_uri": request.champion_s3_uri,
             "sealed_s3_uri": request.sealed_s3_uri,
+            "base_model_s3_uri": request.base_model_s3_uri,
             "instance_count": request.instance_count,
             "volume_size_gb": request.volume_size_gb,
             "max_runtime_seconds": request.max_runtime_seconds,
@@ -571,6 +575,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                 "APPROVED_DATASET_ARTIFACT_ID",
                 "BASE_MODEL_ID",
                 "BASE_MODEL_REVISION",
+                "BASE_MODEL_BUNDLE_SHA256",
                 "QLORA_CONFIG",
             ),
         )
@@ -581,6 +586,11 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
             raise ValueError("APPROVED_DATASET_ARTIFACT_ID is not bound to DATASET_ID")
         if not re.fullmatch(r"[0-9a-fA-F]{40}", environment["BASE_MODEL_REVISION"]):
             raise ValueError("BASE_MODEL_REVISION must be a 40-character immutable revision")
+        _validate_digest_archive(
+            request.base_model_s3_uri,
+            environment["BASE_MODEL_BUNDLE_SHA256"],
+            "base_model_s3_uri",
+        )
         try:
             qlora = json.loads(environment["QLORA_CONFIG"])
         except json.JSONDecodeError as exc:
@@ -643,6 +653,10 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                 "OBJECTIVE_SEED",
                 "CANDIDATE_ARCHIVE_SHA256",
                 "CHAMPION_ARCHIVE_SHA256",
+                "CHAMPION_KIND",
+                "BASE_MODEL_ID",
+                "BASE_MODEL_REVISION",
+                "BASE_MODEL_BUNDLE_SHA256",
             ),
         )
         for name in ("EVALUATION_MANIFEST_SHA256",):
@@ -650,6 +664,19 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                 raise ValueError(f"{name} must be a lowercase SHA-256 digest")
         if not re.fullmatch(r"-?[0-9]+", environment["OBJECTIVE_SEED"]):
             raise ValueError("OBJECTIVE_SEED must be an integer")
+        if environment["BASE_MODEL_ID"] != "google/functiongemma-270m-it":
+            raise ValueError("BASE_MODEL_ID must equal 'google/functiongemma-270m-it'")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", environment["BASE_MODEL_REVISION"]):
+            raise ValueError("BASE_MODEL_REVISION must be a 40-character immutable revision")
+        if environment["CHAMPION_KIND"] not in {"base-model", "qlora-adapter"}:
+            raise ValueError("CHAMPION_KIND must be 'base-model' or 'qlora-adapter'")
+        if request.base_model_s3_uri is None:
+            raise ValueError("base_model evaluation channel is required")
+        _validate_digest_archive(
+            request.base_model_s3_uri,
+            environment["BASE_MODEL_BUNDLE_SHA256"],
+            "base_model_s3_uri",
+        )
         if (
             request.candidate_s3_uri is None
             or request.champion_s3_uri is None
@@ -671,6 +698,12 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                 environment["CHAMPION_ARCHIVE_SHA256"],
                 "champion_s3_uri",
             )
+        if (
+            environment["CHAMPION_KIND"] == "base-model"
+            and environment["CHAMPION_ARCHIVE_SHA256"]
+            != environment["BASE_MODEL_BUNDLE_SHA256"]
+        ):
+            raise ValueError("base-model champion must match BASE_MODEL_BUNDLE_SHA256")
         if request.sealed_s3_uri is not None:
             _validate_input_uri(request.sealed_s3_uri, "sealed_s3_uri")
         if (
@@ -795,10 +828,35 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
             outputs = response.get("ProcessingOutputConfig")
             if isinstance(outputs, Mapping):
                 listed = outputs.get("Outputs", [])
-                if isinstance(listed, list) and listed and isinstance(listed[0], Mapping):
-                    s3_output = listed[0].get("S3Output")
-                    if isinstance(s3_output, Mapping) and "S3Uri" in s3_output:
-                        artifact_uri = _validate_artifact_uri(s3_output["S3Uri"])
+                if not isinstance(listed, list):
+                    raise ProviderResponseError(
+                        "SageMaker Processing outputs must be a list"
+                    )
+                evaluation_outputs = [
+                    item
+                    for item in listed
+                    if isinstance(item, Mapping)
+                    and item.get("OutputName") == "evaluation"
+                ]
+                if len(evaluation_outputs) > 1:
+                    raise ProviderResponseError(
+                        "SageMaker Processing job must define exactly one evaluation output"
+                    )
+                if evaluation_outputs:
+                    s3_output = evaluation_outputs[0].get("S3Output")
+                    if not isinstance(s3_output, Mapping) or "S3Uri" not in s3_output:
+                        raise ProviderResponseError(
+                            "SageMaker Processing evaluation output has no S3 URI"
+                        )
+                    artifact_uri = _validate_artifact_uri(s3_output["S3Uri"])
+                elif status is JobStatus.COMPLETED:
+                    raise ProviderResponseError(
+                        "completed SageMaker Processing job omitted its evaluation output"
+                    )
+            elif status is JobStatus.COMPLETED:
+                raise ProviderResponseError(
+                    "completed SageMaker Processing job omitted its output configuration"
+                )
         failure_reason = None
         if status in {JobStatus.FAILED, JobStatus.STOPPED}:
             failure_reason = _safe_failure_reason(response.get("FailureReason"))
@@ -904,6 +962,16 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                                 "S3DataDistributionType": "FullyReplicated",
                             }
                         },
+                    },
+                    {
+                        "ChannelName": "base_model",
+                        "DataSource": {
+                            "S3DataSource": {
+                                "S3DataType": "S3Prefix",
+                                "S3Uri": request.base_model_s3_uri,
+                                "S3DataDistributionType": "FullyReplicated",
+                            }
+                        },
                     }
                 ]
                 + ([
@@ -987,10 +1055,15 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
         if reconciled is not None:
             return reconciled
         # Processing input names become SM_CHANNEL_* variables.  The
-        # evaluator rejects every name except candidate/champion/sealed.
+        # evaluator accepts only its four declared local artifact channels.
         candidate_uri = request.candidate_s3_uri or request.model_s3_uri or request.input_s3_uri
         sealed_uri = request.sealed_s3_uri or request.input_s3_uri
         input_specs: list[tuple[str, str, str]] = [
+            (
+                "base_model",
+                cast(str, request.base_model_s3_uri),
+                "/opt/ml/processing/input/base_model",
+            ),
             ("candidate", candidate_uri, "/opt/ml/processing/input/candidate"),
             ("sealed", sealed_uri, "/opt/ml/processing/input/sealed"),
         ]
@@ -1015,16 +1088,33 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
             }
             for input_name, uri, local_path in input_specs
         ]
+        processing_environment = dict(request.environment)
+        for input_name, _, local_path in input_specs:
+            variable = f"SM_CHANNEL_{input_name.upper()}"
+            configured_path = processing_environment.get(variable)
+            if configured_path is not None and configured_path != local_path:
+                raise ValueError(
+                    f"{variable} must match its SageMaker Processing LocalPath"
+                )
+            processing_environment[variable] = local_path
+        output_local_path = "/opt/ml/processing/output"
+        configured_output_path = processing_environment.get("SM_OUTPUT_DATA_DIR")
+        if configured_output_path is not None and configured_output_path != output_local_path:
+            raise ValueError("SM_OUTPUT_DATA_DIR must match the Processing output LocalPath")
+        processing_environment["SM_OUTPUT_DATA_DIR"] = output_local_path
         app_spec: dict[str, Any] = {"ImageUri": request.image_uri}
         app_spec["ContainerEntrypoint"] = request.command or [
             "python",
             "-c",
             (
-                "import pathlib,runpy,tarfile; "
-                "[tarfile.open(str(a), 'r:*').extractall(str(root), filter='data') "
-                "for root in (pathlib.Path('/opt/ml/processing/input/candidate'), "
-                "pathlib.Path('/opt/ml/processing/input/champion')) if root.is_dir() "
-                "for a in root.rglob('*.tar.gz')]; "
+                "import os,pathlib,runpy,tarfile\n"
+                "roots = [pathlib.Path(os.environ['SM_CHANNEL_CANDIDATE'])]\n"
+                "if os.environ.get('CHAMPION_KIND') == 'qlora-adapter':\n"
+                "    roots.append(pathlib.Path(os.environ['SM_CHANNEL_CHAMPION']))\n"
+                "for root in roots:\n"
+                "    for archive in root.rglob('*.tar.gz'):\n"
+                "        with tarfile.open(archive, 'r:*') as bundle:\n"
+                "            bundle.extractall(root, filter='data')\n"
                 "runpy.run_path('/opt/ml/code/evaluate.py', run_name='__main__')"
             ),
         ]
@@ -1060,7 +1150,7 @@ class SageMakerProvider(TrainingProvider, EvaluationProvider):
                     }
                 },
                 StoppingCondition={"MaxRuntimeInSeconds": request.max_runtime_seconds},
-                Environment=request.environment,
+                Environment=processing_environment,
                 Tags=tags,
             )
         except BaseException as exc:

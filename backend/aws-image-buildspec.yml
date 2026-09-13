@@ -1,0 +1,29 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  pre_build:
+    commands:
+      - set -euo pipefail
+      - ': "${AWS_ACCOUNT_ID:?AWS_ACCOUNT_ID is required}"'
+      - ': "${AWS_DEFAULT_REGION:?AWS_DEFAULT_REGION is required}"'
+      - ': "${IMAGE_TAG:?IMAGE_TAG must be unique and immutable}"'
+      - ': "${BACKEND_REPOSITORY:?BACKEND_REPOSITORY is required}"'
+      - ': "${TRAINER_REPOSITORY:?TRAINER_REPOSITORY is required}"'
+      - ': "${EVALUATOR_REPOSITORY:?EVALUATOR_REPOSITORY is required}"'
+      - export DOCKER_BUILDKIT=1
+      - export REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+  build:
+    commands:
+      - docker build --platform linux/amd64 --pull --file Dockerfile --tag "$REGISTRY/$BACKEND_REPOSITORY:$IMAGE_TAG" .
+      - docker push "$REGISTRY/$BACKEND_REPOSITORY:$IMAGE_TAG"
+      - docker build --platform linux/amd64 --pull --file workers/trainer/Dockerfile --tag "$REGISTRY/$TRAINER_REPOSITORY:$IMAGE_TAG" .
+      - docker push "$REGISTRY/$TRAINER_REPOSITORY:$IMAGE_TAG"
+      - docker build --platform linux/amd64 --pull --file workers/evaluator/Dockerfile --tag "$REGISTRY/$EVALUATOR_REPOSITORY:$IMAGE_TAG" .
+      - docker push "$REGISTRY/$EVALUATOR_REPOSITORY:$IMAGE_TAG"
+  post_build:
+    commands:
+      - for repository in "$BACKEND_REPOSITORY" "$TRAINER_REPOSITORY" "$EVALUATOR_REPOSITORY"; do digest="$(aws ecr describe-images --repository-name "$repository" --image-ids "imageTag=$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"; [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Invalid ECR digest for $repository" >&2; exit 1; }; printf 'IMAGE_DIGEST %s %s\n' "$repository" "$digest"; done

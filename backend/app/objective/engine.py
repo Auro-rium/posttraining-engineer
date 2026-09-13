@@ -231,6 +231,7 @@ class ServiceRecoveryEngine:
         actions: list[ToolCall] | tuple[ToolCall, ...],
         *,
         split: Literal[ObjectiveSplit.HIDDEN],
+        repaired_from_trajectory_id: str | None = None,
     ) -> _SealedEvaluation: ...
 
     @overload
@@ -240,6 +241,7 @@ class ServiceRecoveryEngine:
         actions: list[ToolCall] | tuple[ToolCall, ...],
         *,
         split: ObjectiveSplit | None = None,
+        repaired_from_trajectory_id: str | None = None,
     ) -> Trajectory: ...
 
     def run_episode(
@@ -248,11 +250,14 @@ class ServiceRecoveryEngine:
         actions: list[ToolCall] | tuple[ToolCall, ...],
         *,
         split: ObjectiveSplit | None = None,
+        repaired_from_trajectory_id: str | None = None,
     ) -> Trajectory | _SealedEvaluation:
         if split is None:
             split = ObjectiveSplit.REPLAY if task_id.startswith("replay-") else ObjectiveSplit.TRAIN
         else:
             split = ObjectiveSplit(split)
+        if split is ObjectiveSplit.HIDDEN and repaired_from_trajectory_id is not None:
+            raise ValueError("repair provenance cannot cross the sealed hidden boundary")
         episode_engine = ServiceRecoveryEngine(seed=self.seed, sealed=self.sealed)
         task = episode_engine.reset(split=split, task_id=task_id)
         results: list[StepResult] = []
@@ -270,21 +275,17 @@ class ServiceRecoveryEngine:
                 steps=len(results),
             )
         executed_actions = [result.call.model_dump(mode="json") for result in results]
-        trajectory_id = (
-            "traj-"
-            + hashlib.sha256(
-                json.dumps(
-                    {
-                        "seed": self.seed,
-                        "task_id": task.task_id,
-                        "split": task.split.value,
-                        "actions": executed_actions,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-            ).hexdigest()[:24]
-        )
+        identity: dict[str, Any] = {
+            "seed": self.seed,
+            "task_id": task.task_id,
+            "split": task.split.value,
+            "actions": executed_actions,
+        }
+        if repaired_from_trajectory_id is not None:
+            identity["repaired_from_trajectory_id"] = repaired_from_trajectory_id
+        trajectory_id = "traj-" + hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:24]
         return Trajectory(
             trajectory_id=trajectory_id,
             task_id=task.task_id,
@@ -295,6 +296,7 @@ class ServiceRecoveryEngine:
             total_reward=round(sum(result.reward for result in results), 8),
             success=bool(results and results[-1].done and not episode_engine._active_issue),
             done=bool(results and results[-1].done),
+            repaired_from_trajectory_id=repaired_from_trajectory_id,
         )
 
     def verify(self, trajectory: Trajectory) -> ReplayResult:
@@ -305,7 +307,12 @@ class ServiceRecoveryEngine:
         if not trajectory.steps:
             raise TrajectoryNotAdmissible("verifier requires at least one trajectory step")
         actions = tuple(step.call for step in trajectory.steps)
-        replayed = self.run_episode(trajectory.task_id, actions, split=trajectory.split)
+        replayed = self.run_episode(
+            trajectory.task_id,
+            actions,
+            split=trajectory.split,
+            repaired_from_trajectory_id=trajectory.repaired_from_trajectory_id,
+        )
         if not isinstance(replayed, Trajectory):
             raise ValueError("trajectory replay crossed the sealed hidden boundary")
         if replayed.trajectory_id != trajectory.trajectory_id:
@@ -321,7 +328,9 @@ class ServiceRecoveryEngine:
             or replayed.seed != trajectory.seed
         ):
             raise ValueError("trajectory replay outcome or provenance does not match verifier")
-        confirmed = trajectory.model_copy(update={"verified": True})
+        confirmed = trajectory.model_copy(
+            update={"verified": True, "verifier_success": replayed.success}
+        )
         return ReplayResult(
             trajectory=confirmed,
             verified=True,
@@ -359,6 +368,11 @@ class ServiceRecoveryEngine:
                 raise TrajectoryNotAdmissible(
                     f"only verifier-confirmed trajectories may enter a dataset: {exc}"
                 ) from exc
+            if not confirmed.success or confirmed.verifier_success is not True:
+                raise TrajectoryNotAdmissible(
+                    "only successful trajectories or repaired trajectories that pass verifier "
+                    "replay may enter a dataset"
+                )
             rows.append(
                 DatasetRow(
                     source_trajectory_id=confirmed.trajectory_id,
@@ -376,11 +390,19 @@ class ServiceRecoveryEngine:
                     or ({"role": "tool", "name": "noop", "observation": {}},),
                     failure_label="service_recovery",
                     verifier_confirmed=True,
-                    source_type="verified_replay",
+                    verifier_success=True,
+                    repaired_from_trajectory_id=confirmed.repaired_from_trajectory_id,
+                    source_type=(
+                        "repaired_replay"
+                        if confirmed.repaired_from_trajectory_id is not None
+                        else "successful_replay"
+                    ),
                 )
             )
         if not rows:
-            raise TrajectoryNotAdmissible("dataset requires at least one verified trajectory")
+            raise TrajectoryNotAdmissible(
+                "dataset requires at least one verifier-confirmed successful trajectory"
+            )
         row_payload = "\n".join(row.canonical_json() for row in rows)
         digest = hashlib.sha256(row_payload.encode()).hexdigest()
         dataset_id = (

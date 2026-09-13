@@ -355,7 +355,10 @@ def _reject_gated_metadata(
         if not relative.lower().endswith(".json"):
             continue
         value = _parse_json(data, relative)
-        if _contains_restricted_flag(value):
+        # Tokenizer vocabularies use arbitrary token strings as JSON object keys
+        # (including words such as "private") with numeric token IDs as values.
+        # They are not model-access metadata and must not be scanned as such.
+        if relative.lower() != "tokenizer.json" and _contains_restricted_flag(value):
             raise CheckpointStagingError(
                 f"checkpoint metadata is gated/private/restricted: {relative}"
             )

@@ -29,10 +29,11 @@ End-to-end AWS architecture target (this diagram is not evidence of deployment):
 ```
 
 Any deployment and live-run actions described here are scoped only to this AWS
-Agents for Humans hackathon. The operator-reported SageMaker GPU quota request
-`9a3453884e2c4230a6e8bb0004c8cca57FuK8VC5` is `PENDING` as of 2026-09-12;
-this documents neither granted quota nor placement capacity. No completed
-end-to-end live post-training result is claimed.
+Agents for Humans hackathon. A read-only Service Quotas query on 2026-09-12
+confirmed an allowance of one `ml.g5.xlarge` training job in `us-east-1`; this
+is not a placement reservation. The live preflight remains blocked because the
+post-training runtime resources and pinned artifacts have not been configured
+or deployed. No completed end-to-end live post-training result is claimed.
 
 ## Run history and observation contracts
 
@@ -231,6 +232,11 @@ The list above is the legacy coordinator surface. A separate `/api/live`
 control plane is mounted for AWS mode; it uses the durable run repository and
 dispatcher when their configuration and adapters are available. It is not an
 SSE endpoint: clients page ordered events with `after` and `limit`.
+In `APP_MODE=aws`, legacy mutation routes (`POST /api/runs`, `/step`, `/auto`,
+`/cancel`, and `/api/demo/reset-environment`) return `410 Gone`; only the
+approval-gated `/api/live` controls can change live-run state. Read-only
+comparison endpoints remain available and never turn local explanatory records
+into live evidence.
 
 ## Guarded AWS live control plane
 
@@ -252,12 +258,41 @@ Prepare requires an `Idempotency-Key`, passes a fresh read-only preflight, and
 stores a bounded approval packet; it does not submit SageMaker work. Start
 requires a new `Idempotency-Key`, reruns preflight, validates and consumes the
 packet-bound single-run approval, marks the run queued, and schedules the
-dispatcher. Startup attempts recovery of incomplete runs. Status, events,
-experiments, and artifact routes read from the durable repository; cancel and
+dispatcher. Startup starts a nonblocking durable-recovery loop that scans
+incomplete runs immediately and every 30 seconds thereafter; dispatcher leases
+prevent the startup scan, periodic scan, and request-triggered dispatch from
+duplicating the same run. Shutdown cancels the recovery task cleanly. Status,
+events, experiments, and artifact routes read from the durable repository; cancel and
 safe-stop request state changes, and the supervisor performs bounded cleanup.
+Dispatcher shutdown also cancels and awaits the supervisor child before its
+lease is released, so the next recovery owner cannot overlap that in-process
+work with a recovered run.
 In AWS mode the app wires a DynamoDB repository plus Bedrock, objective-worker,
 S3, and SageMaker adapters, but any absent/invalid configuration leaves the
 live control plane blocked rather than selecting local simulated adapters.
+The runtime task role grants `bedrock:GetFoundationModel` and
+`bedrock:InvokeModel` only on the configured regional foundation-model ARN.
+Runtime synthesis requires separate validated CDK context values for the
+SageMaker training-job and processing-job GPU quota IDs; coordinator preflight
+queries both and blocks readiness if either quota is missing, unverifiable, or
+below the requested instance count. Quota allowance is not placement capacity.
+
+The coordinator task remains private in the VPC, behind an internet-facing
+application load balancer on port 443. CDK requires an issued ACM certificate
+in the stack region, a matching public hostname and Route 53 zone, and explicit
+`coordinator_ingress_cidrs` IPv4 networks (/16 through /32); synthesis fails
+closed when any contract is absent. The stack outputs an `https://`
+`CoordinatorUrl`.
+Approval TTL defaults to 86,400 seconds (24 hours), enough for five sequential
+training/evaluation pairs with each provider job bounded at two hours, plus
+bounded polling; configuration rejects
+a window shorter than the approved experiment scope. The API is restricted to
+the configured operator CIDR even though the ALB is internet-facing; the
+approval token travels over TLS. An in-stack objective worker separately
+requires its private TLS certificate/SAN contract, while an external worker
+must be reachable at an authenticated HTTPS URL.
+Coordinator IAM grants `sagemaker:ListTags` only for tagged processing/training
+job ARNs so restart reconciliation can verify deterministic job fingerprints.
 
 Successful local API/contract tests or a CDK synthesis do not establish that
 these resources are deployed, accessible, or that a run completed. Deployment
@@ -274,6 +309,25 @@ aggregates, paired outcomes digest, and regression evidence digest validate.
 The candidate is gated against the champion result from that same report. A
 missing champion result or any provenance mismatch blocks promotion; no hidden
 task contents are returned to the coordinator.
+
+For a completed SageMaker Processing evaluation, the provider selects exactly
+one output named `evaluation` and returns its S3 output prefix. The artifact
+store lists that prefix (including all pages), requires exactly one report
+object named `evaluation.json` or `evaluation.tar.gz`, and rejects missing or
+ambiguous matches. It resolves the source object's S3 `VersionId`, downloads
+that exact version, computes SHA-256 from the bytes, and copies the verified
+content to the versioned, content-addressed artifact store. The evaluation
+reader then validates report structure and provenance before accepting metrics.
+No provider prefix itself is treated as an S3 object or evaluation evidence.
+
+The evaluator's Processing inputs use fixed local mounts: `base_model` at
+`/opt/ml/processing/input/base_model`, `candidate` at
+`/opt/ml/processing/input/candidate`, `champion` at
+`/opt/ml/processing/input/champion`, and `sealed` at
+`/opt/ml/processing/input/sealed`. Each `SM_CHANNEL_*` environment value is
+set to the matching Processing `LocalPath`; a conflicting caller-supplied path
+is rejected. `SM_OUTPUT_DATA_DIR` and the Processing output `LocalPath` both
+resolve to `/opt/ml/processing/output`.
 
 The hackathon observer renders this same lifecycle as moving role bots:
 launcher -> benchmark -> failure analysis -> data curation -> training ->
@@ -294,19 +348,124 @@ Transformers loads the checkpoint from that directory with
 Missing or invalid configuration yields a blocked benchmark response, not a
 rule-based or random fallback.
 
+When CDK creates this worker inside the stack, its Fargate task has a fixed
+baseline of 2 vCPU and 4 GiB memory for the Python/Torch/Transformers runtime
+and FunctionGemma model loading. This applies only to the internal objective
+task; the coordinator remains at 1 vCPU and 2 GiB, and an externally configured
+`objective_worker_url` does not create or resize an objective task. The CDK
+contract verifies the synthesized allocation, not successful image startup,
+model loading, or a live benchmark.
+
+For the internal worker, the container entrypoint first downloads the exact
+`OBJECTIVE_BASE_MODEL_URI` S3 object version into
+`OBJECTIVE_MODEL_CHECKPOINT_DIR`, verifies its bundle SHA-256, safely extracts
+the archive, checks the pinned FunctionGemma revision and model files, then
+sets `OBJECTIVE_MODEL_SHA256` to the validated snapshot digest before replacing
+itself with Uvicorn. CDK supplies the immutable versioned URI, bundle digest,
+revision, and checkpoint destination; the objective task role has scoped
+version-read and KMS permissions. Any missing input, S3/KMS error, digest or
+revision mismatch, unsafe archive, or extraction failure exits before the
+health endpoint starts. Coordinator containers skip model bootstrap. This is
+an implemented startup contract; it does not prove an AWS task actually
+downloaded or loaded a checkpoint.
+
 For each requested train/replay task, the model receives only the sanitized
 objective, service name, allow-listed tool schemas, and earlier environment
 observations. It does not receive verifier rewards, terminal flags, internal
 failure-mode fields, or held-out tasks. Its tool calls execute through the
 service-recovery engine until the task terminates or reaches its step budget.
 The engine then deterministically replays each full action sequence, confirms
-the reward and outcome, and the artifact store persists only verified
+the reward and outcome, and the artifact store persists replay-verified
 trajectories; the HTTP response exposes aggregate metrics and opaque artifact
-references. Inference, replay, or persistence failures block the benchmark.
-The current validation record contains no successful checkpoint-backed
-`/v1/benchmark` result or real FunctionGemma trajectory hash. The adapter is
-implemented, but a successful contract test with a test double does not prove
-that the actual checkpoint loads or that any live benchmark was completed.
+references. A replay-verified failure remains benchmark evidence, not an SFT
+target. The DataCuratorAgent may return a strict action-sequence proposal bound
+to a coordinator-supplied train/replay failure reference; that proposal is
+untrusted and is not a trajectory or evidence. Authenticated
+`/v1/replay-corrections` resolves the referenced artifact, checks its
+verifier-confirmed failed outcome and exact task/split, then deterministically
+replays the proposed actions. A failed proposal returns `REJECTED` and is not
+persisted. Only a passing replay is persisted with
+`repaired_from_trajectory_id` in its content-addressed identity and returned as
+a verified trajectory reference. `/v1/verify-curation` replays selected
+originals and accepted repairs, omits failed originals from dataset rows, and
+admits only successful verifier outcomes. Dataset manifests preserve repair
+lineage, and both artifact stores recheck successful verifier outcomes and the
+failed parent before persistence. `build_dataset` itself still rejects failed
+trajectories. Correction and curation requests accept train or replay only;
+hidden and validation data cannot be proposed or replayed through the objective
+service. If no successful original or verified repair is available, curation
+fails closed and creates no dataset. Inference, replay, or persistence failures
+block the benchmark.
+
+Each authenticated `/v1/benchmark` request receives a server-generated
+correlation ID, also returned in `X-Objective-Correlation-ID`. The worker logs
+only that ID, an allow-listed stage, elapsed milliseconds, pinned checkpoint
+revision, optional process RSS, outcome, and (on failure) exception class. It
+never returns exception details or logs prompts, completions, credentials,
+authorization headers, or trajectory/task contents. Instrumented stages are
+`CHECKPOINT_RESOLVE`, `PROCESSOR_LOAD`, `MODEL_LOAD`, `PROMPT_RENDER`,
+`MODEL_GENERATE`, `MODEL_DECODE`, `FUNCTION_PARSE`, `ENVIRONMENT_STEP`,
+`TRAJECTORY_VERIFY`, `S3_PERSIST`, and `BENCHMARK_COMPLETE`.
+
+Authenticated `/v1/readiness` separates `configuration_ready`,
+`checkpoint_ready`, `model_load_ready`, `generation_ready`,
+`artifact_store_ready`, and `execution_ready`. Model-load and generation
+attestations are process-local: they remain false until that worker has loaded
+the local checkpoint and generated a parseable allow-listed tool call.
+`artifact_store_ready` checks the configured store interface; it is not proof
+of an S3 write. Only a successful benchmark response with a version-pinned,
+non-empty trajectory/report artifact proves the end-to-end objective path.
+The coordinator's `/health` is intentionally shallow and reports endpoint
+configuration and build provenance separately from dependency readiness.
+
+Live AWS observation on 2026-09-13: the deployed coordinator `/health` returned
+HTTP 200 but still reported the stale `objective_worker: not_configured` value
+and omitted build provenance. `/api/live/readiness` returned `READY` based on
+configuration and quota checks, but a one-episode authenticated objective
+request had returned HTTP 503 before the stage-telemetry build was deployed.
+No trajectory/report was produced and no SageMaker training or Processing job
+was submitted. The local stage-telemetry/readiness changes are not live AWS
+evidence until committed, published, deployed, and followed by a successful
+objective smoke.
+
+As of 2026-09-13, the pinned `google/functiongemma-270m-it` revision
+`39eccb091651513a5dfb56892d3714c1b5b8276c` has been staged in the versioned,
+KMS-encrypted AWS artifact bucket. Its deterministic bundle SHA-256 is
+`70436508f4a6908c9b455afa57b0690f42f0f0d1df2601a54aefded914afcb79` and its
+S3 `VersionId` is `L86c4JC3X7Zw8kUiOAZlVjOpvXtKtpLF`. The sealed evaluator
+bundle is also staged: suite `AgentGym/AgentEval`, version `agent-eval-v1`,
+seed 7, 20 task IDs, manifest SHA-256
+`019b08d0ef35f192953cc6a1babdf41ea07044a2e491eb7cbf7e236ab939f39a`. Those
+IDs resolve to tasks in the repository's deterministic
+`in-repo-service-recovery-v1` engine; they are not downloaded upstream
+AgentGym assets. These S3 writes do not prove a runtime deployment, checkpoint
+load, successful `/v1/benchmark`, or real FunctionGemma trajectory hash. The
+adapter is implemented, but contract tests with test doubles do not establish
+live inference or a completed benchmark.
+
+## Trainer and evaluator image smoke contract
+
+Both SageMaker worker images include a separate, explicit smoke entrypoint and
+are built for `linux/amd64`. The trainer smoke accepts only a mounted local
+FunctionGemma directory, requires CUDA and bitsandbytes, disables Hub access,
+loads the model in 4-bit, and performs one LoRA optimizer step. It writes a
+throwaway adapter solely so the evaluator image can independently load the
+same local base plus adapter and execute one inference forward pass. The
+evaluator smoke uses no sealed tasks and writes no evaluation report. The
+one-step smoke adapter is not a training result, has no approved lineage
+manifest, and cannot be promoted. A successful image smoke does not prove a
+SageMaker job or live evaluation succeeded.
+
+Worker images are published through `backend/aws-image-buildspec.yml` in an
+AWS CodeBuild environment, not by downloading the ML dependency stack on the
+developer workstation. The source archive must contain only the Docker build
+inputs and exclude `.env` files, virtual environments, local model caches, and
+training/evaluation data. CodeBuild builds `linux/amd64`, pushes uniquely
+tagged images to the three bootstrap ECR repositories, then resolves and
+prints each immutable ECR digest. The runtime stack consumes those digests;
+mutable tags are not deployment inputs. This build path does not run a GPU
+smoke or submit SageMaker jobs, and image digests alone do not establish model
+load, training, evaluation, or promotion evidence.
 
 ## Evidence labels
 
@@ -334,3 +493,16 @@ manufacture progress.
 The guarded command path is `live_preflight.py` (read-only), `live_run.py` (one
 approved run), and `live_batch.py` (sequential runs with a fresh approval token
 between runs). Preflight must pass before any SageMaker job is submitted.
+
+## Durable dispatcher lease ownership
+
+A dispatcher may claim a run only when no unexpired lease exists, including
+when the existing lease owner string matches its own process identity. Lease
+renewal is a separate compare-and-swap operation that requires the current
+owner and an unexpired lease. This prevents overlapping recovery and HTTP-start
+dispatch scans in one coordinator process from treating a shared owner name as
+proof that both workers own the same run. Expired leases remain claimable for
+restart recovery; SageMaker intents and deterministic provider fingerprints
+remain the provider-side duplicate-submission defense. Local regression tests
+cover same-owner reclaims and stale concurrent dispatcher scans; these tests do
+not prove AWS DynamoDB/SageMaker behavior in a deployed stack.

@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
@@ -418,6 +418,8 @@ def _supervisor(
     *,
     max_experiments: int = 1,
     budget: float = 25.0,
+    cost_upper_bounds: Mapping[str, float] | None = None,
+    phase_cost_estimates: Mapping[str, float] | None = None,
     provider: _Provider | None = None,
     target_score: float | None = None,
     objective: _Objective | None = None,
@@ -437,6 +439,12 @@ def _supervisor(
         target_score=target_score,
         poll_interval_seconds=0,
         max_polls=2,
+        phase_cost_upper_bounds_usd=(
+            {"training": 5.0, "evaluation": 1.0}
+            if cost_upper_bounds is None
+            else cost_upper_bounds
+        ),
+        phase_cost_estimates=phase_cost_estimates,
     )
     return supervisor, provider
 
@@ -466,6 +474,100 @@ async def test_restart_resumes_submitted_operation_without_duplicate_training() 
     # A second worker observing the durable terminal state is a no-op.
     second = await supervisor.run_optimization("run-1")
     assert second.status is AutonomousRunStatus.SUCCEEDED
+    assert provider.training_submits == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_recovery_reconciles_persisted_training_intent() -> None:
+    class _CreateAcceptedButResponseLostProvider(_Provider):
+        def __init__(self) -> None:
+            super().__init__([0.5])
+            self.accepted_training: JobResult | None = None
+            self.training_reconciliations = 0
+
+        def submit_training(self, request: TrainingJobRequest) -> JobResult:
+            self.training_submits += 1
+            self.accepted_training = JobResult(
+                request.job_name,
+                f"train://{request.job_name}",
+                JobStatus.IN_PROGRESS,
+            )
+            # Model SageMaker accepting CreateTrainingJob while the coordinator
+            # loses the response before persisting its provider ID.
+            raise TransientProviderError(
+                "training create response was lost",
+                job_name=request.job_name,
+                operation="create_training_job",
+            )
+
+        def reconcile_training(self, request: TrainingJobRequest) -> JobResult | None:
+            self.training_reconciliations += 1
+            if self.accepted_training is not None:
+                assert self.accepted_training.job_name == request.job_name
+            return self.accepted_training
+
+    store = _StateStore()
+    store.create(
+        _state(
+            max_experiments=1,
+            status=AutonomousRunStatus.QUEUED,
+            phase=RunPhase.QUEUED,
+            approved_budget_usd=25.0,
+        )
+    )
+    provider = _CreateAcceptedButResponseLostProvider()
+    objective = _Objective()
+    agents = _Agents()
+
+    def new_supervisor() -> AutonomousRunSupervisor:
+        return AutonomousRunSupervisor(
+            repository=store,
+            objective=objective,
+            agents=agents,
+            provider=provider,
+            request_factory=_Factory(),
+            artifacts=_Artifacts(),
+            evaluator=_Evaluator(),
+            poll_interval_seconds=0,
+            max_polls=2,
+            phase_cost_upper_bounds_usd={"training": 5.0, "evaluation": 1.0},
+        )
+
+    interrupted = await new_supervisor().run_optimization("run-1")
+
+    assert interrupted.status is AutonomousRunStatus.RUNNING
+    training_intent = store.get_operation("run-1", "run-1:1:training")
+    assert training_intent is not None
+    assert training_intent.status.value == "INTENT"
+    assert provider.accepted_training is not None
+    assert training_intent.result["request"]["job_name"] == provider.accepted_training.job_name
+    assert provider.training_submits == 1
+
+    # A hard process loss leaves its durable lease in place until expiry.
+    store.claim_lease(
+        "run-1",
+        "previous-coordinator",
+        now=datetime.now(UTC) - timedelta(seconds=5),
+        ttl_seconds=1,
+    )
+    expired = store.get("run-1")
+    assert expired is not None and expired.lease_expires_at is not None
+    assert expired.lease_expires_at < datetime.now(UTC)
+
+    recovered_supervisor = new_supervisor()
+    dispatcher = AutonomousRunDispatcher(
+        repository=store,
+        supervisor=recovered_supervisor,
+        owner="restarted-coordinator",
+        lease_ttl_seconds=30,
+    )
+    processed = await dispatcher.recover_incomplete_runs()
+
+    recovered = store.get("run-1")
+    assert processed == ["run-1"]
+    assert recovered is not None
+    assert recovered.status is AutonomousRunStatus.SUCCEEDED, recovered.stop_reason
+    assert provider.training_reconciliations == 2
     assert provider.training_submits == 1
 
 
@@ -514,6 +616,57 @@ async def test_budget_exhaustion_blocks_training_before_submission() -> None:
     assert result.status is AutonomousRunStatus.BLOCKED
     assert "budget" in (result.stop_reason or "")
     assert provider.training_submits == 0
+
+
+@pytest.mark.asyncio
+async def test_training_worst_case_above_remaining_budget_blocks_before_submission() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(
+        store,
+        budget=4.99,
+        cost_upper_bounds={"training": 5.0, "evaluation": 1.0},
+    )
+
+    result = await supervisor.run_optimization("run-1")
+
+    assert result.status is AutonomousRunStatus.BLOCKED
+    assert result.stop_reason == "budget exhausted"
+    assert provider.training_submits == 0
+    assert provider.evaluation_submits == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluation_worst_case_above_remaining_budget_blocks_evaluation_submission() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(
+        store,
+        budget=10.0,
+        cost_upper_bounds={"training": 5.0, "evaluation": 5.01},
+        phase_cost_estimates={"training": 5.0, "evaluation": 1.0},
+    )
+
+    result = await supervisor.run_optimization("run-1")
+
+    assert result.status is AutonomousRunStatus.BLOCKED
+    assert result.stop_reason == "budget exhausted"
+    assert provider.training_submits == 1
+    assert provider.evaluation_submits == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_job_cost_bound_blocks_run_before_any_provider_submission() -> None:
+    store = _StateStore()
+    supervisor, provider = _supervisor(
+        store,
+        cost_upper_bounds={"training": 5.0},
+    )
+
+    result = await supervisor.run_optimization("run-1")
+
+    assert result.status is AutonomousRunStatus.BLOCKED
+    assert result.stop_reason == "cost upper bound is unavailable for evaluation"
+    assert provider.training_submits == 0
+    assert provider.evaluation_submits == 0
 
 
 @pytest.mark.asyncio
@@ -855,3 +1008,78 @@ async def test_dispatcher_claims_lease_and_releases_it_after_supervisor() -> Non
     assert calls == ["run-1"]
     assert result == ["run-1"]
     assert store.get("run-1").lease_owner is None  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_cancellation_stops_supervisor_before_releasing_lease() -> None:
+    store = _StateStore()
+    store.create(_state(status=AutonomousRunStatus.QUEUED, phase=RunPhase.QUEUED))
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class _BlockingSupervisor:
+        async def run_optimization(self, run_id: str) -> AutonomousRunState:
+            assert run_id == "run-1"
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    dispatcher = AutonomousRunDispatcher(
+        repository=store,
+        supervisor=_BlockingSupervisor(),
+        owner="worker-a",
+        lease_ttl_seconds=30,
+    )
+    dispatch_task = asyncio.create_task(dispatcher.dispatch_once())
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    dispatch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch_task
+
+    assert cancelled.is_set()
+    assert store.get("run-1").lease_owner is None  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatchers_with_same_owner_do_not_run_stale_candidate_twice() -> None:
+    class _StaleScanStore(_StateStore):
+        def scan_recoverable(self, **kwargs: Any) -> list[AutonomousRunState]:
+            del kwargs
+            state = self.get("run-1")
+            return [state] if state is not None else []
+
+    store = _StaleScanStore()
+    store.create(_state(status=AutonomousRunStatus.QUEUED, phase=RunPhase.QUEUED))
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    class _BlockingSupervisor:
+        async def run_optimization(self, run_id: str) -> AutonomousRunState:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            state = store.get(run_id)
+            assert state is not None
+            return state
+
+    dispatcher = AutonomousRunDispatcher(
+        repository=store,
+        supervisor=_BlockingSupervisor(),
+        owner="same-api-process",
+        lease_ttl_seconds=30,
+    )
+    first = asyncio.create_task(dispatcher.dispatch_once())
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    second = asyncio.create_task(dispatcher.dispatch_once())
+    await asyncio.sleep(0)
+    assert calls == 1
+
+    release.set()
+    await asyncio.gather(first, second)
+    assert calls == 1

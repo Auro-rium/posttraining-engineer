@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from email.message import Message
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Any
 from urllib.error import HTTPError
 
@@ -37,7 +39,8 @@ def _config(**overrides: object) -> Any:
         "evaluation_input_s3_uri": "s3://demo-bucket/post-training/inputs/evaluation",
         "checkpoint_s3_uri": "s3://demo-bucket/checkpoints/base.tar.gz?versionId=v1",
         "checkpoint_sha256": "d" * 64,
-        "sagemaker_gpu_quota_code": "L-0123456789abcdef0",
+        "sagemaker_gpu_quota_code": "L-01234567",
+        "sagemaker_processing_gpu_quota_code": "L-89ABCDEF",
         "max_runtime_seconds": 3600,
     }
     values.update(overrides)
@@ -115,6 +118,10 @@ def test_objective_worker_health_requires_bearer_auth_without_exposing_token(
     client = ObjectiveWorkerClient("https://worker.example.com", auth_token="worker-secret")
 
     assert client.health()["status"] == "healthy"
+    assert [request["url"] for request in requests] == [
+        "https://worker.example.com/v1/health",
+        "https://worker.example.com/v1/auth-probe",
+    ]
     assert requests[0]["headers"] == {"Authorization": "Bearer worker-secret"}
     assert "worker-secret" not in repr(client)
 
@@ -126,8 +133,21 @@ def test_objective_worker_without_auth_token_fails_closed() -> None:
         client.health()
 
 
+@pytest.mark.parametrize(
+    ("worker_url", "api_prefix"),
+    [
+        ("https://worker.example.com", "https://worker.example.com/v1"),
+        ("https://gateway.example.com/v1/", "https://gateway.example.com/v1"),
+        (
+            "https://proxy.example.com/objective/v1/",
+            "https://proxy.example.com/objective/v1",
+        ),
+    ],
+)
 def test_preflight_proves_worker_token_with_protected_non_mutating_endpoint(
     monkeypatch: pytest.MonkeyPatch,
+    worker_url: str,
+    api_prefix: str,
 ) -> None:
     requests: list[dict[str, Any]] = []
 
@@ -146,13 +166,13 @@ def test_preflight_proves_worker_token_with_protected_non_mutating_endpoint(
         raise AssertionError(f"unexpected objective readiness request: {url}")
 
     monkeypatch.setattr(live_execution, "_http_json", fake_http_json)
-    runner = live_execution.PreflightRunner(_config())
+    runner = live_execution.PreflightRunner(_config(objective_worker_url=worker_url))
 
     assert runner._check_worker_readiness()["status"] == "ready"
-    assert [request["url"].rsplit("/", 1)[-1] for request in requests] == [
-        "health",
-        "readiness",
-        "auth-probe",
+    assert [request["url"] for request in requests] == [
+        f"{api_prefix}/health",
+        f"{api_prefix}/readiness",
+        f"{api_prefix}/auth-probe",
     ]
     assert all(
         request["headers"] == {"Authorization": "Bearer worker-secret"}
@@ -221,8 +241,15 @@ def test_preflight_rejects_worker_token_when_protected_probe_returns_unauthorize
 
 
 class _ReadOnlyS3:
-    def __init__(self, *, checkpoint_digest: str, location: str | None = "us-east-1") -> None:
+    def __init__(
+        self,
+        *,
+        checkpoint_digest: str,
+        checkpoint_revision: str = "c" * 40,
+        location: str | None = "us-east-1",
+    ) -> None:
         self.checkpoint_digest = checkpoint_digest
+        self.checkpoint_revision = checkpoint_revision
         self.location = location
         self.calls: list[tuple[str, dict[str, object]]] = []
 
@@ -250,7 +277,14 @@ class _ReadOnlyS3:
 
     def head_object(self, **kwargs: object) -> dict[str, object]:
         self.calls.append(("head_object", kwargs))
-        return {"Metadata": {"sha256": self.checkpoint_digest}, "VersionId": "v1"}
+        return {
+            "Metadata": {
+                "sha256": self.checkpoint_digest,
+                "model-id": "google/functiongemma-270m-it",
+                "hf-revision": self.checkpoint_revision,
+            },
+            "VersionId": "v1",
+        }
 
     def __getattr__(self, name: str) -> object:
         if name.startswith(("put", "create", "delete", "update", "start", "stop")):
@@ -331,28 +365,133 @@ class _ReadOnlyS3Inputs:
         return {"Contents": self.contents, "KeyCount": len(self.contents)}
 
 
-def test_sagemaker_input_preflight_requires_a_nonempty_prefix() -> None:
+def test_sagemaker_evaluation_preflight_requires_a_nonempty_sealed_prefix() -> None:
     client = _ReadOnlyS3Inputs([])
     runner = PreflightRunner(_config(), clients={"s3": client})
 
-    with pytest.raises(LiveExecutionBlocked, match="training input prefix is empty"):
-        runner._check_input_readiness("training")
+    with pytest.raises(LiveExecutionBlocked, match="evaluation input prefix is empty"):
+        runner._check_input_readiness("evaluation")
 
     assert client.calls == [
         {
             "Bucket": "demo-bucket",
-            "Prefix": "post-training/inputs/training/",
+            "Prefix": "post-training/inputs/evaluation/",
             "MaxKeys": 1,
         }
     ]
 
 
-def test_sagemaker_input_preflight_rejects_inputs_outside_artifact_scope() -> None:
-    config = _config(training_input_s3_uri="s3://other-bucket/post-training/inputs/training")
+def test_live_preflight_uses_staged_checkpoint_without_hub_or_static_training_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_splits: list[str] = []
+    config = _config(training_input_s3_uri="")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    def input_readiness(self: PreflightRunner, split: str) -> dict[str, str]:
+        input_splits.append(split)
+        assert split == "evaluation"
+        return {"status": "available"}
+
+    monkeypatch.setattr(PreflightRunner, "_check_bedrock_readiness", lambda self: {})
+    monkeypatch.setattr(PreflightRunner, "_check_s3_readiness", lambda self: {})
+    monkeypatch.setattr(PreflightRunner, "_check_input_readiness", input_readiness)
+    monkeypatch.setattr(PreflightRunner, "_check_dynamodb_readiness", lambda self: {})
+    monkeypatch.setattr(PreflightRunner, "_check_sagemaker_readiness", lambda self: {})
+    monkeypatch.setattr(PreflightRunner, "_check_worker_readiness", lambda self: {})
+    monkeypatch.setattr(
+        PreflightRunner,
+        "_check_approval_secret",
+        lambda self: live_execution.CheckResult(
+            name="approval_secret",
+            status=live_execution.CheckStatus.PASSED,
+            detail="test secret is configured",
+        ),
+    )
+    monkeypatch.setattr(
+        PreflightRunner,
+        "_check_gpu_readiness",
+        lambda self: live_execution.CheckResult(
+            name="gpu_quota",
+            status=live_execution.CheckStatus.PASSED,
+            detail="test quota is available",
+        ),
+    )
+
+    runner = PreflightRunner(
+        config,
+        clients={
+            "sts": SimpleNamespace(
+                get_caller_identity=lambda: {"Account": "123456789012"}
+            ),
+            "s3": _ReadOnlyS3(checkpoint_digest="d" * 64),
+        },
+    )
+    report = runner.run()
+
+    assert report.ready
+    assert input_splits == ["evaluation"]
+    names = {check.name for check in report.checks}
+    assert "sagemaker_training_input" not in names
+    assert "huggingface_pinned_revision" not in names
+    assert "configured_base_model_revision" in names
+    assert "pinned_checkpoint_artifact" in names
+    checkpoint_check = next(
+        check for check in report.checks if check.name == "pinned_checkpoint_artifact"
+    )
+    assert checkpoint_check.metadata["revision"] == "c" * 40
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_uri", "observed_digest", "observed_revision", "message"),
+    [
+        (None, "d" * 64, "c" * 40, "CHECKPOINT_S3_URI"),
+        ("s3://demo-bucket/checkpoints/base.tar.gz", "d" * 64, "c" * 40, "versionId"),
+        (
+            "s3://demo-bucket/checkpoints/base.tar.gz?versionId=v1",
+            "c" * 64,
+            "c" * 40,
+            "metadata digest",
+        ),
+        (
+            "s3://demo-bucket/checkpoints/base.tar.gz?versionId=v1",
+            "d" * 64,
+            "f" * 40,
+            "metadata revision",
+        ),
+    ],
+)
+def test_checkpoint_preflight_blocks_missing_unversioned_or_mismatched_staged_base(
+    checkpoint_uri: str | None,
+    observed_digest: str,
+    observed_revision: str,
+    message: str,
+) -> None:
+    config = _config(checkpoint_s3_uri=checkpoint_uri)
+    runner = PreflightRunner(
+        config,
+        clients={
+            "s3": _ReadOnlyS3(
+                checkpoint_digest=observed_digest,
+                checkpoint_revision=observed_revision,
+            )
+        },
+    )
+
+    with pytest.raises(LiveExecutionBlocked, match=message):
+        runner._check_checkpoint_readiness()
+
+
+def test_sagemaker_evaluation_preflight_rejects_inputs_outside_artifact_scope() -> None:
+    config = _config(
+        evaluation_input_s3_uri="s3://other-bucket/post-training/inputs/evaluation"
+    )
     runner = PreflightRunner(config, clients={"s3": _ReadOnlyS3Inputs([])})
 
     with pytest.raises(LiveExecutionBlocked, match="artifact bucket and prefix"):
-        runner._check_input_readiness("training")
+        runner._check_input_readiness("evaluation")
 
 
 def test_checkpoint_preflight_rejects_unversioned_uri() -> None:

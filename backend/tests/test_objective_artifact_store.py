@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any, cast
 
@@ -14,7 +15,15 @@ from app.objective.artifacts import (
     S3ObjectiveArtifactStore,
 )
 from app.objective.engine import ServiceRecoveryEngine
-from app.objective.models import ObjectiveSplit, ToolCall, Trajectory, TrajectoryReference
+from app.objective.models import (
+    Dataset,
+    DatasetManifest,
+    DatasetRow,
+    ObjectiveSplit,
+    ToolCall,
+    Trajectory,
+    TrajectoryReference,
+)
 
 
 class _VersionedS3:
@@ -82,13 +91,19 @@ class _VersionedS3:
 
 def _trajectory(*, split: ObjectiveSplit = ObjectiveSplit.REPLAY) -> Trajectory:
     engine = ServiceRecoveryEngine(seed=7)
+    task_id = "replay-001"
+    definition = engine._make_definition(task_id, split)
+    if definition.failure_mode == "config_error":
+        action = ToolCall(
+            tool="edit_config",
+            arguments={"service": definition.service_name, "content": "fixed"},
+        )
+    else:
+        action = ToolCall(tool="restart_service", arguments={"service": definition.service_name})
     return engine.verify(
         engine.run_episode(
-            "replay-001",
-            [
-                ToolCall(tool="edit_config", arguments={"service": "api", "content": "fixed"}),
-                ToolCall(tool="run_healthcheck", arguments={"service": "api"}),
-            ],
+            task_id,
+            [action],
             split=split,
         )
     ).trajectory
@@ -136,6 +151,37 @@ def test_repeated_content_addressed_put_is_idempotent() -> None:
             ]
         )
         == 1
+    )
+
+
+def test_benchmark_report_is_immutable_and_scoped_under_requested_run_prefix() -> None:
+    client = _VersionedS3()
+    store = S3ObjectiveArtifactStore(
+        "objective-artifacts", client=client, prefix="post-training"
+    )
+    report = {"benchmark_id": "bench-1", "manifest_sha256": "a" * 64}
+
+    artifact = store.put_benchmark_report(
+        output_s3_uri=(
+            "s3://objective-artifacts/post-training/run-1/train/0"
+        ),
+        report=report,
+        split=ObjectiveSplit.TRAIN,
+    )
+
+    assert artifact.bucket == "objective-artifacts"
+    assert artifact.key == "post-training/run-1/train/0/benchmark-report.json"
+    assert artifact.version_id == "v1"
+    assert artifact.version_ref == (
+        "s3://objective-artifacts/post-training/run-1/train/0/benchmark-report.json?versionId=v1"
+    )
+    put_call = next(
+        call
+        for name, call in client.calls
+        if name == "put_object" and "benchmark-report.json" in str(call["Key"])
+    )
+    assert bytes(cast(bytes, put_call["Body"])) == (
+        b'{"benchmark_id":"bench-1","manifest_sha256":"' + b"a" * 64 + b'"}'
     )
 
 
@@ -324,3 +370,48 @@ def test_reference_resolution_never_uses_validation_flag_as_authorization() -> N
                 verified=True,
             )
         )
+
+
+def test_artifact_store_refuses_a_success_claim_for_a_verified_failed_source() -> None:
+    store = S3ObjectiveArtifactStore("objective-artifacts", client=_VersionedS3())
+    engine = ServiceRecoveryEngine(seed=7)
+    failed = engine.verify(
+        engine.run_episode(
+            "replay-failed-artifact-001",
+            [ToolCall(tool="run_healthcheck", arguments={})] * 10,
+            split=ObjectiveSplit.REPLAY,
+        )
+    ).trajectory
+    assert failed.verifier_success is False
+    store.put(failed)
+
+    row = DatasetRow.model_construct(
+        source_trajectory_id=failed.trajectory_id,
+        task_id=failed.task_id,
+        split=failed.split,
+        messages=({"role": "tool", "name": "run_healthcheck", "arguments": {}},),
+        failure_label="service_recovery",
+        verifier_confirmed=True,
+        verifier_success=True,
+        repaired_from_trajectory_id=None,
+        source_type="successful_replay",
+    )
+    digest = hashlib.sha256(row.canonical_json().encode()).hexdigest()
+    dataset_id = "dataset-" + hashlib.sha256(f"run-1:exp-1:{digest}".encode()).hexdigest()[:24]
+    dataset = Dataset(
+        manifest=DatasetManifest(
+            dataset_id=dataset_id,
+            run_id="run-1",
+            experiment_id="exp-1",
+            row_count=1,
+            sha256=digest,
+            s3_uri=f"s3://objective-artifacts/datasets/{dataset_id}.jsonl",
+            created_at=datetime(2026, 9, 12, tzinfo=UTC),
+            source_trajectory_ids=(failed.trajectory_id,),
+            target_failure_classes=("service_recovery",),
+        ),
+        rows=(row,),
+    )
+
+    with pytest.raises(ObjectiveArtifactIntegrityError, match="trusted successful trajectory"):
+        store.put_dataset(dataset)

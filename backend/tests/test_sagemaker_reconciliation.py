@@ -29,6 +29,7 @@ def _training_request() -> TrainingJobRequest:
         input_s3_uri=f"s3://artifacts/run-001/dataset/{dataset_sha256}",
         output_s3_uri="s3://artifacts/run-001/candidate",
         instance_type="ml.g5.xlarge",
+        base_model_s3_uri=f"s3://artifacts/run-001/base/{'b' * 64}.tar.gz",
         hyperparameters={"epochs": 2, "learning_rate": "0.0002"},
         environment={
             "RUN_ID": "run-001",
@@ -38,6 +39,7 @@ def _training_request() -> TrainingJobRequest:
             "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-001",
             "BASE_MODEL_ID": "google/functiongemma-270m-it",
             "BASE_MODEL_REVISION": "b" * 40,
+            "BASE_MODEL_BUNDLE_SHA256": "b" * 64,
             "QLORA_CONFIG": "{}",
         },
     )
@@ -57,6 +59,7 @@ def _evaluation_request() -> EvaluationJobRequest:
         candidate_s3_uri=f"s3://artifacts/run-001/candidate/{candidate_sha256}.tar.gz",
         champion_s3_uri=f"s3://artifacts/run-001/champion/{champion_sha256}.tar.gz",
         sealed_s3_uri="s3://artifacts/run-001/held-out",
+        base_model_s3_uri=f"s3://artifacts/run-001/base/{'e' * 64}.tar.gz",
         environment={
             "RUN_ID": "run-001",
             "EXPERIMENT_ID": "run-001-1",
@@ -65,6 +68,10 @@ def _evaluation_request() -> EvaluationJobRequest:
             "OBJECTIVE_SEED": "7",
             "CANDIDATE_ARCHIVE_SHA256": candidate_sha256,
             "CHAMPION_ARCHIVE_SHA256": champion_sha256,
+            "CHAMPION_KIND": "qlora-adapter",
+            "BASE_MODEL_ID": "google/functiongemma-270m-it",
+            "BASE_MODEL_REVISION": "f" * 40,
+            "BASE_MODEL_BUNDLE_SHA256": "e" * 64,
         },
     )
 

@@ -246,6 +246,23 @@ def test_lease_claim_renew_release_and_recovery_scan() -> None:
     assert [item.run_id for item in recoverable] == ["queued", "running"]
 
 
+def test_live_lease_cannot_be_reclaimed_by_same_owner_but_can_be_renewed() -> None:
+    repository = InMemoryAutonomousRunRepository()
+    repository.create(make_approved_queued_run("same-owner"))
+    now = datetime(2026, 9, 8, tzinfo=UTC)
+
+    claimed = repository.claim_lease("same-owner", "worker-a", now=now, ttl_seconds=30)
+
+    with pytest.raises(LeaseConflictError):
+        repository.claim_lease("same-owner", "worker-a", now=now, ttl_seconds=30)
+
+    renewed = repository.renew_lease(
+        "same-owner", "worker-a", now=now + timedelta(seconds=1), ttl_seconds=60
+    )
+    assert renewed.lease_owner == claimed.lease_owner
+    assert renewed.lease_expires_at == now + timedelta(seconds=61)
+
+
 def test_recovery_excludes_prepared_unapproved_runs_and_supports_cursor_pages() -> None:
     repository = InMemoryAutonomousRunRepository()
     repository.create(make_run("prepared"))
@@ -676,6 +693,30 @@ def test_dynamo_lease_uses_native_resource_expression_values_and_derived_name() 
     repository.claim_lease("run-1", "worker", now=datetime(2026, 9, 8, tzinfo=UTC))
     values = table.puts[-1]["ExpressionAttributeValues"]
     assert values == {":version": 0}
+
+
+def test_dynamo_live_lease_rejects_same_owner_reclaim_but_renews_explicitly() -> None:
+    now = datetime(2026, 9, 8, tzinfo=UTC)
+    live_state = AutonomousRunState.model_validate(
+        {
+            **make_approved_queued_run().model_dump(mode="python"),
+            "lease_owner": "worker-a",
+            "lease_expires_at": now + timedelta(seconds=30),
+        }
+    )
+    table = StubDynamoTable()
+    table.items.append(DynamoDBAutonomousRunRepository._item("STATE", live_state))
+    repository = DynamoDBAutonomousRunRepository(table=table, client=StubDynamoClient())
+
+    with pytest.raises(LeaseConflictError):
+        repository.claim_lease("run-1", "worker-a", now=now)
+    assert table.puts == []
+
+    renewed = repository.renew_lease(
+        "run-1", "worker-a", now=now + timedelta(seconds=1), ttl_seconds=60
+    )
+    assert renewed.lease_expires_at == now + timedelta(seconds=61)
+    assert len(table.puts) == 1
 
 
 def test_dynamo_update_state_uses_validated_conditional_put() -> None:

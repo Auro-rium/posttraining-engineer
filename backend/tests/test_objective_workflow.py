@@ -42,6 +42,7 @@ def _result(request: ObjectiveBenchmarkRequest) -> ObjectiveBenchmarkResult:
         suite=request.suite,
         suite_version=request.suite_version,
         model_id=request.model_uri,
+        model_sha256=request.model_sha256,
         seed=request.seed,
         split=request.split,
         metrics=BenchmarkMetrics(aggregate=0.5, per_environment={"WebShop": 0.5}),
@@ -61,7 +62,8 @@ def test_objective_result_requires_real_artifact_for_live_evidence() -> None:
             run_id="run-001",
             suite="AgentGym/WebShop",
             suite_version="2026-09-01",
-            model_id="s3://bucket/base",
+            model_id="s3://bucket/base.tar.gz?versionId=base-v1",
+            model_sha256="a" * 64,
             seed=7,
             split="baseline",
             metrics=BenchmarkMetrics(aggregate=0.5),
@@ -74,7 +76,8 @@ def test_objective_result_requires_real_artifact_for_live_evidence() -> None:
 def test_objective_worker_result_is_provenance_checked() -> None:
     request = ObjectiveBenchmarkRequest(
         run_id="run-001",
-        model_uri="s3://bucket/base",
+        model_uri="s3://bucket/base.tar.gz?versionId=base-v1",
+        model_sha256="a" * 64,
         suite="AgentGym/WebShop",
         suite_version="2026-09-01",
         seed=7,
@@ -96,7 +99,7 @@ def test_objective_worker_result_is_provenance_checked() -> None:
     assert evidence.label is EvidenceLabel.LIVE
     assert evidence.artifact_ids == ("report-001",)
 
-    mismatch = _result(request).model_copy(update={"seed": 8})
+    mismatch = _result(request).model_copy(update={"model_sha256": "b" * 64})
 
     class BadWorker:
         def execute_benchmark(
@@ -114,7 +117,8 @@ def test_training_benchmark_request_rejects_non_training_splits(split: str) -> N
     with pytest.raises(ValueError):
         ObjectiveBenchmarkRequest(
             run_id="run-001",
-            model_uri="s3://bucket/base",
+            model_uri="s3://bucket/base.tar.gz?versionId=base-v1",
+            model_sha256="a" * 64,
             suite="AgentGym/WebShop",
             suite_version="2026-09-01",
             seed=7,

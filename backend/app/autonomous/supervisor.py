@@ -382,8 +382,9 @@ class AutonomousRunSupervisor:
         gate: MultiRunPromotionGate | None = None,
         telemetry: TelemetrySink | None = None,
         target_score: float | None = None,
-        max_polls: int = 120,
+        max_polls: int = 241,
         poll_interval_seconds: float = 30.0,
+        phase_cost_upper_bounds_usd: Mapping[str, float] | None = None,
         phase_cost_estimates: Mapping[str, float] | None = None,
         owner: str | None = None,
     ) -> None:
@@ -411,6 +412,10 @@ class AutonomousRunSupervisor:
             "evaluation": 1.0,
             **dict(phase_cost_estimates or {}),
         }
+        # Per-job ceilings are intentionally distinct from cost estimates:
+        # an estimate may reconcile a completed job, but cannot authorize a
+        # billable SageMaker submission.
+        self.phase_cost_upper_bounds_usd = dict(phase_cost_upper_bounds_usd or {})
         self.owner = owner
 
     async def run_optimization(self, run_id: str) -> AutonomousRunState:
@@ -867,6 +872,22 @@ class AutonomousRunSupervisor:
             raise SupervisorBlocked(SupervisorStopReason.APPROVAL_EXPIRED.value)
         if self.readiness is not None and not await _await(self.readiness(state)):
             raise SupervisorBlocked(SupervisorStopReason.READINESS_BLOCKED.value)
+        self._validate_cost_upper_bounds()
+
+    def _validate_cost_upper_bounds(self) -> None:
+        for phase in ("training", "evaluation"):
+            self._phase_cost_upper_bound(phase)
+
+    def _phase_cost_upper_bound(self, phase: str) -> float:
+        if phase not in self.phase_cost_upper_bounds_usd:
+            raise SupervisorBlocked(f"cost upper bound is unavailable for {phase}")
+        try:
+            upper_bound = _finite_cost(self.phase_cost_upper_bounds_usd[phase])
+        except SupervisorProviderFailure as exc:
+            raise SupervisorBlocked(f"cost upper bound is invalid for {phase}") from exc
+        if upper_bound <= 0:
+            raise SupervisorBlocked(f"cost upper bound is invalid for {phase}")
+        return upper_bound
 
     async def _run_benchmark(self, state: AutonomousRunState, number: int) -> BenchmarkEvidence:
         self._assert_lease(self._reload(state.run_id))
@@ -1002,7 +1023,9 @@ class AutonomousRunSupervisor:
             control = await self._control(self._reload(state.run_id), active_provider_job=False)
             if control.should_stop:
                 raise SupervisorControlStop(control.action)
-            self._check_budget(state, kind)
+            self._check_budget(
+                self._reload(state.run_id), kind, operation_key=operation_key
+            )
             try:
                 result = _require_job_result(
                     await _invoke(getattr(self.provider, f"submit_{kind}"), request)
@@ -1021,9 +1044,8 @@ class AutonomousRunSupervisor:
                 status=_operation_status(result.status),
                 result={
                     "job_name": result.job_name,
-                    "cost_usd": self._job_cost(
-                        result, fallback=self.phase_cost_estimates.get(kind, 0.0)
-                    ),
+                    "cost_usd": self._job_cost_for_phase(result, kind),
+                    "cost_upper_bound_usd": self._phase_cost_upper_bound(kind),
                 },
             )
         else:
@@ -1040,9 +1062,8 @@ class AutonomousRunSupervisor:
                     status=_operation_status(result.status),
                     result={
                         "job_name": result.job_name,
-                        "cost_usd": self._job_cost(
-                            result, fallback=self.phase_cost_estimates.get(kind, 0.0)
-                        ),
+                        "cost_usd": self._job_cost_for_phase(result, kind),
+                        "cost_upper_bound_usd": self._phase_cost_upper_bound(kind),
                     },
                 )
         current = self._reload(state.run_id)
@@ -1051,11 +1072,9 @@ class AutonomousRunSupervisor:
         )
         state = self._patch(current, {current_field: _safe_job_id(result)})
         if result.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.STOPPED}:
-            self._reconcile_cost(
-                state,
-                operation_key,
-                self._job_cost(result, fallback=self.phase_cost_estimates.get(kind, 0.0)),
-            )
+            job_cost = self._reconcile_job_cost(state, operation_key, result, kind)
+        else:
+            job_cost = self._job_cost_for_phase(result, kind)
         self._emit(
             "job.submitted",
             state.run_id,
@@ -1069,7 +1088,7 @@ class AutonomousRunSupervisor:
                 number,
                 operation_key,
                 result,
-                cost_usd=self._job_cost(result, fallback=self.phase_cost_estimates.get(kind, 0.0)),
+                cost_usd=job_cost,
             )
             return result
         for _ in range(self.max_polls):
@@ -1111,24 +1130,19 @@ class AutonomousRunSupervisor:
                         status=_operation_status(result.status),
                         result={
                             "job_name": result.job_name,
-                            "cost_usd": self._job_cost(
-                                result, fallback=self.phase_cost_estimates.get(kind, 0.0)
-                            ),
+                            "cost_usd": self._job_cost_for_phase(result, kind),
+                            "cost_upper_bound_usd": self._phase_cost_upper_bound(kind),
                         },
                     )
-                self._reconcile_cost(
-                    self._reload(state.run_id),
-                    operation_key,
-                    self._job_cost(result, fallback=self.phase_cost_estimates.get(kind, 0.0)),
+                job_cost = self._reconcile_job_cost(
+                    self._reload(state.run_id), operation_key, result, kind
                 )
                 self._emit_job_terminal(
                     state.run_id,
                     number,
                     operation_key,
                     result,
-                    cost_usd=self._job_cost(
-                        result, fallback=self.phase_cost_estimates.get(kind, 0.0)
-                    ),
+                    cost_usd=job_cost,
                 )
                 return result
             if self.poll_interval_seconds:
@@ -1148,6 +1162,23 @@ class AutonomousRunSupervisor:
         if fallback is None:
             raise SupervisorProviderFailure("provider cost evidence is unavailable")
         return _finite_cost(fallback)
+
+    def _job_cost_for_phase(self, job: JobResult, phase: str) -> float:
+        return self._job_cost(job, fallback=self._phase_cost_upper_bound(phase))
+
+    def _reconcile_job_cost(
+        self,
+        state: AutonomousRunState,
+        operation_key: str,
+        job: JobResult,
+        phase: str,
+    ) -> float:
+        upper_bound = self._phase_cost_upper_bound(phase)
+        cost = self._job_cost(job, fallback=upper_bound)
+        self._reconcile_cost(state, operation_key, cost)
+        if cost > upper_bound:
+            raise SupervisorProviderFailure(f"provider {phase} cost exceeded declared bound")
+        return cost
 
     def _emit_job_terminal(
         self,
@@ -1194,7 +1225,63 @@ class AutonomousRunSupervisor:
             remaining_budget_usd=remaining,
         )
 
-    def _check_budget(self, state: AutonomousRunState, phase: str) -> None:
+    def _check_budget(
+        self,
+        state: AutonomousRunState,
+        phase: str,
+        *,
+        operation_key: str | None = None,
+    ) -> None:
+        if phase in {"training", "evaluation"}:
+            upper_bound = self._phase_cost_upper_bound(phase)
+            if operation_key is not None:
+                operation = self.repository.get_operation(state.run_id, operation_key)
+                if operation is not None and operation.status is RunOperationStatus.INTENT:
+                    result = dict(operation.result)
+                    recorded_bound = result.get("cost_upper_bound_usd")
+                    if recorded_bound is not None:
+                        try:
+                            if _finite_cost(recorded_bound) != upper_bound:
+                                raise SupervisorBlocked(
+                                    f"persisted cost upper bound changed for {phase}"
+                                )
+                        except SupervisorProviderFailure as exc:
+                            raise SupervisorBlocked(
+                                f"persisted cost upper bound is invalid for {phase}"
+                            ) from exc
+                    else:
+                        result["cost_upper_bound_usd"] = upper_bound
+                        operation = self.repository.record_operation_result(
+                            state.run_id,
+                            operation_key,
+                            status=RunOperationStatus.INTENT,
+                            result=result,
+                        )
+            reserved = 0.0
+            for number in range(1, state.max_experiments + 1):
+                for job_phase in ("training", "evaluation"):
+                    key = canonical_operation_key(state.run_id, number, job_phase)
+                    operation = self.repository.get_operation(state.run_id, key)
+                    if operation is None or operation.status in {
+                        RunOperationStatus.SUCCEEDED,
+                        RunOperationStatus.FAILED,
+                        RunOperationStatus.CANCELLED,
+                    }:
+                        continue
+                    raw_bound = operation.result.get("cost_upper_bound_usd")
+                    if raw_bound is None:
+                        raise SupervisorBlocked(
+                            f"cost reservation is unavailable for {job_phase}"
+                        )
+                    try:
+                        reserved += _finite_cost(raw_bound)
+                    except SupervisorProviderFailure as exc:
+                        raise SupervisorBlocked(
+                            f"cost reservation is invalid for {job_phase}"
+                        ) from exc
+            if state.spent_budget_usd + reserved > state.approved_budget_usd:
+                raise SupervisorBlocked(SupervisorStopReason.BUDGET_EXHAUSTED.value)
+            return
         estimated = _finite_cost(self.phase_cost_estimates.get(phase, 0.0))
         if state.spent_budget_usd + estimated > state.approved_budget_usd:
             raise SupervisorBlocked(SupervisorStopReason.BUDGET_EXHAUSTED.value)

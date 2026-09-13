@@ -406,7 +406,7 @@ class S3ArtifactStore:
         expected_sha256: str | None = None,
         expected_size_bytes: int | None = None,
     ) -> ArtifactRef:
-        """Copy a SageMaker output archive into a retained content-addressed object.
+        """Copy one SageMaker output object into a retained content-addressed object.
 
         SageMaker output paths are mutable and their user metadata is not used
         as the checkpoint identity.  The current version is pinned, the bytes
@@ -416,9 +416,9 @@ class S3ArtifactStore:
 
         parsed = urlparse(output_uri)
         if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
-            raise ArtifactIntegrityError(f"Not an S3 output archive URI: {output_uri!r}")
+            raise ArtifactIntegrityError(f"Not an S3 output object URI: {output_uri!r}")
         source_key = _validate_s3_path(
-            unquote(parsed.path.lstrip("/")), name="SageMaker output key"
+            unquote(parsed.path.lstrip("/")), name="SageMaker output object key"
         )
         if not isinstance(allowed_source_bucket, str) or not allowed_source_bucket.strip():
             raise ArtifactIntegrityError("allowed source bucket must not be empty")
@@ -456,20 +456,23 @@ class S3ArtifactStore:
         digest = self.sha256(data)
         if expected_sha256 is not None and digest != self._required_digest(expected_sha256):
             raise ArtifactIntegrityError(
-                "downloaded output archive SHA-256 does not match expected digest"
+                "downloaded output object SHA-256 does not match expected digest"
             )
         if expected_size_bytes is not None and len(data) != self._required_size(
             expected_size_bytes
         ):
             raise ArtifactIntegrityError(
-                "downloaded output archive size does not match expected size"
+                "downloaded output object size does not match expected size"
             )
-        retained_key = f"{clean_prefix}/{digest}.tar.gz"
+        is_json_report = source_key.rsplit("/", 1)[-1] == "evaluation.json"
+        retained_suffix = ".json" if is_json_report else ".tar.gz"
+        content_type = "application/json" if is_json_report else "application/gzip"
+        retained_key = f"{clean_prefix}/{digest}{retained_suffix}"
         try:
             retained = self.put_bytes(
                 retained_key,
                 data,
-                content_type="application/gzip",
+                content_type=content_type,
                 metadata={
                     "source-uri": output_uri,
                     "source-version-id": resolved_version,
@@ -483,6 +486,128 @@ class S3ArtifactStore:
             retained,
             expected_sha256=digest,
             expected_size_bytes=len(data),
+        )
+
+    def canonicalize_sagemaker_processing_output(
+        self,
+        output_prefix_uri: str,
+        *,
+        retained_prefix: str,
+        allowed_source_bucket: str,
+        allowed_source_prefix: str,
+        expected_sha256: str | None = None,
+        expected_size_bytes: int | None = None,
+    ) -> ArtifactRef:
+        """Find, pin, and retain the sole evaluator report beneath an output prefix.
+
+        SageMaker Processing uploads files from its configured ``LocalPath``
+        under ``S3Uri``; that URI is a prefix, not the report object itself.
+        Ignore unrelated output files, but fail closed unless exactly one
+        ``evaluation.json`` or ``evaluation.tar.gz`` is present.
+        """
+
+        parsed = urlparse(output_prefix_uri)
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or not parsed.path.strip("/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ArtifactIntegrityError(
+                f"Not a query-free S3 Processing output prefix: {output_prefix_uri!r}"
+            )
+        if not isinstance(allowed_source_bucket, str) or not allowed_source_bucket.strip():
+            raise ArtifactIntegrityError("allowed source bucket must not be empty")
+        if parsed.netloc != allowed_source_bucket:
+            raise ArtifactIntegrityError(
+                "SageMaker Processing output is outside the allowed source bucket"
+            )
+        source_prefix = _validate_s3_path(
+            unquote(parsed.path.lstrip("/")).rstrip("/"),
+            name="SageMaker Processing output prefix",
+        )
+        allowed_source_prefix = _validate_s3_path(
+            allowed_source_prefix, name="allowed source prefix"
+        )
+        if not self._key_in_prefix(source_prefix, allowed_source_prefix):
+            raise ArtifactIntegrityError(
+                "SageMaker Processing output is outside the allowed source prefix"
+            )
+
+        client = self._client_or_create()
+        list_prefix = f"{source_prefix}/"
+        candidates: list[tuple[str, int]] = []
+        continuation_token: str | None = None
+        seen_tokens: set[str] = set()
+        while True:
+            list_kwargs: dict[str, Any] = {
+                "Bucket": parsed.netloc,
+                "Prefix": list_prefix,
+            }
+            if continuation_token is not None:
+                list_kwargs["ContinuationToken"] = continuation_token
+            response = client.list_objects_v2(**list_kwargs)
+            if not isinstance(response, Mapping):
+                raise ArtifactIntegrityError("S3 Processing output listing is malformed")
+            contents = response.get("Contents", [])
+            if not isinstance(contents, list):
+                raise ArtifactIntegrityError("S3 Processing output listing is malformed")
+            for item in contents:
+                if not isinstance(item, Mapping):
+                    raise ArtifactIntegrityError("S3 Processing output listing is malformed")
+                key = _validate_s3_path(
+                    item.get("Key"), name="SageMaker Processing output object key"
+                )
+                if not key.startswith(list_prefix):
+                    raise ArtifactIntegrityError(
+                        "S3 Processing output listing returned a key outside its prefix"
+                    )
+                if key.rsplit("/", 1)[-1] in {"evaluation.json", "evaluation.tar.gz"}:
+                    candidates.append(
+                        (
+                            key,
+                            self._required_size(
+                                item.get("Size"), context="listed Processing output size"
+                            ),
+                        )
+                    )
+            truncated = response.get("IsTruncated", False)
+            if not isinstance(truncated, bool):
+                raise ArtifactIntegrityError("S3 Processing output listing is malformed")
+            if not truncated:
+                break
+            token = response.get("NextContinuationToken")
+            if not isinstance(token, str) or not token or token in seen_tokens:
+                raise ArtifactIntegrityError(
+                    "S3 Processing output listing has an invalid continuation token"
+                )
+            seen_tokens.add(token)
+            continuation_token = token
+
+        if not candidates:
+            raise ArtifactIntegrityError(
+                "SageMaker Processing output prefix contains no evaluation artifact"
+            )
+        if len(candidates) != 1:
+            raise ArtifactIntegrityError(
+                "SageMaker Processing output prefix must contain exactly one evaluation artifact"
+            )
+        source_key, listed_size = candidates[0]
+        if expected_size_bytes is not None and self._required_size(
+            expected_size_bytes, context="expected Processing output size"
+        ) != listed_size:
+            raise ArtifactIntegrityError(
+                "listed Processing output size does not match the expected size"
+            )
+        source_uri = f"s3://{parsed.netloc}/{quote(source_key, safe='/')}"
+        return self.canonicalize_sagemaker_output(
+            source_uri,
+            retained_prefix=retained_prefix,
+            allowed_source_bucket=allowed_source_bucket,
+            allowed_source_prefix=allowed_source_prefix,
+            expected_sha256=expected_sha256,
+            expected_size_bytes=listed_size,
         )
 
     # Descriptive aliases for supervisor code that calls this operation

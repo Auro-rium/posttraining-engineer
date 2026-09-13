@@ -68,6 +68,24 @@ class _VersionedS3:
             "VersionId": version_id,
         }
 
+    def list_objects_v2(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("list_objects_v2", kwargs))
+        bucket = str(kwargs["Bucket"])
+        prefix = str(kwargs["Prefix"])
+        keys = sorted({key for item_bucket, key, _ in self.objects if item_bucket == bucket})
+        contents: list[dict[str, object]] = []
+        for key in keys:
+            if not key.startswith(prefix):
+                continue
+            versions = [
+                version
+                for item_bucket, item_key, version in self.objects
+                if item_bucket == bucket and item_key == key
+            ]
+            data, _ = self.objects[(bucket, key, versions[-1])]
+            contents.append({"Key": key, "Size": len(data)})
+        return {"Contents": contents, "IsTruncated": False}
+
     def put_object(self, **kwargs: object) -> dict[str, str]:
         self.calls.append(("put_object", kwargs))
         version_id = f"retained-v{self.next_version}"
@@ -318,6 +336,141 @@ def test_canonicalize_sagemaker_output_retains_downloaded_bytes_by_content_hash(
     assert put_calls[0]["Body"] == data
     metadata = cast(Mapping[object, object], put_calls[0]["Metadata"])
     assert metadata["sha256"] == digest
+
+
+def test_canonicalize_sagemaker_processing_output_discovers_one_json_and_pins_its_version() -> None:
+    data = b'{"report_sha256":"verified"}\n'
+    digest = hashlib.sha256(data).hexdigest()
+    client = _VersionedS3()
+    client.add(
+        "artifacts",
+        "jobs/run-1/eval/1/evaluation.json",
+        data,
+        version_id="processing-output-v4",
+    )
+    client.add(
+        "artifacts",
+        "jobs/run-1/eval/1/log.txt",
+        b"ignore non-artifact output",
+        version_id="log-v1",
+    )
+    client.add(
+        "artifacts",
+        "jobs/run-1/eval/10/evaluation.json",
+        b"wrong experiment",
+        version_id="wrong-experiment-v1",
+    )
+    store = S3ArtifactStore("artifacts", client=client, prefix="retained")
+
+    retained = store.canonicalize_sagemaker_processing_output(
+        "s3://artifacts/jobs/run-1/eval/1",
+        retained_prefix="evaluations/run-1",
+        allowed_source_bucket="artifacts",
+        allowed_source_prefix="jobs/run-1/eval/1",
+        expected_sha256=digest,
+        expected_size_bytes=len(data),
+    )
+
+    assert retained.key == f"retained/evaluations/run-1/{digest}.json"
+    assert retained.sha256 == digest
+    assert retained.version_id == "retained-v1"
+    list_calls = [kwargs for name, kwargs in client.calls if name == "list_objects_v2"]
+    assert list_calls == [{"Bucket": "artifacts", "Prefix": "jobs/run-1/eval/1/"}]
+    get_calls = [kwargs for name, kwargs in client.calls if name == "get_object"]
+    assert get_calls[0] == {
+        "Bucket": "artifacts",
+        "Key": "jobs/run-1/eval/1/evaluation.json",
+        "VersionId": "processing-output-v4",
+    }
+
+
+def test_canonicalize_sagemaker_processing_output_paginates_for_archive() -> None:
+    data = b"evaluation archive bytes"
+
+    class PagedS3(_VersionedS3):
+        def list_objects_v2(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append(("list_objects_v2", kwargs))
+            if "ContinuationToken" not in kwargs:
+                return {
+                    "Contents": [
+                        {"Key": "jobs/run-1/eval/1/debug.txt", "Size": 10}
+                    ],
+                    "IsTruncated": True,
+                    "NextContinuationToken": "page-2",
+                }
+            return {
+                "Contents": [
+                    {
+                        "Key": "jobs/run-1/eval/1/evaluation.tar.gz",
+                        "Size": len(data),
+                    }
+                ],
+                "IsTruncated": False,
+            }
+
+    client = PagedS3()
+    client.add(
+        "artifacts",
+        "jobs/run-1/eval/1/evaluation.tar.gz",
+        data,
+        version_id="processing-output-v5",
+    )
+    store = S3ArtifactStore("artifacts", client=client, prefix="retained")
+
+    retained = store.canonicalize_sagemaker_processing_output(
+        "s3://artifacts/jobs/run-1/eval/1/",
+        retained_prefix="evaluations/run-1",
+        allowed_source_bucket="artifacts",
+        allowed_source_prefix="jobs/run-1/eval/1",
+    )
+
+    assert retained.key.endswith(".tar.gz")
+    assert retained.version_id == "retained-v1"
+    list_calls = [kwargs for name, kwargs in client.calls if name == "list_objects_v2"]
+    assert list_calls == [
+        {"Bucket": "artifacts", "Prefix": "jobs/run-1/eval/1/"},
+        {
+            "Bucket": "artifacts",
+            "Prefix": "jobs/run-1/eval/1/",
+            "ContinuationToken": "page-2",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("objects", "message"),
+    [
+        ([], "no evaluation artifact"),
+        (
+            ["evaluation.json", "evaluation.tar.gz"],
+            "exactly one evaluation artifact",
+        ),
+        (
+            ["evaluation.json", "nested/evaluation.json"],
+            "exactly one evaluation artifact",
+        ),
+    ],
+)
+def test_canonicalize_sagemaker_processing_output_rejects_missing_or_ambiguous_artifact(
+    objects: list[str], message: str
+) -> None:
+    client = _VersionedS3()
+    for index, name in enumerate(objects, start=1):
+        client.add(
+            "artifacts",
+            f"jobs/run-1/eval/1/{name}",
+            b"content",
+            version_id=f"source-v{index}",
+        )
+    store = S3ArtifactStore("artifacts", client=client, prefix="retained")
+
+    with pytest.raises(ArtifactIntegrityError, match=message):
+        store.canonicalize_sagemaker_processing_output(
+            "s3://artifacts/jobs/run-1/eval/1/",
+            retained_prefix="evaluations/run-1",
+            allowed_source_bucket="artifacts",
+            allowed_source_prefix="jobs/run-1/eval/1",
+        )
 
 
 def test_canonicalize_sagemaker_output_requires_retained_version() -> None:

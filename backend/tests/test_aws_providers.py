@@ -3,6 +3,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import pathlib
+import runpy
+import struct
 import tarfile
 from pathlib import Path
 from typing import ClassVar, cast
@@ -28,6 +32,7 @@ from app.providers.sagemaker import (
     SageMakerProvider,
     TrainingJobRequest,
 )
+from scripts.stage_functiongemma_checkpoint import build_deterministic_bundle
 from workers.evaluator.evaluate import parse_evaluation_inputs
 from workers.trainer.train import parse_training_inputs
 
@@ -463,6 +468,7 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
                 "ProcessingJobName": kwargs["ProcessingJobName"],
                 "ProcessingJobArn": arn,
                 "ProcessingJobStatus": "Completed",
+                "ProcessingOutputConfig": kwargs["ProcessingOutputConfig"],
             }
             self.tags[arn] = cast(list[dict[str, str]], kwargs.get("Tags", []))
             return {"ProcessingJobArn": arn}
@@ -491,6 +497,7 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
             input_s3_uri=f"s3://bucket/data/{'a' * 64}",
             output_s3_uri="s3://bucket/output",
             instance_type="ml.g5.xlarge",
+            base_model_s3_uri=f"s3://bucket/base/{'b' * 64}.tar.gz",
             hyperparameters={"epochs": 1},
             environment={
                 "RUN_ID": "run-1",
@@ -500,6 +507,7 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
                 "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
                 "BASE_MODEL_ID": "google/functiongemma-270m-it",
                 "BASE_MODEL_REVISION": "b" * 40,
+                "BASE_MODEL_BUNDLE_SHA256": "b" * 64,
                 "QLORA_CONFIG": "{}",
             },
         )
@@ -515,6 +523,7 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
             candidate_s3_uri=f"s3://bucket/candidate/{'c' * 64}.tar.gz",
             champion_s3_uri=f"s3://bucket/champion/{'b' * 64}.tar.gz",
             sealed_s3_uri="s3://bucket/sealed",
+            base_model_s3_uri=f"s3://bucket/base/{'d' * 64}.tar.gz",
             environment={
                 "RUN_ID": "run-1",
                 "EXPERIMENT_ID": "run-1-1",
@@ -523,6 +532,10 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
                 "OBJECTIVE_SEED": "7",
                 "CANDIDATE_ARCHIVE_SHA256": "c" * 64,
                 "CHAMPION_ARCHIVE_SHA256": "b" * 64,
+                "CHAMPION_KIND": "qlora-adapter",
+                "BASE_MODEL_ID": "google/functiongemma-270m-it",
+                "BASE_MODEL_REVISION": "e" * 40,
+                "BASE_MODEL_BUNDLE_SHA256": "d" * 64,
             },
         )
     )
@@ -543,7 +556,7 @@ def test_sagemaker_training_and_evaluation_requests_map_to_native_calls() -> Non
 
 
 def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Native SageMaker channel/env payloads must boot both audited workers."""
 
@@ -579,6 +592,24 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
     train_dir = tmp_path / "train"
     train_dir.mkdir()
     model_dir = tmp_path / "model"
+    base_snapshot = tmp_path / "base-snapshot"
+    base_snapshot.mkdir()
+    (base_snapshot / "config.json").write_text(
+        json.dumps({"architectures": ["Gemma3ForCausalLM"], "model_type": "gemma3_text"})
+    )
+    (base_snapshot / "tokenizer.json").write_text('{"version":1}')
+    (base_snapshot / "tokenizer_config.json").write_text("{}")
+    safetensors_header = json.dumps(
+        {"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}},
+        separators=(",", ":"),
+    ).encode()
+    (base_snapshot / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(safetensors_header)) + safetensors_header + b"\x00" * 4
+    )
+    base_bundle = build_deterministic_bundle(base_snapshot, revision="b" * 40)
+    base_channel = tmp_path / "base-model-channel"
+    base_channel.mkdir()
+    (base_channel / f"{base_bundle.sha256}.tar.gz").write_bytes(base_bundle.data)
     training_environment = {
         "RUN_ID": "run-1",
         "EXPERIMENT_ID": "exp-1",
@@ -587,6 +618,7 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
         "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
         "BASE_MODEL_ID": "google/functiongemma-270m-it",
         "BASE_MODEL_REVISION": "b" * 40,
+        "BASE_MODEL_BUNDLE_SHA256": base_bundle.sha256,
         "QLORA_CONFIG": json.dumps({
             "rank": 8,
             "alpha": 16,
@@ -606,6 +638,7 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
             role_arn="arn:role",
             image_uri="123.dkr.ecr/train@sha256:" + "c" * 64,
             input_s3_uri=f"s3://bucket/datasets/run-1/1/{'a' * 64}",
+            base_model_s3_uri=f"s3://bucket/base/{base_bundle.sha256}.tar.gz",
             output_s3_uri="s3://bucket/output/run-1",
             instance_type="ml.g5.xlarge",
             environment=training_environment,
@@ -616,14 +649,18 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
     assert training_payload["InputDataConfig"][0]["DataSource"]["S3DataSource"]["S3Uri"] == (
         f"s3://bucket/datasets/run-1/1/{'a' * 64}"
     )
+    assert training_payload["InputDataConfig"][1]["ChannelName"] == "base_model"
+    assert training_payload["InputDataConfig"][1]["DataSource"]["S3DataSource"]["S3Uri"] == (
+        f"s3://bucket/base/{base_bundle.sha256}.tar.gz"
+    )
     parser_environment = dict(training_payload["Environment"])
     parser_environment["SM_CHANNEL_TRAIN"] = str(train_dir)
+    parser_environment["SM_CHANNEL_BASE_MODEL"] = str(base_channel)
     parsed_training = parse_training_inputs(parser_environment)
     assert parsed_training.dataset_id == "dataset-1"
     assert parsed_training.base_model_revision == "b" * 40
 
     candidate_bytes = b"candidate checkpoint fixture"
-    champion_bytes = b"champion checkpoint fixture"
 
     def archive_file(name: str, payload: bytes) -> tuple[bytes, str]:
         buffer = io.BytesIO()
@@ -635,7 +672,8 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
         return data, hashlib.sha256(data).hexdigest()
 
     candidate_archive, candidate_sha = archive_file("candidate.json", candidate_bytes)
-    champion_archive, champion_sha = archive_file("champion.json", champion_bytes)
+    # The first evaluation compares against the pinned base-model artifact.
+    champion_archive, champion_sha = base_bundle.data, base_bundle.sha256
     candidate_channel = tmp_path / "candidate"
     champion_channel = tmp_path / "champion"
     candidate_channel.mkdir()
@@ -644,6 +682,7 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
     (champion_channel / f"{champion_sha}.tar.gz").write_bytes(champion_archive)
     candidate_uri = f"s3://bucket/checkpoints/{candidate_sha}.tar.gz"
     champion_uri = f"s3://bucket/checkpoints/{champion_sha}.tar.gz"
+    base_model_uri = f"s3://bucket/base/{base_bundle.sha256}.tar.gz"
     sealed_uri = "s3://bucket/evaluation/sealed"
     sealed_dir = tmp_path / "sealed"
     sealed_dir.mkdir()
@@ -655,7 +694,11 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
         "OBJECTIVE_SEED": "7",
         "CANDIDATE_ARCHIVE_SHA256": candidate_sha,
         "CHAMPION_ARCHIVE_SHA256": champion_sha,
-        "SM_OUTPUT_DATA_DIR": str(tmp_path / "evaluation-output"),
+        "CHAMPION_KIND": "base-model",
+        "BASE_MODEL_ID": "google/functiongemma-270m-it",
+        "BASE_MODEL_REVISION": "b" * 40,
+        "BASE_MODEL_BUNDLE_SHA256": base_bundle.sha256,
+        "SM_OUTPUT_DATA_DIR": "/opt/ml/processing/output",
     }
     provider.submit_evaluation(
         EvaluationJobRequest(
@@ -666,6 +709,7 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
             sealed_s3_uri=sealed_uri,
             candidate_s3_uri=candidate_uri,
             champion_s3_uri=champion_uri,
+            base_model_s3_uri=base_model_uri,
             output_s3_uri="s3://bucket/evaluation/output",
             instance_type="ml.g5.xlarge",
             environment=evaluation_environment,
@@ -675,30 +719,140 @@ def test_sagemaker_payloads_feed_strict_trainer_and_evaluator_parsers(
     input_names = {
         item["InputName"]: item for item in evaluation_payload["ProcessingInputs"]
     }
-    assert set(input_names) == {"candidate", "champion", "sealed"}
+    assert set(input_names) == {"base_model", "candidate", "champion", "sealed"}
+    assert input_names["base_model"]["S3Input"]["S3Uri"] == base_model_uri
     assert input_names["candidate"]["S3Input"]["S3Uri"] == candidate_uri
     assert input_names["champion"]["S3Input"]["S3Uri"] == champion_uri
     assert input_names["sealed"]["S3Input"]["S3Uri"] == sealed_uri
+    assert {
+        name: input_names[name]["S3Input"]["LocalPath"]
+        for name in ("base_model", "candidate", "champion", "sealed")
+    } == {
+        "base_model": "/opt/ml/processing/input/base_model",
+        "candidate": "/opt/ml/processing/input/candidate",
+        "champion": "/opt/ml/processing/input/champion",
+        "sealed": "/opt/ml/processing/input/sealed",
+    }
+    assert evaluation_payload["Environment"] == {
+        **evaluation_environment,
+        "SM_CHANNEL_BASE_MODEL": "/opt/ml/processing/input/base_model",
+        "SM_CHANNEL_CANDIDATE": "/opt/ml/processing/input/candidate",
+        "SM_CHANNEL_CHAMPION": "/opt/ml/processing/input/champion",
+        "SM_CHANNEL_SEALED": "/opt/ml/processing/input/sealed",
+    }
+    assert evaluation_payload["ProcessingOutputConfig"]["Outputs"][0]["S3Output"][
+        "LocalPath"
+    ] == "/opt/ml/processing/output"
     entrypoint = evaluation_payload["AppSpecification"]["ContainerEntrypoint"]
     assert entrypoint[:2] == ["python", "-c"]
     assert "extractall" in entrypoint[2]
     assert "evaluate.py" in entrypoint[2]
     evaluator_environment = dict(evaluation_payload["Environment"])
+    evaluator_environment["SM_OUTPUT_DATA_DIR"] = str(tmp_path / "processing-output")
+    processing_paths: dict[str, Path] = {}
     for name, item in input_names.items():
         native_path = Path(item["S3Input"]["LocalPath"])
         assert native_path == Path(f"/opt/ml/processing/input/{name}")
         parser_path = tmp_path / name
         parser_path.mkdir(parents=True, exist_ok=True)
-        if name == "candidate":
+        processing_paths[str(native_path)] = parser_path
+        if name == "base_model":
+            (parser_path / f"{base_bundle.sha256}.tar.gz").write_bytes(base_bundle.data)
+        elif name == "candidate":
             (parser_path / f"{candidate_sha}.tar.gz").write_bytes(candidate_archive)
         elif name == "champion":
             (parser_path / f"{champion_sha}.tar.gz").write_bytes(champion_archive)
         evaluator_environment[f"SM_CHANNEL_{name.upper()}"] = str(parser_path)
-    parsed_evaluation = parse_evaluation_inputs(evaluator_environment)
+    real_path_factory = pathlib.Path
+
+    def map_processing_path(value: str | os.PathLike[str]) -> Path:
+        path = real_path_factory(value)
+        return processing_paths.get(str(path), path)
+
+    parsed_evaluations = []
+
+    def parse_worker_inputs(path: str, *, run_name: str) -> None:
+        assert path == "/opt/ml/code/evaluate.py"
+        assert run_name == "__main__"
+        parsed_evaluations.append(parse_evaluation_inputs(dict(os.environ)))
+
+    monkeypatch.setattr(pathlib, "Path", map_processing_path)
+    monkeypatch.setattr(os, "environ", evaluator_environment)
+    monkeypatch.setattr(runpy, "run_path", parse_worker_inputs)
+    exec(compile(entrypoint[2], "<sagemaker-evaluator-entrypoint>", "exec"), {})
+    assert len(parsed_evaluations) == 1
+    parsed_evaluation = parsed_evaluations.pop()
     assert (parsed_evaluation.candidate_dir / "candidate.json").read_bytes() == candidate_bytes
     assert parsed_evaluation.champion_dir is not None
-    assert (parsed_evaluation.champion_dir / "champion.json").read_bytes() == champion_bytes
+    assert parsed_evaluation.champion_kind == "base-model"
+    assert sorted(path.name for path in parsed_evaluation.champion_dir.iterdir()) == [
+        f"{champion_sha}.tar.gz"
+    ]
+    assert parsed_evaluation.base_model_dir is not None
+    assert (parsed_evaluation.base_model_dir / "model.safetensors").is_file()
     assert parsed_evaluation.sealed_dir == (tmp_path / "sealed").resolve()
+
+    # The same generated command still extracts adapter champions before the
+    # strict worker parser validates and opens the content-addressed archive.
+    adapter_candidate_channel = tmp_path / "adapter-candidate"
+    adapter_champion_channel = tmp_path / "adapter-champion"
+    adapter_sealed_channel = tmp_path / "adapter-sealed"
+    for directory in (
+        adapter_candidate_channel,
+        adapter_champion_channel,
+        adapter_sealed_channel,
+    ):
+        directory.mkdir()
+    adapter_candidate_archive, adapter_candidate_sha = archive_file(
+        "candidate.json", candidate_bytes
+    )
+    adapter_champion_archive, adapter_champion_sha = archive_file(
+        "adapter.json", b"verified adapter payload"
+    )
+    (adapter_candidate_channel / f"{adapter_candidate_sha}.tar.gz").write_bytes(
+        adapter_candidate_archive
+    )
+    (adapter_champion_channel / f"{adapter_champion_sha}.tar.gz").write_bytes(
+        adapter_champion_archive
+    )
+    (adapter_sealed_channel / "sealed.json").write_text("{}")
+    processing_paths.update(
+        {
+            "/opt/ml/processing/input/candidate": adapter_candidate_channel,
+            "/opt/ml/processing/input/champion": adapter_champion_channel,
+            "/opt/ml/processing/input/sealed": adapter_sealed_channel,
+        }
+    )
+    adapter_environment = dict(evaluation_environment)
+    adapter_environment.update(
+        {
+            "CHAMPION_KIND": "qlora-adapter",
+            "CHAMPION_ARCHIVE_SHA256": adapter_champion_sha,
+            "CANDIDATE_ARCHIVE_SHA256": adapter_candidate_sha,
+            "SM_OUTPUT_DATA_DIR": str(tmp_path / "adapter-processing-output"),
+            "SM_CHANNEL_BASE_MODEL": str(base_channel),
+            "SM_CHANNEL_CANDIDATE": str(adapter_candidate_channel),
+            "SM_CHANNEL_CHAMPION": str(adapter_champion_channel),
+            "SM_CHANNEL_SEALED": str(adapter_sealed_channel),
+        }
+    )
+    monkeypatch.setattr(os, "environ", adapter_environment)
+
+    def parse_adapter_inputs(path: str, *, run_name: str) -> None:
+        assert (adapter_champion_channel / "adapter.json").read_bytes() == (
+            b"verified adapter payload"
+        )
+        parsed_evaluations.append(parse_evaluation_inputs(dict(os.environ)))
+
+    monkeypatch.setattr(runpy, "run_path", parse_adapter_inputs)
+    exec(compile(entrypoint[2], "<sagemaker-evaluator-entrypoint>", "exec"), {})
+    assert len(parsed_evaluations) == 1
+    adapter_evaluation = parsed_evaluations.pop()
+    assert adapter_evaluation.champion_kind == "qlora-adapter"
+    assert adapter_evaluation.champion_dir is not None
+    assert (adapter_evaluation.champion_dir / "adapter.json").read_bytes() == (
+        b"verified adapter payload"
+    )
 
 
 def test_sagemaker_terminal_result_preserves_actual_cost_and_billable_time() -> None:
@@ -740,12 +894,188 @@ def test_sagemaker_rejects_empty_processing_output_uri() -> None:
                 "ProcessingJobArn": "arn:aws:sagemaker:us-east-1:123:processing-job/eval",
                 "ProcessingJobStatus": "Completed",
                 "ProcessingOutputConfig": {
-                    "Outputs": [{"S3Output": {"S3Uri": "s3://"}}]
+                    "Outputs": [
+                        {
+                            "OutputName": "evaluation",
+                            "S3Output": {"S3Uri": "s3://"},
+                        }
+                    ]
                 },
             }
 
     with pytest.raises(ProviderResponseError, match="invalid artifact URI"):
         SageMakerProvider(client=_Client()).get_evaluation_status("eval-empty-artifact")
+
+
+def test_sagemaker_processing_status_exposes_configured_output_prefix() -> None:
+    output_prefix = "s3://demo-bucket/post-training/run-1/eval/1"
+
+    class _Client:
+        def describe_processing_job(self, **kwargs: object) -> dict[str, object]:
+            return {
+                "ProcessingJobName": kwargs["ProcessingJobName"],
+                "ProcessingJobArn": "arn:aws:sagemaker:us-east-1:123:processing-job/eval",
+                "ProcessingJobStatus": "Completed",
+                "ProcessingOutputConfig": {
+                    "Outputs": [
+                        {
+                            "OutputName": "evaluation",
+                            "S3Output": {"S3Uri": output_prefix},
+                        }
+                    ]
+                },
+            }
+
+    result = SageMakerProvider(client=_Client()).get_evaluation_status("eval-prefix")
+
+    assert result.artifact_uri == output_prefix
+
+
+def test_sagemaker_processing_status_selects_named_evaluation_output() -> None:
+    evaluation_prefix = "s3://demo-bucket/post-training/run-1/eval/1"
+
+    class _Client:
+        def describe_processing_job(self, **kwargs: object) -> dict[str, object]:
+            return {
+                "ProcessingJobName": kwargs["ProcessingJobName"],
+                "ProcessingJobArn": "arn:aws:sagemaker:us-east-1:123:processing-job/eval",
+                "ProcessingJobStatus": "Completed",
+                "ProcessingOutputConfig": {
+                    "Outputs": [
+                        {
+                            "OutputName": "diagnostics",
+                            "S3Output": {"S3Uri": "s3://demo-bucket/diagnostics/run-1"},
+                        },
+                        {
+                            "OutputName": "evaluation",
+                            "S3Output": {"S3Uri": evaluation_prefix},
+                        },
+                    ]
+                },
+            }
+
+    result = SageMakerProvider(client=_Client()).get_evaluation_status("eval-named-output")
+
+    assert result.artifact_uri == evaluation_prefix
+
+
+def test_sagemaker_processing_status_rejects_duplicate_evaluation_outputs() -> None:
+    class _Client:
+        def describe_processing_job(self, **kwargs: object) -> dict[str, object]:
+            return {
+                "ProcessingJobName": kwargs["ProcessingJobName"],
+                "ProcessingJobArn": "arn:aws:sagemaker:us-east-1:123:processing-job/eval",
+                "ProcessingJobStatus": "Completed",
+                "ProcessingOutputConfig": {
+                    "Outputs": [
+                        {
+                            "OutputName": "evaluation",
+                            "S3Output": {"S3Uri": "s3://demo-bucket/evaluation/one"},
+                        },
+                        {
+                            "OutputName": "evaluation",
+                            "S3Output": {"S3Uri": "s3://demo-bucket/evaluation/two"},
+                        },
+                    ]
+                },
+            }
+
+    with pytest.raises(ProviderResponseError, match="exactly one evaluation output"):
+        SageMakerProvider(client=_Client()).get_evaluation_status("eval-duplicate-output")
+
+
+def test_sagemaker_processing_environment_matches_each_configured_local_path() -> None:
+    class _NotFound(Exception):
+        def __init__(self) -> None:
+            self.response = {
+                "Error": {"Code": "ResourceNotFoundException", "Message": "not found"}
+            }
+
+    class _Client:
+        request: dict[str, object]
+
+        def describe_processing_job(self, **kwargs: object) -> dict[str, object]:
+            raise _NotFound()
+
+        def create_processing_job(self, **kwargs: object) -> dict[str, object]:
+            self.request = kwargs
+            return {
+                "ProcessingJobArn": "arn:aws:sagemaker:us-east-1:123:processing-job/eval"
+            }
+
+    client = _Client()
+    candidate_sha = "b" * 64
+    champion_sha = "c" * 64
+    request = EvaluationJobRequest(
+        job_name="eval-local-path-contract",
+        role_arn="arn:role",
+        image_uri="123.dkr.ecr/eval@sha256:" + "e" * 64,
+        input_s3_uri="s3://bucket/evaluation/sealed",
+        sealed_s3_uri="s3://bucket/evaluation/sealed",
+        candidate_s3_uri=f"s3://bucket/checkpoints/{candidate_sha}.tar.gz",
+        champion_s3_uri=f"s3://bucket/checkpoints/{champion_sha}.tar.gz",
+        base_model_s3_uri=f"s3://bucket/checkpoints/{'a' * 64}.tar.gz",
+        output_s3_uri="s3://bucket/evaluation/output/run-1",
+        instance_type="ml.g5.xlarge",
+        environment={
+            "RUN_ID": "run-1",
+            "EXPERIMENT_ID": "run-1-1",
+            "EVALUATION_MANIFEST_SHA256": "a" * 64,
+            "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+            "OBJECTIVE_SEED": "7",
+            "CANDIDATE_ARCHIVE_SHA256": candidate_sha,
+            "CHAMPION_ARCHIVE_SHA256": champion_sha,
+            "CHAMPION_KIND": "qlora-adapter",
+            "BASE_MODEL_ID": "google/functiongemma-270m-it",
+            "BASE_MODEL_REVISION": "e" * 40,
+            "BASE_MODEL_BUNDLE_SHA256": "a" * 64,
+        },
+    )
+
+    SageMakerProvider(client=client).submit_evaluation(request)
+
+    assert client.request["Environment"] == {
+        **request.environment,
+        "SM_CHANNEL_BASE_MODEL": "/opt/ml/processing/input/base_model",
+        "SM_CHANNEL_CANDIDATE": "/opt/ml/processing/input/candidate",
+        "SM_CHANNEL_CHAMPION": "/opt/ml/processing/input/champion",
+        "SM_CHANNEL_SEALED": "/opt/ml/processing/input/sealed",
+        "SM_OUTPUT_DATA_DIR": "/opt/ml/processing/output",
+    }
+    assert client.request["ProcessingOutputConfig"]["Outputs"][0]["S3Output"][
+        "LocalPath"
+    ] == "/opt/ml/processing/output"
+
+
+def test_sagemaker_evaluation_rejects_missing_base_model_channel() -> None:
+    base_sha = "a" * 64
+    with pytest.raises(ValueError, match="base_model evaluation channel is required"):
+        SageMakerProvider._validate_evaluation(
+            EvaluationJobRequest(
+                job_name="eval-missing-base-model",
+                role_arn="arn:role",
+                image_uri="123.dkr.ecr/eval@sha256:" + "e" * 64,
+                input_s3_uri="s3://bucket/evaluation/sealed",
+                sealed_s3_uri="s3://bucket/evaluation/sealed",
+                candidate_s3_uri=f"s3://bucket/checkpoints/{'b' * 64}.tar.gz",
+                champion_s3_uri=f"s3://bucket/checkpoints/{'c' * 64}.tar.gz",
+                output_s3_uri="s3://bucket/evaluation/output",
+                instance_type="ml.g5.xlarge",
+                environment={
+                    "RUN_ID": "run-1",
+                    "EXPERIMENT_ID": "run-1-1",
+                    "EVALUATION_MANIFEST_SHA256": "d" * 64,
+                    "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+                    "OBJECTIVE_SEED": "7",
+                    "CANDIDATE_ARCHIVE_SHA256": "b" * 64,
+                    "CHAMPION_ARCHIVE_SHA256": "c" * 64,
+                    "CHAMPION_KIND": "qlora-adapter",
+                    "BASE_MODEL_ID": "google/functiongemma-270m-it",
+                    "BASE_MODEL_REVISION": "e" * 40,
+                    "BASE_MODEL_BUNDLE_SHA256": base_sha,
+                },
+            )
+        )
 
 
 def test_sagemaker_rejects_version_query_in_input_uri() -> None:
@@ -760,6 +1090,7 @@ def test_sagemaker_rejects_version_query_in_input_uri() -> None:
                 input_s3_uri="s3://bucket/dataset?versionId=dataset-v1",
                 output_s3_uri="s3://bucket/output",
                 instance_type="ml.g5.xlarge",
+                base_model_s3_uri=f"s3://bucket/base/{'b' * 64}.tar.gz",
                 environment={
                     "RUN_ID": "run-1",
                     "EXPERIMENT_ID": "exp-1",
@@ -768,6 +1099,7 @@ def test_sagemaker_rejects_version_query_in_input_uri() -> None:
                     "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
                     "BASE_MODEL_ID": "google/functiongemma-270m-it",
                     "BASE_MODEL_REVISION": "a" * 40,
+                    "BASE_MODEL_BUNDLE_SHA256": "b" * 64,
                     "QLORA_CONFIG": "{}",
                 },
             )
@@ -785,6 +1117,7 @@ def test_sagemaker_rejects_version_query_in_input_uri() -> None:
                 candidate_s3_uri="s3://bucket/checkpoints/candidate.tar.gz?versionId=v1",
                 champion_s3_uri="s3://bucket/checkpoints/" + "b" * 64 + ".tar.gz",
                 sealed_s3_uri="s3://bucket/sealed",
+                base_model_s3_uri="s3://bucket/base/" + "a" * 64 + ".tar.gz",
                 environment={
                     "RUN_ID": "run-1",
                     "EXPERIMENT_ID": "exp-1",
@@ -793,6 +1126,10 @@ def test_sagemaker_rejects_version_query_in_input_uri() -> None:
                     "OBJECTIVE_SEED": "7",
                     "CANDIDATE_ARCHIVE_SHA256": "c" * 64,
                     "CHAMPION_ARCHIVE_SHA256": "b" * 64,
+                    "CHAMPION_KIND": "qlora-adapter",
+                    "BASE_MODEL_ID": "google/functiongemma-270m-it",
+                    "BASE_MODEL_REVISION": "e" * 40,
+                    "BASE_MODEL_BUNDLE_SHA256": "a" * 64,
                 },
             )
         )

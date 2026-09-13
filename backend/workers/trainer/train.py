@@ -42,6 +42,7 @@ class TrainingArtifactError(TrainingWorkerError):
 class TrainingInputs:
     train_dir: Path
     model_dir: Path
+    base_model_dir: Path
     run_id: str
     experiment_id: str
     dataset_id: str
@@ -88,23 +89,25 @@ def _normalise_channels(channels: Mapping[str, str | Path]) -> dict[str, Path]:
         key = str(name).strip().lower()
         if key in _SEALED_NAMES or any(part in _SEALED_NAMES for part in key.split("_")):
             raise TrainingWorkerError(f"trainer cannot consume sealed/evaluation channel {name!r}")
-        if key not in {"train", "parent_adapter"}:
+        if key not in {"train", "base_model", "parent_adapter"}:
             raise TrainingWorkerError(
-                f"unsupported trainer channel {name!r}; use train or parent_adapter"
+                f"unsupported trainer channel {name!r}; use train, base_model, or parent_adapter"
             )
         candidate = Path(value).expanduser()
         if not candidate.exists() or not candidate.is_dir():
-            raise TrainingWorkerError("train channel must be an existing directory")
+            raise TrainingWorkerError(f"{key} channel must be an existing directory")
         normalised[key] = candidate.resolve()
     return normalised
 
 
-def _extract_checkpoint_archive(archive_path: Path, destination: Path) -> Path:
-    """Safely unpack a SageMaker checkpoint archive into a fresh directory."""
+def _extract_checkpoint_archive(
+    archive_path: Path, destination: Path, *, label: str = "parent adapter"
+) -> Path:
+    """Safely unpack an approved SageMaker checkpoint archive into a fresh directory."""
 
     root = destination.resolve()
     if destination.exists():
-        raise TrainingWorkerError("parent adapter extraction directory already exists")
+        raise TrainingWorkerError(f"{label} extraction directory already exists")
     destination.mkdir(parents=True)
     total_size = 0
     file_count = 0
@@ -113,52 +116,85 @@ def _extract_checkpoint_archive(archive_path: Path, destination: Path) -> Path:
             for member in archive.getmembers():
                 if member.islnk() or member.issym() or member.isdev() or member.isfifo():
                     raise TrainingWorkerError(
-                        "parent adapter archive contains a link or special file"
+                        f"{label} archive contains a link or special file"
                     )
                 if member.size < 0 or member.size > 2 * 1024**3:
-                    raise TrainingWorkerError("parent adapter archive member is oversized")
+                    raise TrainingWorkerError(f"{label} archive member is oversized")
                 parts = tuple(
                     part for part in PurePosixPath(member.name).parts if part not in {"", "."}
                 )
                 if not parts or PurePosixPath(member.name).is_absolute() or ".." in parts:
-                    raise TrainingWorkerError("parent adapter archive contains an unsafe path")
+                    raise TrainingWorkerError(f"{label} archive contains an unsafe path")
                 target = destination.joinpath(*parts)
                 try:
                     target.resolve().relative_to(root)
                 except ValueError as exc:
                     raise TrainingWorkerError(
-                        "parent adapter archive escapes its extraction directory"
+                        f"{label} archive escapes its extraction directory"
                     ) from exc
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 if not member.isfile():
                     raise TrainingWorkerError(
-                        "parent adapter archive contains an unsupported entry"
+                        f"{label} archive contains an unsupported entry"
                     )
                 file_count += 1
                 total_size += member.size
                 if file_count > 20_000 or total_size > 4 * 1024**3:
-                    raise TrainingWorkerError("parent adapter archive exceeds extraction limits")
+                    raise TrainingWorkerError(f"{label} archive exceeds extraction limits")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source = archive.extractfile(member)
                 if source is None:
-                    raise TrainingWorkerError("parent adapter archive member is unreadable")
+                    raise TrainingWorkerError(f"{label} archive member is unreadable")
                 with source, target.open("xb") as output:
                     remaining = member.size
                     while remaining:
                         chunk = source.read(min(1024 * 1024, remaining))
                         if not chunk:
-                            raise TrainingWorkerError("parent adapter archive member is truncated")
+                            raise TrainingWorkerError(f"{label} archive member is truncated")
                         output.write(chunk)
                         remaining -= len(chunk)
     except TrainingWorkerError:
         raise
     except (OSError, tarfile.TarError) as exc:
-        raise TrainingWorkerError("parent adapter archive is invalid") from exc
+        raise TrainingWorkerError(f"{label} archive is invalid") from exc
     if file_count == 0:
-        raise TrainingWorkerError("parent adapter archive is empty")
+        raise TrainingWorkerError(f"{label} archive is empty")
     return destination
+
+
+def _materialize_base_model(
+    channel_dir: Path, *, expected_sha256: str, revision: str, destination: Path
+) -> Path:
+    entries = tuple(channel_dir.iterdir())
+    archives = tuple(path for path in entries if path.name.endswith(".tar.gz"))
+    if (
+        len(entries) != 1
+        or len(archives) != 1
+        or archives[0].name != f"{expected_sha256}.tar.gz"
+        or file_sha256(archives[0]) != expected_sha256
+    ):
+        raise TrainingArtifactError(
+            "base model archive is not the approved content-addressed bundle"
+        )
+    checkpoint_dir = _extract_checkpoint_archive(
+        archives[0], destination, label="base model"
+    )
+    try:
+        from scripts.stage_functiongemma_checkpoint import (
+            CheckpointStagingError,
+            validate_checkpoint_directory,
+        )
+
+        validate_checkpoint_directory(
+            checkpoint_dir, revision=revision, model_id=BASE_MODEL_ID
+        )
+    except ImportError as exc:
+        raise TrainingArtifactError("base model checkpoint validator is unavailable") from exc
+    except CheckpointStagingError as exc:
+        raise TrainingArtifactError("base model checkpoint failed local validation") from exc
+    return checkpoint_dir
 
 
 def parse_training_inputs(
@@ -169,19 +205,22 @@ def parse_training_inputs(
 
     values = dict(os.environ if env is None else env)
     channel_values = dict(channels or {})
+    for channel_name in ("train", "base_model", "parent_adapter"):
+        path = values.get(f"SM_CHANNEL_{channel_name.upper()}", "").strip()
+        if path:
+            channel_values.setdefault(channel_name, path)
     for env_name, env_value in values.items():
         if env_name.startswith("SM_CHANNEL_") and env_value.strip():
             channel_name = env_name.removeprefix("SM_CHANNEL_").lower()
-            if channel_name not in {"train", "parent_adapter"}:
+            if channel_name not in {"train", "base_model", "parent_adapter"}:
                 _normalise_channels({channel_name: env_value})
     train_env = values.get("SM_CHANNEL_TRAIN", "").strip()
     if not train_env and "train" not in channel_values:
         raise TrainingWorkerError("SM_CHANNEL_TRAIN is required")
     if train_env:
         channel_values.setdefault("train", train_env)
-    parent_channel = values.get("SM_CHANNEL_PARENT_ADAPTER", "").strip()
-    if parent_channel:
-        channel_values.setdefault("parent_adapter", parent_channel)
+    if "base_model" not in channel_values:
+        raise TrainingWorkerError("SM_CHANNEL_BASE_MODEL is required")
     channel_paths = _normalise_channels(channel_values)
     train_dir = channel_paths["train"]
     model_dir = Path(_required(values, "SM_MODEL_DIR")).expanduser().resolve()
@@ -194,6 +233,15 @@ def parse_training_inputs(
     model_id = _required(values, "BASE_MODEL_ID")
     if model_id != BASE_MODEL_ID:
         raise TrainingWorkerError(f"BASE_MODEL_ID must equal {BASE_MODEL_ID!r}")
+    base_model_sha = _digest(
+        _required(values, "BASE_MODEL_BUNDLE_SHA256"), "BASE_MODEL_BUNDLE_SHA256"
+    )
+    base_model_dir = _materialize_base_model(
+        channel_paths["base_model"],
+        expected_sha256=base_model_sha,
+        revision=revision,
+        destination=model_dir.parent / f"{model_dir.name}-base-model",
+    )
     parent = values.get("PARENT_ADAPTER_DIR", "").strip()
     parent_path = _path(parent, "PARENT_ADAPTER_DIR") if parent else None
     parent_archive_sha = values.get("APPROVED_PARENT_ARCHIVE_SHA256", "").strip() or None
@@ -266,6 +314,7 @@ def parse_training_inputs(
     return TrainingInputs(
         train_dir=train_dir,
         model_dir=model_dir,
+        base_model_dir=base_model_dir,
         run_id=_required(values, "RUN_ID"),
         experiment_id=_required(values, "EXPERIMENT_ID"),
         dataset_id=_required(values, "DATASET_ID"),
@@ -421,6 +470,32 @@ def function_tool_schemas() -> list[dict[str, Any]]:
         }
         for name in ALLOWED_TOOLS
     ]
+
+
+def _load_base_model_locally(
+    inputs: TrainingInputs,
+    *,
+    processor_loader: Any,
+    model_loader: Any,
+    quantization_config: Any,
+    device_map: str,
+) -> tuple[Any, Any]:
+    """Load the staged immutable base bundle without consulting Hugging Face."""
+
+    checkpoint_dir = str(inputs.base_model_dir)
+    processor = processor_loader.from_pretrained(
+        checkpoint_dir,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
+    model = model_loader.from_pretrained(
+        checkpoint_dir,
+        quantization_config=quantization_config,
+        device_map=device_map,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
+    return processor, model
 
 
 def _render_function_call(tool: str, arguments: Mapping[str, Any]) -> str:
@@ -763,7 +838,8 @@ def load_training_dataset(inputs: TrainingInputs) -> Any:
     if any(
         row.split.value not in _ALLOWED_SPLITS
         or not row.verifier_confirmed
-        or row.source_type != "verified_replay"
+        or not row.verifier_success
+        or row.source_type not in {"successful_replay", "repaired_replay"}
         or row.failure_label not in dataset.manifest.target_failure_classes
         or any(
             marker in row.task_id.lower() or marker in row.source_trajectory_id.lower()
@@ -845,23 +921,19 @@ def run_training(inputs: TrainingInputs) -> Path:
         ) from exc
 
     try:
-        processor = AutoProcessor.from_pretrained(
-            inputs.base_model_id, revision=inputs.base_model_revision, trust_remote_code=False
+        processor, model = _load_base_model_locally(
+            inputs,
+            processor_loader=AutoProcessor,
+            model_loader=AutoModelForCausalLM,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            ),
+            device_map="auto",
         )
         tokenizer = getattr(processor, "tokenizer", processor)
-        quantization = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            inputs.base_model_id,
-            revision=inputs.base_model_revision,
-            quantization_config=quantization,
-            device_map="auto",
-            trust_remote_code=False,
-        )
         model = prepare_model_for_kbit_training(model)
         if inputs.parent_adapter_dir is not None:
             # Merge the approved parent into the exact pinned base first, then

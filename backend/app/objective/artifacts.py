@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from threading import RLock
 from typing import Any, cast
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 from app.providers.artifacts import ArtifactRef
 
@@ -396,9 +396,12 @@ class S3ObjectiveArtifactStore:
             )
         if trajectory.split not in _PUBLIC_SPLITS:
             raise ObjectiveArtifactIntegrityError("unsupported trajectory split")
-        if not trajectory.verified:
+        if (
+            not trajectory.verified
+            or trajectory.verifier_success is not trajectory.success
+        ):
             raise ObjectiveArtifactIntegrityError(
-                "only verifier-confirmed trajectories may be stored"
+                "only verifier-confirmed replay trajectories with verifier outcome may be stored"
             )
         trajectory_id = _validate_identifier(trajectory.trajectory_id, name="trajectory_id")
         payload = _canonical_json(trajectory.model_dump(mode="json"))
@@ -422,6 +425,43 @@ class S3ObjectiveArtifactStore:
         )
 
     put = put_trajectory
+
+    def put_benchmark_report(
+        self,
+        *,
+        output_s3_uri: str,
+        report: Mapping[str, Any],
+        split: ObjectiveSplit,
+    ) -> ArtifactRef:
+        """Persist a metadata-only benchmark report under its requested run prefix."""
+
+        parsed = urlparse(output_s3_uri)
+        if (
+            parsed.scheme != "s3"
+            or parsed.netloc != self.bucket
+            or not parsed.path.strip("/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ObjectiveArtifactIntegrityError(
+                "benchmark output scope must be a query-free prefix in the configured bucket"
+            )
+        requested_path = _validate_path(
+            unquote(parsed.path.lstrip("/")), name="benchmark output path"
+        )
+        if self.prefix:
+            if not requested_path.startswith(f"{self.prefix}/"):
+                raise ObjectiveArtifactIntegrityError(
+                    "benchmark output scope is outside the configured artifact prefix"
+                )
+            requested_path = requested_path[len(self.prefix) + 1 :]
+        key = self._key(requested_path, "benchmark-report.json")
+        return self._put_bytes(
+            key,
+            _canonical_json(report),
+            kind="benchmark_report",
+            split=ObjectiveSplit(split),
+        )
 
     def _index_for(self, trajectory_id: str, *, split: ObjectiveSplit) -> dict[str, Any] | None:
         key = self._key("trajectory-index", split.value, f"{trajectory_id}.json")
@@ -483,9 +523,10 @@ class S3ObjectiveArtifactStore:
                 trajectory.trajectory_id != trajectory_id
                 or trajectory.split is not candidate_split
                 or not trajectory.verified
+                or trajectory.verifier_success is not trajectory.success
             ):
                 raise ObjectiveArtifactIntegrityError(
-                    "stored trajectory provenance does not match index"
+                    "stored trajectory provenance or verifier outcome does not match index"
                 )
             return trajectory
         return None
@@ -562,9 +603,13 @@ class S3ObjectiveArtifactStore:
                 raise ObjectiveArtifactIntegrityError(
                     "validation and hidden rows cannot enter training datasets"
                 )
-            if not row.verifier_confirmed or row.source_type != "verified_replay":
+            if (
+                not row.verifier_confirmed
+                or not row.verifier_success
+                or row.source_type not in {"successful_replay", "repaired_replay"}
+            ):
                 raise ObjectiveArtifactIntegrityError(
-                    "dataset rows must carry verifier-confirmed replay evidence"
+                    "dataset rows must carry verifier-confirmed successful replay evidence"
                 )
         if (
             tuple(row.source_trajectory_id for row in dataset.rows)
@@ -573,10 +618,30 @@ class S3ObjectiveArtifactStore:
             raise ObjectiveArtifactIntegrityError("dataset manifest provenance does not match rows")
         for row in dataset.rows:
             source = self.get_trajectory(row.source_trajectory_id, split=row.split)
-            if source is None or source.task_id != row.task_id or not source.verified:
+            if (
+                source is None
+                or source.task_id != row.task_id
+                or not source.verified
+                or source.success is not True
+                or source.verifier_success is not True
+                or source.repaired_from_trajectory_id != row.repaired_from_trajectory_id
+            ):
                 raise ObjectiveArtifactIntegrityError(
-                    "dataset row source is not present in the trusted trajectory index"
+                    "dataset row source is not a trusted successful trajectory"
                 )
+            if row.repaired_from_trajectory_id is not None:
+                parent = self.get_trajectory(row.repaired_from_trajectory_id, split=row.split)
+                if (
+                    parent is None
+                    or not parent.verified
+                    or parent.success is not False
+                    or parent.verifier_success is not False
+                    or parent.task_id != row.task_id
+                    or parent.split is not row.split
+                ):
+                    raise ObjectiveArtifactIntegrityError(
+                        "dataset repair lineage lacks a verifier-confirmed failed source"
+                    )
         dataset_id = _validate_identifier(dataset.manifest.dataset_id, name="dataset_id")
         run_id = _validate_identifier(dataset.manifest.run_id, name="run_id")
         experiment_id = _validate_identifier(dataset.manifest.experiment_id, name="experiment_id")

@@ -99,6 +99,13 @@ class AutonomousRunDispatcher:
                 await asyncio.gather(work, return_exceptions=True)
                 raise LeaseConflictError("dispatcher lease was lost")
             await work
+        except asyncio.CancelledError:
+            # Do not release the durable lease while its supervisor child is
+            # still running. A replacement dispatcher could otherwise claim
+            # the run and submit duplicate provider work after shutdown.
+            work.cancel()
+            await asyncio.gather(work, return_exceptions=True)
+            raise
         finally:
             beat.cancel()
             lost_wait.cancel()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -50,6 +51,7 @@ def _app(repository: InMemoryAutonomousRunRepository | None = None) -> FastAPI:
         instance_count=1,
         volume_size_gb=30,
         max_runtime_seconds=3600,
+        approval_ttl_seconds=86400,
         estimated_run_cost_usd=1.0,
         checkpoint_s3_uri="s3://bucket/checkpoint?versionId=v1",
         checkpoint_sha256=CHECKPOINT,
@@ -312,7 +314,29 @@ async def test_prepare_returns_canonical_packet_for_external_signing() -> None:
     body = prepared.json()
     packet = ApprovalPacket.model_validate(body["approval_packet"])
     assert packet.digest == body["packet_sha256"]
+    assert packet.expires_at - packet.issued_at == timedelta(days=1)
     assert app.state.live_repository.get("run-prepare").status is AutonomousRunStatus.PREPARED
+
+
+@pytest.mark.anyio
+async def test_prepare_rejects_approval_expiry_shorter_than_full_bounded_run() -> None:
+    app = _app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        prepared = await client.post(
+            "/api/live/runs/prepare",
+            headers={"Idempotency-Key": "prepare-short-approval"},
+            json={
+                "run_id": "run-short-approval",
+                "checkpoint_revision": REVISION,
+                "checkpoint_sha256": CHECKPOINT,
+                "checkpoint_s3_uri": "s3://bucket/checkpoint?versionId=v1",
+                "benchmark_manifest_sha256": MANIFEST,
+                "expires_at": (datetime.now(UTC) + timedelta(hours=5)).isoformat(),
+            },
+        )
+
+    assert prepared.status_code == 424
+    assert "shorter than the bounded" in prepared.json()["detail"]
 
 
 @pytest.mark.anyio
@@ -573,14 +597,22 @@ async def test_safe_stop_replays_same_response_and_rejects_cancel_key_reuse() ->
 
 
 @pytest.mark.anyio
-async def test_lifespan_recovers_incomplete_runs() -> None:
+async def test_lifespan_runs_nonblocking_periodic_recovery_and_stops_it() -> None:
     repository = InMemoryAutonomousRunRepository()
     repository.create(_state(status=AutonomousRunStatus.QUEUED, phase=RunPhase.QUEUED))
     calls: list[str] = []
+    first_recovery_started = asyncio.Event()
+    release_first_recovery = asyncio.Event()
+    second_recovery_started = asyncio.Event()
 
     class Dispatcher:
         async def recover_incomplete_runs(self) -> list[str]:
             calls.append("recover")
+            if len(calls) == 1:
+                first_recovery_started.set()
+                await release_first_recovery.wait()
+            elif len(calls) == 2:
+                second_recovery_started.set()
             return ["run-1"]
 
         async def shutdown(self) -> None:
@@ -588,6 +620,12 @@ async def test_lifespan_recovers_incomplete_runs() -> None:
 
     app = _app(repository)
     app.state.live_dispatcher = Dispatcher()
+    app.state.live_recovery_interval_seconds = 0.01
     async with app.router.lifespan_context(app):
-        pass
-    assert calls == ["recover", "shutdown"]
+        await asyncio.wait_for(first_recovery_started.wait(), timeout=1)
+        # Startup must complete while the initial durable scan is still active.
+        assert calls == ["recover"]
+        release_first_recovery.set()
+        await asyncio.wait_for(second_recovery_started.wait(), timeout=1)
+    assert calls.count("recover") >= 2
+    assert calls[-1] == "shutdown"

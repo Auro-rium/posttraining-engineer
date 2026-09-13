@@ -14,6 +14,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
+from urllib.parse import parse_qs, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -41,12 +42,29 @@ class ObjectiveBenchmarkRequest(BaseModel):
 
     run_id: str = Field(min_length=1)
     model_uri: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     suite: str = Field(min_length=1)
     suite_version: str = Field(min_length=1)
     seed: int
     num_episodes: int = Field(ge=1)
     split: Literal["train", "replay"]
     output_s3_uri: str = Field(min_length=1)
+
+    @field_validator("model_uri")
+    @classmethod
+    def require_immutable_model_uri(cls, value: str) -> str:
+        parsed = urlparse(value)
+        versions = parse_qs(parsed.query).get("versionId", [])
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or not parsed.path
+            or len(versions) != 1
+            or not versions[0]
+            or versions[0].strip().lower() == "null"
+        ):
+            raise ValueError("model_uri must be an immutable S3 object version")
+        return value
 
 
 class ObjectiveBenchmarkResult(BaseModel):
@@ -59,6 +77,7 @@ class ObjectiveBenchmarkResult(BaseModel):
     suite: str = Field(min_length=1)
     suite_version: str = Field(min_length=1)
     model_id: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     seed: int
     split: str = Field(min_length=1)
     metrics: BenchmarkMetrics
@@ -146,6 +165,7 @@ def execute_objective_benchmark(
         result.suite != request.suite
         or result.suite_version != request.suite_version
         or result.model_id != request.model_uri
+        or result.model_sha256 != request.model_sha256
         or result.seed != request.seed
         or result.split != request.split
     ):

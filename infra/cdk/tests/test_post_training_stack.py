@@ -16,6 +16,16 @@ if str(ROOT) not in sys.path:
 
 from stacks.post_training_stack import PostTrainingStack  # noqa: E402
 
+OBJECTIVE_MODEL_CONTEXT = {
+    "artifact_bucket_name": "post-training-test-artifacts",
+    "checkpoint_s3_uri": (
+        "s3://post-training-test-artifacts/post-training/checkpoints/base.tar.gz"
+        "?versionId=base-v1"
+    ),
+    "checkpoint_sha256": "a" * 64,
+    "hf_revision": "b" * 40,
+}
+
 
 def template(extra_context: dict[str, str] | None = None) -> Template:
     context = {
@@ -25,6 +35,24 @@ def template(extra_context: dict[str, str] | None = None) -> Template:
         "trainer_image_digest": "sha256:" + "1" * 64,
         "evaluator_image_digest": "sha256:" + "2" * 64,
         "objective_worker_url": "https://objective.example.test",
+        "coordinator_ingress_cidrs": "198.51.100.14/32",
+        "coordinator_certificate_arn": (
+            "arn:aws:acm:us-east-1:123456789012:certificate/"
+            "12345678-abcd-1234-abcd-1234567890ab"
+        ),
+        "coordinator_public_dns_name": "api.example.test",
+        "coordinator_public_hosted_zone_name": "example.test",
+        "coordinator_public_hosted_zone_id": "Z1234567890ABC",
+        "coordinator_certificate_san": "api.example.test",
+        # A version-pinned checkpoint is part of the required live deployment
+        # contract even when the objective worker is external.
+        "artifact_bucket_name": "post-training-test-artifacts",
+        "checkpoint_s3_uri": (
+            "s3://post-training-test-artifacts/post-training/checkpoints/base.tar.gz"
+            "?versionId=base-v1"
+        ),
+        "checkpoint_sha256": "a" * 64,
+        "hf_revision": "b" * 40,
     }
     context.update(extra_context or {})
     app = App(
@@ -40,6 +68,23 @@ def template(extra_context: dict[str, str] | None = None) -> Template:
 
 def test_has_three_immutable_ecr_repositories() -> None:
     template().resource_count_is("AWS::ECR::Repository", 3)
+
+
+def test_zero_desired_count_synthesizes_repositories_without_starting_tasks() -> None:
+    stack_template = template({"desired_count": "0"})
+
+    stack_template.resource_count_is("AWS::ECR::Repository", 3)
+    services = stack_template.find_resources("AWS::ECS::Service")
+    assert len(services) == 1
+    service = next(iter(services.values()))
+    assert service["Properties"]["DesiredCount"] == 0
+
+
+def test_default_desired_count_keeps_one_coordinator_task() -> None:
+    services = template().find_resources("AWS::ECS::Service")
+    assert len(services) == 1
+    service = next(iter(services.values()))
+    assert service["Properties"]["DesiredCount"] == 1
 
 
 def test_ecr_repositories_are_immutable_and_scan_on_push() -> None:
@@ -96,6 +141,7 @@ def test_secrets_are_created_and_injected_without_plaintext_values() -> None:
 def test_objective_service_is_internal_and_token_authenticated() -> None:
     stack_template = template(
         {
+            **OBJECTIVE_MODEL_CONTEXT,
             "objective_worker_url": "",
             "objective_certificate_arn": (
                 "arn:aws:acm:us-east-1:123456789012:certificate/"
@@ -108,8 +154,10 @@ def test_objective_service_is_internal_and_token_authenticated() -> None:
     )
     stack_template.resource_count_is("AWS::ECS::Service", 2)
     load_balancers = stack_template.find_resources("AWS::ElasticLoadBalancingV2::LoadBalancer")
-    assert len(load_balancers) == 1
-    assert next(iter(load_balancers.values()))["Properties"]["Scheme"] == "internal"
+    assert {item["Properties"]["Scheme"] for item in load_balancers.values()} == {
+        "internal",
+        "internet-facing",
+    }
     task_definitions = stack_template.find_resources("AWS::ECS::TaskDefinition")
     objective = [
         value
@@ -131,26 +179,125 @@ def test_objective_service_is_internal_and_token_authenticated() -> None:
         for item in objective_container["Environment"]
     }
     assert objective_environment["SERVICE_ROLE"] == "objective"
+    assert objective_environment["OBJECTIVE_MODEL_CHECKPOINT_DIR"] == "/opt/models/functiongemma"
+    assert objective_environment["OBJECTIVE_MODEL_REVISION"] == "b" * 40
+    assert objective_environment["OBJECTIVE_BASE_MODEL_URI"] == (
+        "s3://post-training-test-artifacts/post-training/checkpoints/base.tar.gz"
+        "?versionId=base-v1"
+    )
+    assert objective_environment["OBJECTIVE_BASE_MODEL_SHA256"] == "a" * 64
     assert objective_environment["S3_ARTIFACT_BUCKET"]
     assert objective_environment["S3_ARTIFACT_PREFIX"] == "post-training"
     ingress = stack_template.find_resources("AWS::EC2::SecurityGroupIngress")
     assert ingress
-    assert all("CidrIp" not in item["Properties"] for item in ingress.values())
+    assert all(
+        item["Properties"]["FromPort"] == 443
+        and item["Properties"]["ToPort"] == 443
+        for item in ingress.values()
+        if "CidrIp" in item["Properties"]
+    )
     assert any(
         item["Properties"].get("SourceSecurityGroupId")
         for item in ingress.values()
     )
     listeners = stack_template.find_resources("AWS::ElasticLoadBalancingV2::Listener")
-    assert len(listeners) == 1
-    assert next(iter(listeners.values()))["Properties"]["Port"] == 443
+    assert {item["Properties"]["Port"] for item in listeners.values()} == {443}
+
+
+def test_internal_objective_worker_uses_hackathon_task_sizing() -> None:
+    stack_template = template(
+        {
+            **OBJECTIVE_MODEL_CONTEXT,
+            "objective_worker_url": "",
+            "objective_certificate_arn": (
+                "arn:aws:acm:us-east-1:123456789012:certificate/"
+                "abcdef01-2345-6789-abcd-ef0123456789"
+            ),
+            "objective_private_dns_name": "objective.internal.example.test",
+            "objective_private_hosted_zone_name": "internal.example.test",
+            "objective_certificate_san": "objective.internal.example.test",
+        }
+    )
+    task_definitions = stack_template.find_resources("AWS::ECS::TaskDefinition")
+    objective = [
+        task
+        for task in task_definitions.values()
+        if any(
+            container.get("Name") == "Objective"
+            for container in task["Properties"]["ContainerDefinitions"]
+        )
+    ]
+    coordinator = [
+        task
+        for task in task_definitions.values()
+        if any(
+            container.get("Name") == "Backend"
+            for container in task["Properties"]["ContainerDefinitions"]
+        )
+    ]
+
+    assert len(objective) == 1
+    assert objective[0]["Properties"]["Cpu"] == "2048"
+    assert objective[0]["Properties"]["Memory"] == "4096"
+    assert len(coordinator) == 1
+    assert coordinator[0]["Properties"]["Cpu"] == "1024"
+    assert coordinator[0]["Properties"]["Memory"] == "2048"
 
 
 def test_external_objective_url_does_not_create_internal_service() -> None:
     stack_template = template()
     stack_template.resource_count_is("AWS::ECS::Service", 1)
-    assert not stack_template.find_resources("AWS::ElasticLoadBalancingV2::LoadBalancer")
-    assert not stack_template.find_resources("AWS::ElasticLoadBalancingV2::Listener")
+    load_balancers = stack_template.find_resources("AWS::ElasticLoadBalancingV2::LoadBalancer")
+    assert len(load_balancers) == 1
+    coordinator_lb = next(iter(load_balancers.values()))
+    assert coordinator_lb["Properties"]["Scheme"] == "internet-facing"
+    listeners = stack_template.find_resources("AWS::ElasticLoadBalancingV2::Listener")
+    assert len(listeners) == 1
+    listener = next(iter(listeners.values()))["Properties"]
+    assert listener["Port"] == 443
+    assert listener["Protocol"] == "HTTPS"
+    assert len(listener["Certificates"]) == 1
+    records = stack_template.find_resources("AWS::Route53::RecordSet")
+    assert len(records) == 1
+    record = next(iter(records.values()))["Properties"]
+    assert record["Name"] == "api.example.test."
+    assert record["Type"] == "A"
     assert len(stack_template.find_resources("AWS::ECS::TaskDefinition")) == 1
+
+
+def test_coordinator_ingress_is_public_but_restricted_to_explicit_cidr() -> None:
+    security_groups = template().find_resources("AWS::EC2::SecurityGroup")
+    coordinator_ingress = [
+        rule
+        for item in security_groups.values()
+        for rule in item["Properties"].get("SecurityGroupIngress", [])
+        if rule.get("CidrIp") == "198.51.100.14/32"
+    ]
+    assert len(coordinator_ingress) == 1
+    assert coordinator_ingress[0]["FromPort"] == 443
+    assert coordinator_ingress[0]["ToPort"] == 443
+    assert coordinator_ingress[0]["IpProtocol"] == "tcp"
+    listeners = template().find_resources("AWS::ElasticLoadBalancingV2::Listener")
+    assert len(listeners) == 1
+    listener = next(iter(listeners.values()))["Properties"]
+    assert listener["Port"] == 443
+    assert listener["Protocol"] == "HTTPS"
+
+
+@pytest.mark.parametrize(
+    ("cidr", "message"),
+    [
+        ("", "coordinator_ingress_cidrs"),
+        ("0.0.0.0/0", "prefix /16"),
+        ("198.51.100.1", "valid IPv4 CIDRs"),
+        ("2001:db8::/64", "valid IPv4 CIDRs"),
+    ],
+)
+def test_coordinator_ingress_requires_a_narrow_explicit_ipv4_cidr(
+    cidr: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        template({"coordinator_ingress_cidrs": cidr})
 
 
 def test_runtime_task_injects_all_live_readiness_configuration() -> None:
@@ -204,6 +351,10 @@ def test_runtime_task_injects_all_live_readiness_configuration() -> None:
         "MAX_TRAINING_TIME_MIN",
     }
     assert required <= env_names
+    runtime_environment = {
+        item["Name"]: item["Value"] for item in container["Environment"]
+    }
+    assert runtime_environment["LIVE_APPROVAL_TTL_SECONDS"] == "86400"
 
 
 def test_outputs_expose_resources_and_objective_endpoint() -> None:
@@ -215,9 +366,12 @@ def test_outputs_expose_resources_and_objective_endpoint() -> None:
         "TrainerRepositoryUri",
         "EvaluatorRepositoryUri",
         "ObjectiveWorkerUrl",
+        "CoordinatorUrl",
         "SageMakerTrainingRoleArn",
     ):
         assert name in outputs
+    coordinator_output = outputs["CoordinatorUrl"]["Value"]
+    assert coordinator_output == "https://api.example.test"
 
 
 def test_sagemaker_permissions_are_tag_bound_and_prefix_scoped() -> None:
@@ -245,6 +399,18 @@ def test_sagemaker_permissions_are_tag_bound_and_prefix_scoped() -> None:
         "/post-training/*" in json.dumps(statement.get("Resource"))
         for document in policy_documents
         for statement in document["Statement"]
+    )
+    list_tags = [
+        statement
+        for statement in sagemaker_statements
+        if statement.get("Action") == "sagemaker:ListTags"
+    ]
+    assert len(list_tags) == 1
+    assert len(list_tags[0]["Resource"]) == 2
+    assert "processing-job/*" in json.dumps(list_tags[0]["Resource"])
+    assert "training-job/*" in json.dumps(list_tags[0]["Resource"])
+    assert list_tags[0]["Condition"]["StringEquals"]["sagemaker:ResourceTag/project"] == (
+        "autonomous-post-training"
     )
 
 
@@ -275,13 +441,20 @@ def test_stack_fails_closed_without_image_digests() -> None:
         template({"backend_image_digest": "latest"})
 
 
-def test_cdk_defaults_are_explicitly_development_only() -> None:
+def test_default_cdk_app_is_bootstrap_only_and_has_no_runtime_inputs() -> None:
     config = json.loads((ROOT / "cdk.json").read_text())
     context = config["context"]
-    assert context["config_note"].startswith("development-only;")
+    assert context["config_note"].startswith("bootstrap-only;")
+    assert config["app"].endswith("app.py")
     assert not any(name.endswith("_image_digest") for name in context)
     assert "objective_worker_url" not in context
     assert "objective_certificate_arn" not in context
+    assert not any("model" in name or "checkpoint" in name for name in context)
+    assert not any(
+        marker in name
+        for name in context
+        for marker in ("evaluation", "certificate", "dns", "ingress")
+    )
 
 
 def test_stack_fails_closed_without_https_objective_endpoint() -> None:
@@ -289,9 +462,42 @@ def test_stack_fails_closed_without_https_objective_endpoint() -> None:
         template({"objective_worker_url": "http://objective.internal"})
 
 
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        ({"coordinator_certificate_arn": ""}, "coordinator_certificate_arn"),
+        ({"coordinator_public_dns_name": ""}, "coordinator_public_dns_name"),
+        (
+            {"coordinator_public_hosted_zone_name": ""},
+            "coordinator_public_hosted_zone_name",
+        ),
+        (
+            {"coordinator_public_hosted_zone_id": ""},
+            "coordinator_public_hosted_zone_id",
+        ),
+        ({"coordinator_certificate_san": "wrong.example.test"}, "must match"),
+        (
+            {
+                "coordinator_certificate_arn": (
+                    "arn:aws:acm:us-west-2:123456789012:certificate/"
+                    "12345678-abcd-1234-abcd-1234567890ab"
+                )
+            },
+            "stack's AWS region",
+        ),
+    ],
+)
+def test_coordinator_https_requires_valid_certificate_and_public_dns_contract(
+    config: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        template(config)
+
+
 def test_valid_certificate_can_supply_https_objective_endpoint() -> None:
     stack_template = template(
         {
+            **OBJECTIVE_MODEL_CONTEXT,
             "objective_worker_url": "",
             "objective_certificate_arn": (
                 "arn:aws:acm:us-east-1:123456789012:certificate/"
@@ -315,6 +521,7 @@ def test_valid_certificate_can_supply_https_objective_endpoint() -> None:
 def test_certificate_only_objective_uses_private_alias_matching_certificate_san() -> None:
     stack_template = template(
         {
+            **OBJECTIVE_MODEL_CONTEXT,
             "objective_worker_url": "",
             "objective_certificate_arn": (
                 "arn:aws:acm:us-east-1:123456789012:certificate/"
@@ -329,8 +536,12 @@ def test_certificate_only_objective_uses_private_alias_matching_certificate_san(
     assert len(zones) == 1
     assert next(iter(zones.values()))["Properties"]["Name"] == "internal.example.test."
     records = stack_template.find_resources("AWS::Route53::RecordSet")
-    assert len(records) == 1
-    record = next(iter(records.values()))["Properties"]
+    assert len(records) == 2
+    record = next(
+        value["Properties"]
+        for value in records.values()
+        if value["Properties"]["Name"] == "objective.internal.example.test."
+    )
     assert record["Name"] == "objective.internal.example.test."
     assert record["Type"] == "A"
     coordinator = next(
@@ -354,10 +565,17 @@ def test_certificate_only_objective_fails_closed_on_missing_or_mismatched_dns_co
         "abcdef01-2345-6789-abcd-ef0123456789"
     )
     with pytest.raises(ValueError, match="objective_private_dns_name"):
-        template({"objective_worker_url": "", "objective_certificate_arn": certificate})
+        template(
+            {
+                **OBJECTIVE_MODEL_CONTEXT,
+                "objective_worker_url": "",
+                "objective_certificate_arn": certificate,
+            }
+        )
     with pytest.raises(ValueError, match="must match objective_certificate_san"):
         template(
             {
+                **OBJECTIVE_MODEL_CONTEXT,
                 "objective_worker_url": "",
                 "objective_certificate_arn": certificate,
                 "objective_private_dns_name": "objective.internal.example.test",
@@ -370,6 +588,7 @@ def test_certificate_only_objective_fails_closed_on_missing_or_mismatched_dns_co
 def test_objective_role_can_read_write_versioned_encrypted_artifacts() -> None:
     stack_template = template(
         {
+            **OBJECTIVE_MODEL_CONTEXT,
             "objective_worker_url": "",
             "objective_certificate_arn": (
                 "arn:aws:acm:us-east-1:123456789012:certificate/"
@@ -417,7 +636,15 @@ def test_objective_role_can_read_write_versioned_encrypted_artifacts() -> None:
 
 def test_task_role_has_only_scoped_readonly_preflight_permissions() -> None:
     artifact_prefix = "scoped-preflight"
-    stack_template = template({"artifact_prefix": artifact_prefix})
+    stack_template = template(
+        {
+            "artifact_prefix": artifact_prefix,
+            "checkpoint_s3_uri": (
+                "s3://post-training-test-artifacts/scoped-preflight/"
+                "checkpoints/base.tar.gz?versionId=base-v1"
+            ),
+        }
+    )
     policies = stack_template.find_resources("AWS::IAM::Policy")
     coordinator_policy = next(
         item
@@ -464,9 +691,25 @@ def test_configured_s3_inputs_must_match_named_bucket_and_prefix() -> None:
         )
 
 
+def test_live_checkpoint_uri_requires_explicit_immutable_version() -> None:
+    with pytest.raises(ValueError, match="checkpoint_s3_uri.*versionId"):
+        template({"checkpoint_s3_uri": ""})
+
+    with pytest.raises(ValueError, match="exactly one immutable versionId"):
+        template(
+            {
+                "checkpoint_s3_uri": (
+                    "s3://post-training-test-artifacts/"
+                    "post-training/checkpoints/base.tar.gz"
+                )
+            }
+        )
+
+
 def test_task_roles_do_not_read_runtime_secrets() -> None:
     policies = template(
         {
+            **OBJECTIVE_MODEL_CONTEXT,
             "objective_worker_url": "",
             "objective_certificate_arn": (
                 "arn:aws:acm:us-east-1:123456789012:certificate/"

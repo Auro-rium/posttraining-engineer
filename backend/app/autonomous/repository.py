@@ -705,9 +705,12 @@ class InMemoryAutonomousRunRepository:
             ttl_seconds = _ensure_ttl(ttl_seconds)
             if not owner.strip():
                 raise ValueError("lease owner must not be blank")
-            if current.lease_owner and current.lease_owner != owner and current.lease_expires_at:
-                if current.lease_expires_at > when:
-                    raise LeaseConflictError("run lease is held by another live worker")
+            if (
+                current.lease_owner
+                and current.lease_expires_at
+                and current.lease_expires_at > when
+            ):
+                raise LeaseConflictError("run lease is held by a live worker")
             next_state = current.model_copy(
                 update={
                     "lease_owner": owner,
@@ -1529,11 +1532,10 @@ class DynamoDBAutonomousRunRepository:
         ttl_seconds = _ensure_ttl(ttl_seconds)
         if (
             current.lease_owner
-            and current.lease_owner != owner
             and current.lease_expires_at
             and current.lease_expires_at > when
         ):
-            raise LeaseConflictError("run lease is held by another live worker")
+            raise LeaseConflictError("run lease is held by a live worker")
         next_state = AutonomousRunState.model_validate(
             current.model_copy(
                 update={
@@ -1570,7 +1572,26 @@ class DynamoDBAutonomousRunRepository:
             or current.lease_expires_at <= when
         ):
             raise LeaseConflictError("worker does not hold a live lease")
-        return self.claim_lease(run_id, owner, now=when, ttl_seconds=ttl_seconds)
+        next_state = AutonomousRunState.model_validate(
+            current.model_copy(
+                update={
+                    "lease_expires_at": when + timedelta(seconds=ttl_seconds),
+                    "version": current.version + 1,
+                    "updated_at": when,
+                }
+            ).model_dump(mode="python")
+        )
+        try:
+            self._table_or_create().put_item(
+                Item=self._item(self.STATE_SK, next_state),
+                ConditionExpression="version = :version",
+                ExpressionAttributeValues={":version": current.version},
+            )
+        except Exception as exc:
+            if self._conditional(exc):
+                raise LeaseConflictError("lease renewal lost a race") from exc
+            raise
+        return next_state
 
     def release_lease(self, run_id: str, owner: str) -> AutonomousRunState:
         current = self.get(run_id)

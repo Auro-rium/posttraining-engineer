@@ -31,7 +31,9 @@ FUNCTION_END = "<end_function_call>"
 FUNCTION_ESCAPE = "<escape>"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-fA-F]{40}$")
-_CHANNELS = frozenset({"candidate", "champion", "sealed"})
+_CHANNELS = frozenset({"base_model", "candidate", "champion", "sealed"})
+_BASE_MODEL_ID = "google/functiongemma-270m-it"
+_CHAMPION_KINDS = frozenset({"base-model", "qlora-adapter"})
 
 
 class EvaluationWorkerError(ValueError):
@@ -61,6 +63,11 @@ class EvaluationInputs:
     evaluation_suite_version: str
     objective_seed: int
     champion_dir: Path | None = None
+    base_model_dir: Path | None = None
+    base_model_id: str | None = None
+    base_model_revision: str | None = None
+    base_model_archive_sha256: str | None = None
+    champion_kind: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +127,8 @@ def _channels(
         name = str(raw_name).strip().lower()
         if name not in _CHANNELS:
             raise EvaluationWorkerError(
-                f"evaluator channel {raw_name!r} is not allowed; use candidate, champion, or sealed"
+                "evaluator channel "
+                f"{raw_name!r} is not allowed; use base_model, candidate, champion, or sealed"
             )
         parsed[name] = _path(raw_path, f"{name} channel")
     if "candidate" not in parsed:
@@ -212,12 +220,17 @@ def parse_evaluation_inputs(
                     f"evaluator cannot consume train-side or unknown channel {env_name!r}"
                 )
     for env_key, name in (
+        ("SM_CHANNEL_BASE_MODEL", "base_model"),
         ("SM_CHANNEL_CANDIDATE", "candidate"),
         ("SM_CHANNEL_CHAMPION", "champion"),
         ("SM_CHANNEL_SEALED", "sealed"),
     ):
         if env_key in values and values[env_key].strip():
             channel_values.setdefault(name, values[env_key])
+    for name in ("base_model", "candidate", "champion", "sealed"):
+        explicit_path = values.get(f"EVALUATION_{name.upper()}_DIR", "").strip()
+        if explicit_path:
+            channel_values.setdefault(name, explicit_path)
     parsed_channels = _channels(channel_values)
     output_text = values.get("SM_OUTPUT_DATA_DIR", values.get("SM_MODEL_DIR", "")).strip()
     if not output_text:
@@ -226,8 +239,65 @@ def parse_evaluation_inputs(
     if output_dir.exists() and not output_dir.is_dir():
         raise EvaluationWorkerError("SM_OUTPUT_DATA_DIR must be a directory")
     output_dir.mkdir(parents=True, exist_ok=True)
+    base_model_dir: Path | None = None
+    base_model_id: str | None = None
+    base_model_revision: str | None = None
+    base_model_archive_sha256: str | None = None
+    base_model_channel = parsed_channels.get("base_model")
+    if base_model_channel is not None:
+        base_model_id = _required(values, "BASE_MODEL_ID")
+        if base_model_id != _BASE_MODEL_ID:
+            raise EvaluationWorkerError(f"BASE_MODEL_ID must equal {_BASE_MODEL_ID!r}")
+        base_model_revision = _required(values, "BASE_MODEL_REVISION")
+        if not _REVISION.fullmatch(base_model_revision):
+            raise EvaluationWorkerError("BASE_MODEL_REVISION must be an immutable 40-character SHA")
+        archive_digest = values.get("BASE_MODEL_ARCHIVE_SHA256", "").strip()
+        bundle_digest = values.get("BASE_MODEL_BUNDLE_SHA256", "").strip()
+        if archive_digest and bundle_digest and archive_digest != bundle_digest:
+            raise EvaluationArtifactError("base model archive and bundle digests disagree")
+        base_model_archive_sha256 = _digest(
+            archive_digest or bundle_digest or _required(values, "BASE_MODEL_ARCHIVE_SHA256"),
+            "BASE_MODEL_ARCHIVE_SHA256",
+        )
+        base_model_dir = _extract_checkpoint_channel(
+            base_model_channel,
+            name="base model",
+            expected_sha256=base_model_archive_sha256,
+            destination=output_dir / "_base_model_checkpoint",
+        )
+        _verify_base_model_directory(base_model_dir)
+
+    champion_kind = values.get("CHAMPION_KIND", "qlora-adapter").strip() or "qlora-adapter"
+    if champion_kind not in _CHAMPION_KINDS:
+        raise EvaluationWorkerError("CHAMPION_KIND must be 'base-model' or 'qlora-adapter'")
+    if champion_kind == "base-model":
+        if base_model_dir is None or base_model_archive_sha256 is None:
+            raise EvaluationWorkerError(
+                "base-model champion requires the immutable base_model channel"
+            )
+        champion_archive_sha256 = _digest(
+            _required(values, "CHAMPION_ARCHIVE_SHA256"), "CHAMPION_ARCHIVE_SHA256"
+        )
+        if champion_archive_sha256 != base_model_archive_sha256:
+            raise EvaluationArtifactError(
+                "base-model champion digest does not match base_model channel"
+            )
+        champion_channel = parsed_channels.get("champion")
+        if champion_channel is not None:
+            archives = tuple(champion_channel.glob("*.tar.gz"))
+            if (
+                len(archives) != 1
+                or archives[0].name != f"{champion_archive_sha256}.tar.gz"
+                or _file_sha256(archives[0]) != champion_archive_sha256
+            ):
+                raise EvaluationArtifactError(
+                    "base-model champion archive is not content-addressed"
+                )
+
     for name in ("candidate", "champion"):
         channel = parsed_channels.get(name)
+        if name == "champion" and champion_kind == "base-model":
+            continue
         if channel is None or (channel / "manifest.json").is_file():
             continue
         if not tuple(channel.glob("*.tar.gz")):
@@ -260,6 +330,11 @@ def parse_evaluation_inputs(
         evaluation_suite_version=suite_version,
         objective_seed=seed,
         champion_dir=parsed_channels.get("champion"),
+        base_model_dir=base_model_dir,
+        base_model_id=base_model_id,
+        base_model_revision=base_model_revision,
+        base_model_archive_sha256=base_model_archive_sha256,
+        champion_kind=champion_kind if "champion" in parsed_channels else None,
     )
 
 
@@ -271,6 +346,40 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_base_model_directory(directory: Path) -> None:
+    """Check the extracted immutable FunctionGemma bundle before Transformers sees it."""
+
+    config_path = directory / "config.json"
+    if not config_path.is_file() or config_path.is_symlink():
+        raise EvaluationArtifactError("base model config.json is absent")
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvaluationArtifactError("base model config.json is not valid JSON") from exc
+    if (
+        not isinstance(config, dict)
+        or config.get("model_type") != "gemma3_text"
+        or config.get("architectures") != ["Gemma3ForCausalLM"]
+    ):
+        raise EvaluationArtifactError(
+            "base model config is not the pinned FunctionGemma architecture"
+        )
+    weights = tuple(
+        item
+        for item in directory.iterdir()
+        if item.is_file()
+        and not item.is_symlink()
+        and (
+            item.name in {"model.safetensors", "pytorch_model.bin"}
+            or re.fullmatch(
+                r"(?:model|pytorch_model)-\d{5}-of-\d{5}\.(?:safetensors|bin)", item.name
+            )
+        )
+    )
+    if not weights:
+        raise EvaluationArtifactError("base model weight files are absent")
 
 
 def _artifact_digest(files: Sequence[Mapping[str, Any]]) -> str:
@@ -456,11 +565,9 @@ def _sealed_manifest(inputs: EvaluationInputs) -> tuple[Mapping[str, Any], list[
         raise EvaluationArtifactError("sealed evaluation manifest must be a JSON object")
     if manifest.get("manifest_sha256") != inputs.evaluation_manifest_sha256:
         raise EvaluationArtifactError("sealed evaluation manifest digest does not match job input")
-    if manifest.get("run_id") != inputs.run_id:
-        raise EvaluationArtifactError("sealed evaluation run identity does not match job input")
-    if manifest.get("experiment_id") != inputs.experiment_id:
+    if "run_id" in manifest or "experiment_id" in manifest:
         raise EvaluationArtifactError(
-            "sealed evaluation experiment identity does not match job input"
+            "static sealed manifest must not contain per-run identity; bind it in the job input"
         )
     if manifest.get("objective_seed") != inputs.objective_seed:
         raise EvaluationArtifactError("sealed evaluation seed does not match job input")
@@ -666,7 +773,13 @@ def _decode_actions(text: str, *, allow_json: bool = False) -> tuple[ToolCall, .
 
 
 def _model_policy(
-    checkpoint_dir: Path, manifest: Mapping[str, Any]
+    checkpoint_dir: Path,
+    manifest: Mapping[str, Any],
+    *,
+    base_model_dir: Path | None = None,
+    base_model_id: str | None = None,
+    base_model_revision: str | None = None,
+    use_adapter: bool = True,
 ) -> Callable[[Task, Sequence[Mapping[str, Any]]], tuple[ToolCall, ...]]:
     try:
         # Heavy dependencies are loaded only while evaluating a real checkpoint.
@@ -682,19 +795,38 @@ def _model_policy(
     model_id = manifest.get("base_model_id")
     revision = manifest.get("base_model_revision")
     if (
-        model_id != "google/functiongemma-270m-it"
+        model_id != _BASE_MODEL_ID
         or not isinstance(revision, str)
         or not _REVISION.fullmatch(revision)
     ):
         raise EvaluationRuntimeError(
             "checkpoint manifest does not pin the FunctionGemma base revision"
         )
-    try:
-        processor = AutoProcessor.from_pretrained(checkpoint_dir, trust_remote_code=False)
-        base = AutoModelForCausalLM.from_pretrained(
-            model_id, revision=revision, trust_remote_code=False
+    if base_model_id is not None and model_id != base_model_id:
+        raise EvaluationRuntimeError(
+            "checkpoint base model does not match immutable base_model input"
         )
-        model = PeftModel.from_pretrained(base, checkpoint_dir)
+    if base_model_revision is not None and revision != base_model_revision:
+        raise EvaluationRuntimeError(
+            "checkpoint base revision does not match immutable base_model input"
+        )
+    if base_model_dir is None:
+        raise EvaluationRuntimeError("immutable base_model channel is required for evaluation")
+    base_directory = _path(base_model_dir, "base model")
+    if not use_adapter:
+        _verify_base_model_directory(base_directory)
+    try:
+        processor = AutoProcessor.from_pretrained(
+            base_directory, trust_remote_code=False, local_files_only=True
+        )
+        base = AutoModelForCausalLM.from_pretrained(
+            base_directory, trust_remote_code=False, local_files_only=True
+        )
+        model = (
+            PeftModel.from_pretrained(base, checkpoint_dir, local_files_only=True)
+            if use_adapter
+            else base
+        )
         model.eval()
     except Exception as exc:
         raise EvaluationRuntimeError(
@@ -746,15 +878,53 @@ def evaluate_checkpoint(
     objective_seed: int,
     policy: Callable[..., ToolCall | Sequence[ToolCall]] | None = None,
     manifest: Mapping[str, Any] | None = None,
+    artifact_manifest: Mapping[str, Any] | None = None,
     run_id: str | None = None,
     experiment_id: str | None = None,
+    base_model_dir: Path | None = None,
+    base_model_id: str | None = None,
+    base_model_revision: str | None = None,
+    checkpoint_kind: str = "qlora-adapter",
 ) -> EvaluationMetrics:
     """Evaluate one verified checkpoint against task IDs without leaking tasks."""
 
-    checkpoint_manifest = verify_checkpoint_artifact(
-        checkpoint_dir, run_id=run_id, experiment_id=experiment_id
+    if checkpoint_kind == "qlora-adapter":
+        checkpoint_manifest = verify_checkpoint_artifact(
+            checkpoint_dir, run_id=run_id, experiment_id=experiment_id
+        )
+        use_adapter = True
+    elif checkpoint_kind == "base-model":
+        if artifact_manifest is None or artifact_manifest.get("kind") != "base-model":
+            raise EvaluationArtifactError("base-model checkpoint manifest is required")
+        checkpoint_manifest = artifact_manifest
+        use_adapter = False
+        if base_model_dir is None:
+            raise EvaluationRuntimeError("immutable base_model channel is required for evaluation")
+        _verify_base_model_directory(_path(base_model_dir, "base model"))
+    else:
+        raise EvaluationArtifactError("evaluation checkpoint kind is not supported")
+    if artifact_manifest is not None and checkpoint_kind == "qlora-adapter":
+        if artifact_manifest.get("manifest_sha256") != checkpoint_manifest.get("manifest_sha256"):
+            raise EvaluationArtifactError("checkpoint manifest does not match verified artifact")
+    if base_model_id is not None and checkpoint_manifest.get("base_model_id") != base_model_id:
+        raise EvaluationArtifactError(
+            "checkpoint base model does not match immutable base_model input"
+        )
+    if (
+        base_model_revision is not None
+        and checkpoint_manifest.get("base_model_revision") != base_model_revision
+    ):
+        raise EvaluationArtifactError(
+            "checkpoint base revision does not match immutable base_model input"
+        )
+    selected_policy = policy or _model_policy(
+        checkpoint_dir,
+        checkpoint_manifest,
+        base_model_dir=base_model_dir,
+        base_model_id=base_model_id,
+        base_model_revision=base_model_revision,
+        use_adapter=use_adapter,
     )
-    selected_policy = policy or _model_policy(checkpoint_dir, checkpoint_manifest)
     successes = 0
     task_successes: list[bool] = []
     task_environments: list[str] = []
@@ -876,6 +1046,7 @@ def build_evaluation_report(
         "evaluation_manifest_sha256": inputs.evaluation_manifest_sha256,
         "run_id": inputs.run_id,
         "experiment_id": inputs.experiment_id,
+        "candidate_kind": candidate_manifest.get("kind"),
         "candidate_manifest_sha256": candidate_manifest["manifest_sha256"],
         "candidate_artifact_sha256": candidate_manifest["artifact_sha256"],
         "candidate_task_count": candidate_metrics.task_count,
@@ -897,6 +1068,7 @@ def build_evaluation_report(
             {
                 "champion_manifest_sha256": champion_manifest["manifest_sha256"],
                 "champion_artifact_sha256": champion_manifest["artifact_sha256"],
+                "champion_kind": champion_manifest.get("kind"),
                 "champion_task_count": champion_metrics.task_count,
                 "champion_successful_tasks": champion_metrics.successful_tasks,
                 "champion_success_rate": champion_metrics.success_rate,
@@ -1011,6 +1183,31 @@ def build_evaluation_report(
     return payload
 
 
+def _base_model_manifest(inputs: EvaluationInputs) -> Mapping[str, Any]:
+    """Create deterministic evaluation identity for the immutable baseline bundle."""
+
+    if (
+        inputs.base_model_dir is None
+        or inputs.base_model_id != _BASE_MODEL_ID
+        or not isinstance(inputs.base_model_revision, str)
+        or not _REVISION.fullmatch(inputs.base_model_revision)
+        or not isinstance(inputs.base_model_archive_sha256, str)
+        or not _SHA256.fullmatch(inputs.base_model_archive_sha256)
+    ):
+        raise EvaluationArtifactError("immutable base_model channel provenance is incomplete")
+    payload: dict[str, Any] = {
+        "schema_version": "base-model-manifest-v1",
+        "kind": "base-model",
+        "base_model_id": inputs.base_model_id,
+        "base_model_revision": inputs.base_model_revision,
+        "artifact_sha256": inputs.base_model_archive_sha256,
+    }
+    payload["manifest_sha256"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return payload
+
+
 def run_evaluation(
     inputs: EvaluationInputs,
     *,
@@ -1028,25 +1225,45 @@ def run_evaluation(
         objective_seed=inputs.objective_seed,
         policy=policy,
         manifest=sealed_manifest,
+        artifact_manifest=candidate_manifest,
         run_id=inputs.run_id,
         experiment_id=inputs.experiment_id,
+        base_model_dir=inputs.base_model_dir,
+        base_model_id=inputs.base_model_id,
+        base_model_revision=inputs.base_model_revision,
     )
     champion_metrics: EvaluationMetrics | None = None
     champion_manifest: Mapping[str, Any] | None = None
     if inputs.champion_dir is not None:
-        champion_manifest = verify_checkpoint_artifact(
-            inputs.champion_dir,
-            run_id=inputs.run_id,
-            experiment_id=inputs.experiment_id,
-        )
+        if inputs.champion_kind == "base-model":
+            champion_manifest = _base_model_manifest(inputs)
+            champion_dir = inputs.base_model_dir
+            if champion_dir is None:
+                raise EvaluationArtifactError(
+                    "base-model champion has no immutable base_model channel"
+                )
+            champion_kind = "base-model"
+        else:
+            champion_manifest = verify_checkpoint_artifact(
+                inputs.champion_dir,
+                run_id=inputs.run_id,
+                experiment_id=inputs.experiment_id,
+            )
+            champion_dir = inputs.champion_dir
+            champion_kind = "qlora-adapter"
         champion_metrics = evaluate_checkpoint(
-            inputs.champion_dir,
+            champion_dir,
             sealed_task_ids=task_ids,
             objective_seed=inputs.objective_seed,
             policy=policy,
             manifest=sealed_manifest,
+            artifact_manifest=champion_manifest,
             run_id=inputs.run_id,
             experiment_id=inputs.experiment_id,
+            base_model_dir=inputs.base_model_dir,
+            base_model_id=inputs.base_model_id,
+            base_model_revision=inputs.base_model_revision,
+            checkpoint_kind=champion_kind,
         )
     payload = build_evaluation_report(
         inputs,

@@ -19,6 +19,7 @@ from app.autonomous.agents import (
     validate_qlora_config,
 )
 from app.autonomous.models import ExperimentRecord
+from app.objective.models import CorrectionProposal, ObjectiveSplit, ToolCall
 
 
 class RecordingProvider:
@@ -599,6 +600,133 @@ def test_curation_sends_verified_inputs_and_returns_judgment_only_plan() -> None
     assert '"verified_trajectory_references":["traj://verified"]' in provider.prompts[0]
     assert '"verified_trajectory_metadata"' in provider.prompts[0]
     assert '"failure_clusters"' in provider.prompts[0]
+
+
+def test_data_curator_returns_a_typed_repair_proposal_bound_to_input_failure() -> None:
+    source_ref = "trajectory://replay/traj-failed-1/replay-task-1/verified"
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "LIVE",
+            "plan": {
+                "plan_id": "plan-repair-1",
+                "selected_trajectory_refs": [],
+                "target_failure_classes": ["premature_completion"],
+                "record_count": 0,
+                "evidence_class": "LIVE",
+                "correction_proposals": [
+                    {
+                        "source_trajectory_id": "traj-failed-1",
+                        "task_id": "replay-task-1",
+                        "split": "replay",
+                        "actions": [
+                            {"tool": "restart_service", "arguments": {"service": "api"}}
+                        ],
+                    }
+                ],
+            },
+        }
+    )
+
+    plan = AutonomousAgentAdapters(provider).curate(
+        [source_ref],
+        failure_clusters=[
+            FailureCluster(
+                cluster_id="cluster-1",
+                failure_type="premature_completion",
+                description="failed before healthcheck",
+                count=1,
+                evidence_refs=[source_ref],
+            )
+        ],
+        verified_trajectory_metadata=trajectory_evidence_metadata([source_ref]),
+    )
+
+    assert plan.selected_trajectory_refs == ()
+    assert plan.correction_proposals[0].source_trajectory_id == "traj-failed-1"
+    assert plan.correction_proposals[0].task_id == "replay-task-1"
+    assert plan.correction_proposals[0].split.value == "replay"
+    assert plan.correction_proposals[0].actions[0].tool == "restart_service"
+
+
+def test_data_curator_cannot_bind_a_repair_to_an_unselected_source() -> None:
+    source_ref = "trajectory://train/traj-failed-1/train-task-1/verified"
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "LIVE",
+            "plan": {
+                "plan_id": "plan-repair-2",
+                "selected_trajectory_refs": [],
+                "target_failure_classes": ["premature_completion"],
+                "record_count": 0,
+                "evidence_class": "LIVE",
+                "correction_proposals": [
+                    {
+                        "source_trajectory_id": "traj-unselected",
+                        "task_id": "train-task-other",
+                        "split": "train",
+                        "actions": [{"tool": "restart_service", "arguments": {}}],
+                    }
+                ],
+            },
+        }
+    )
+
+    with pytest.raises(ProviderHandoffError, match="outside verified input references"):
+        AutonomousAgentAdapters(provider).curate(
+            [source_ref],
+            failure_clusters=[
+                FailureCluster(
+                    cluster_id="cluster-1",
+                    failure_type="premature_completion",
+                    description="failed before healthcheck",
+                    count=1,
+                    evidence_refs=[source_ref],
+                )
+            ],
+            verified_trajectory_metadata=trajectory_evidence_metadata([source_ref]),
+        )
+
+
+def test_training_designer_receives_plan_metadata_but_not_correction_actions() -> None:
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "EXPLANATION",
+            "config": {
+                "rank": 16,
+                "alpha": 32,
+                "dropout": 0.05,
+                "learning_rate": 0.0002,
+                "epochs": 2,
+                "sequence_length": 1024,
+                "batch_size": 2,
+                "gradient_accumulation_steps": 8,
+                "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            },
+        }
+    )
+    plan = CuratedDatasetPlan(
+        plan_id="plan-repair-3",
+        selected_trajectory_refs=[],
+        correction_proposals=(
+            CorrectionProposal(
+                source_trajectory_id="traj-failed-3",
+                task_id="replay-task-3",
+                split=ObjectiveSplit.REPLAY,
+                actions=(ToolCall(tool="restart_service", arguments={"service": "api"}),),
+            ),
+        ),
+        target_failure_classes=["premature_completion"],
+        record_count=0,
+        evidence_class="LIVE",
+    )
+
+    AutonomousAgentAdapters(provider).design_qlora(plan)
+
+    assert '"correction_proposals"' not in provider.prompts[0]
+    assert '"restart_service"' not in provider.prompts[0]
 
 
 def test_trajectory_metadata_is_opaque_in_prompt_contract() -> None:

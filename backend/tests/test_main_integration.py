@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import app.main as main_module
 from app.core.state import OptimizationRun
 from app.main import (
     _create_application_orchestrator,
@@ -76,6 +77,86 @@ async def test_main_exposes_comparison_and_telemetry_readiness() -> None:
 
 
 @pytest.mark.anyio
+async def test_health_exposes_build_provenance_and_shallow_objective_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        main_module.settings.model_copy(
+            update={"app_mode": "aws", "service_role": "coordinator"}
+        ),
+    )
+    monkeypatch.setenv("GIT_SHA", "a" * 40)
+    monkeypatch.setenv("BUILD_ID", "codebuild:build-123")
+    monkeypatch.setenv("IMAGE_DIGEST", "sha256:" + "b" * 64)
+    monkeypatch.setenv(
+        "OBJECTIVE_WORKER_URL",
+        "https://example.execute-api.us-east-1.amazonaws.com/v1/",
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/health")
+
+    assert response.status_code == 200
+    health = response.json()
+    assert health["build_info"] == {
+        "git_sha": "a" * 40,
+        "build_id": "codebuild:build-123",
+        "image_digest": "sha256:" + "b" * 64,
+    }
+    assert health["components"]["objective_worker"] == "configured"
+
+
+@pytest.mark.anyio
+async def test_health_does_not_claim_unconfigured_or_non_https_objective_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        main_module.settings.model_copy(
+            update={"app_mode": "aws", "service_role": "coordinator"}
+        ),
+    )
+    monkeypatch.delenv("OBJECTIVE_WORKER_URL", raising=False)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        unconfigured = await client.get("/health")
+        monkeypatch.setenv("OBJECTIVE_WORKER_URL", "http://objective.internal/v1/")
+        invalid = await client.get("/health")
+
+    assert unconfigured.json()["components"]["objective_worker"] == "not_configured"
+    assert invalid.json()["components"]["objective_worker"] == "invalid_configuration"
+
+
+@pytest.mark.anyio
+async def test_aws_mode_rejects_process_local_demo_mutations_but_keeps_comparison_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        main_module.settings.model_copy(update={"app_mode": "aws"}),
+    )
+    requests = (
+        ("POST", "/api/runs?target_model=google%2Ffunctiongemma-270m-it&base_checkpoint=local"),
+        ("POST", "/api/runs/demo/step"),
+        ("POST", "/api/runs/demo/auto"),
+        ("POST", "/api/runs/demo/cancel"),
+        ("POST", "/api/demo/reset-environment"),
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        responses = [await client.request(method, path) for method, path in requests]
+        comparison = await client.get("/api/runs/compare")
+
+    assert [response.status_code for response in responses] == [410] * len(requests)
+    assert all("/api/live/runs" in response.json()["detail"] for response in responses)
+    assert comparison.status_code == 200
+
+
+@pytest.mark.anyio
 async def test_objective_role_selects_only_authenticated_objective_routes() -> None:
     config = RuntimeConfig(
         _env_file=None,
@@ -88,13 +169,25 @@ async def test_objective_role_selects_only_authenticated_objective_routes() -> N
     objective_app = _select_application(config, app)
     paths = {getattr(route, "path", "") for route in objective_app.routes}
 
-    assert {"/health", "/v1/auth-probe", "/v1/benchmark", "/v1/verify-curation"} <= paths
+    assert {
+        "/health",
+        "/v1/health",
+        "/v1/auth-probe",
+        "/v1/readiness",
+        "/v1/benchmark",
+        "/v1/verify-curation",
+        "/v1/replay-corrections",
+    } <= paths
     assert "/api/runs" not in paths
 
     async with AsyncClient(
         transport=ASGITransport(app=objective_app), base_url="http://test"
     ) as client:
         health = await client.get("/health")
+        unauthenticated_v1_health = await client.get("/v1/health")
+        authenticated_v1_health = await client.get(
+            "/v1/health", headers={"Authorization": "Bearer objective-secret"}
+        )
         unauthorized = await client.get("/v1/auth-probe")
         authenticated = await client.get(
             "/v1/auth-probe", headers={"Authorization": "Bearer objective-secret"}
@@ -115,6 +208,8 @@ async def test_objective_role_selects_only_authenticated_objective_routes() -> N
         )
 
     assert health.status_code == 200
+    assert unauthenticated_v1_health.status_code == 401
+    assert authenticated_v1_health.status_code == 200
     assert unauthorized.status_code == 401
     assert authenticated.status_code == 200
     # Invalid split probes establish route+auth capability without running or

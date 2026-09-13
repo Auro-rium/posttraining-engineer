@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import os
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
@@ -32,11 +33,15 @@ from app.autonomous.repository import (
     RunNotFoundError,
 )
 from app.live_execution import (
+    SAGEMAKER_PHASES_PER_EXPERIMENT,
     ApprovalPacket,
     LiveExecutionBlocked,
     _decode_approval_token,
     config_from_environment,
 )
+
+logger = logging.getLogger(__name__)
+DISPATCH_RECOVERY_INTERVAL_SECONDS = 30.0
 
 
 class LiveAPIError(RuntimeError):
@@ -321,7 +326,16 @@ def _packet_and_state(
     }
     manifest_sha = manifest_sha or sha256(str(sorted(scope.items())).encode("utf-8")).hexdigest()
     now = issued_at or datetime.now(UTC)
-    ttl_seconds = int(getattr(config, "approval_ttl_seconds", 900))
+    ttl_seconds = int(getattr(config, "approval_ttl_seconds", 86400))
+    minimum_ttl_seconds = (
+        request.max_experiments
+        * SAGEMAKER_PHASES_PER_EXPERIMENT
+        * int(configured_values["max_runtime_seconds"])
+    )
+    if ttl_seconds < minimum_ttl_seconds:
+        raise LiveAPIError(
+            "configured approval window is shorter than the bounded experiment runtime"
+        )
     if request.expires_at is not None:
         if request.expires_at.tzinfo is None or request.expires_at.utcoffset() is None:
             raise LiveAPIError("approval expiry must include a timezone")
@@ -332,6 +346,10 @@ def _packet_and_state(
         raise LiveAPIError("approval expiry must be in the future")
     if expires - now > timedelta(seconds=ttl_seconds):
         raise LiveAPIError("approval expiry exceeds configured approval window")
+    if expires - now < timedelta(seconds=minimum_ttl_seconds):
+        raise LiveAPIError(
+            "approval expiry is shorter than the bounded training/evaluation window"
+        )
     packet = ApprovalPacket(
         run_id=run_id,
         run_number=request.run_number,
@@ -495,6 +513,42 @@ async def _schedule_dispatch(request: Request) -> None:
     tasks.add(task)
     task.add_done_callback(tasks.discard)
     await asyncio.sleep(0)
+
+
+def _live_task_set(app: Any) -> set[asyncio.Task[Any]]:
+    tasks = getattr(app.state, "live_tasks", None)
+    if tasks is None:
+        tasks = set()
+        app.state.live_tasks = tasks
+    return tasks
+
+
+async def _periodic_dispatch_recovery(app: Any) -> None:
+    """Recover durable queued/expired runs after startup and on a short cadence."""
+
+    dispatcher = getattr(app.state, "live_dispatcher", None)
+    recover = getattr(dispatcher, "recover_incomplete_runs", None)
+    if not callable(recover):
+        return
+    interval = float(
+        getattr(
+            app.state,
+            "live_recovery_interval_seconds",
+            DISPATCH_RECOVERY_INTERVAL_SECONDS,
+        )
+    )
+    if interval <= 0:
+        raise ValueError("live recovery interval must be positive")
+    while True:
+        try:
+            await _call(recover)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Keep recovery alive, but do not put provider exception details or
+            # payloads in logs. Durable state and telemetry remain authoritative.
+            logger.warning("periodic autonomous dispatcher recovery failed")
+        await asyncio.sleep(interval)
 
 
 @router.post("/runs/prepare", status_code=status.HTTP_201_CREATED)
@@ -840,11 +894,23 @@ def install_autonomous_live_api(app: Any) -> None:
         if dispatcher is not None and callable(
             getattr(dispatcher, "recover_incomplete_runs", None)
         ):
-            await _call(dispatcher.recover_incomplete_runs)
+            tasks = _live_task_set(app)
+            if getattr(app.state, "live_recovery_task", None) is None:
+                task = asyncio.create_task(
+                    _periodic_dispatch_recovery(app),
+                    name="autonomous-live-periodic-recovery",
+                )
+                app.state.live_recovery_task = task
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+                # Start the first scan promptly without blocking ASGI startup
+                # on a long-running recovered experiment.
+                await asyncio.sleep(0)
 
     @app.on_event("shutdown")  # type: ignore[untyped-decorator]
     async def _shutdown_live_runs() -> None:
         tasks = list(getattr(app.state, "live_tasks", set()))
+        app.state.live_recovery_task = None
         for task in tasks:
             task.cancel()
         if tasks:

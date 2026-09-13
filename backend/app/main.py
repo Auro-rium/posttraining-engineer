@@ -5,10 +5,12 @@ Updated for AWS Agents for Humans Hackathon with Strands Agents.
 
 import logging
 import math
+import os
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from threading import Lock
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import uvicorn
@@ -113,7 +115,9 @@ def _create_run_registry(config: Any) -> RunRegistry:
 
 def _create_objective_application(config: Any) -> FastAPI:
     """Build the authenticated objective service with durable S3 artifacts."""
-
+    # Production objective containers run scripts.start_backend before Uvicorn;
+    # that entrypoint materializes the exact pinned checkpoint once. Do not
+    # repeat the download while importing ``app.main`` to construct the ASGI app.
     bucket = getattr(config, "s3_artifact_bucket", None)
     auth_token = getattr(config, "objective_auth_token", None)
     if not isinstance(bucket, str) or not bucket.strip():
@@ -125,11 +129,19 @@ def _create_objective_application(config: Any) -> FastAPI:
     )
     execution_adapter = build_benchmark_execution_adapter(
         {
+            "AWS_REGION": getattr(config, "aws_region", ""),
             "OBJECTIVE_MODEL_CHECKPOINT_DIR": (
                 getattr(config, "objective_model_checkpoint_dir", None) or ""
             ),
             "OBJECTIVE_MODEL_REVISION": getattr(config, "objective_model_revision", None) or "",
-            "OBJECTIVE_MODEL_SHA256": getattr(config, "objective_model_sha256", None) or "",
+            "OBJECTIVE_MODEL_SHA256": (
+                getattr(config, "objective_model_sha256", None)
+                or os.environ.get("OBJECTIVE_MODEL_SHA256", "")
+            ),
+            "OBJECTIVE_BASE_MODEL_URI": (getattr(config, "objective_base_model_uri", None) or ""),
+            "OBJECTIVE_BASE_MODEL_SHA256": (
+                getattr(config, "objective_base_model_sha256", None) or ""
+            ),
         }
     )
     return create_objective_app(
@@ -211,6 +223,16 @@ registry_settings = (
 )
 app.state.run_registry = _create_run_registry(registry_settings)
 app.state.telemetry = TelemetryRecorder()
+
+
+def _require_local_demo_mode() -> None:
+    """Prevent process-local demo mutations from masquerading as AWS runs."""
+
+    if settings.app_mode == "aws":
+        raise HTTPException(
+            status_code=410,
+            detail="Process-local demo mutations are disabled in AWS mode; use /api/live/runs",
+        )
 app.state.run_numbers = {}
 app.state.live_repository = None
 app.state.live_supervisor = None
@@ -314,6 +336,33 @@ def _record_phase_telemetry(
         )
 
 
+def _objective_worker_health_status() -> str:
+    """Report configured endpoint presence without making a provider call."""
+
+    if settings.service_role == "objective":
+        return "self"
+    endpoint = os.environ.get("OBJECTIVE_WORKER_URL", "").strip()
+    if not endpoint:
+        return "not_configured"
+    try:
+        parsed = urlsplit(endpoint)
+        if parsed.scheme == "https" and parsed.hostname and not parsed.username:
+            return "configured"
+    except ValueError:
+        pass
+    return "invalid_configuration"
+
+
+def _build_info() -> dict[str, str | None]:
+    """Expose injected image provenance; absent values remain explicitly unknown."""
+
+    return {
+        "git_sha": os.environ.get("GIT_SHA", "").strip() or None,
+        "build_id": os.environ.get("BUILD_ID", "").strip() or None,
+        "image_digest": os.environ.get("IMAGE_DIGEST", "").strip() or None,
+    }
+
+
 @app.get("/health")
 async def health_check() -> JSONResponse:
     """Health check endpoint."""
@@ -327,6 +376,7 @@ async def health_check() -> JSONResponse:
             "aws_region": settings.aws_region,
             "reasoning_model": settings.strands_model,
             "target_model": settings.target_model,
+            "build_info": _build_info(),
             "timestamp": datetime.utcnow().isoformat(),
             "components": {
                 "orchestrator": "ready",
@@ -334,7 +384,7 @@ async def health_check() -> JSONResponse:
                 "sagemaker_provider": (
                     "configured" if settings.app_mode == "aws" else "not_configured"
                 ),
-                "objective_worker": "not_configured",
+                "objective_worker": _objective_worker_health_status(),
                 "environment": "available",
                 "run_history": "ready",
                 "telemetry": "ready",
@@ -373,6 +423,7 @@ async def create_optimization_run(
         objective: Optimization objective
         budget: Resource constraints
     """
+    _require_local_demo_mode()
     try:
         # Apply the deployment's hard budget defaults and reject request-level
         # values that would widen them.  This keeps the HTTP boundary aligned
@@ -489,6 +540,7 @@ async def execute_next_step(run_id: str) -> JSONResponse:
     Args:
         run_id: The optimization run identifier
     """
+    _require_local_demo_mode()
     if run_id not in active_runs:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
@@ -542,6 +594,7 @@ async def execute_auto_workflow(
     Args:
         run_id: The optimization run identifier
     """
+    _require_local_demo_mode()
     if run_id not in active_runs:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
@@ -660,6 +713,7 @@ async def cancel_run(run_id: str) -> JSONResponse:
     Args:
         run_id: The optimization run identifier
     """
+    _require_local_demo_mode()
     if run_id not in active_runs:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
@@ -685,6 +739,7 @@ async def reset_environment() -> JSONResponse:
     """
     Reset the service recovery environment for demonstration purposes.
     """
+    _require_local_demo_mode()
     try:
         env = create_service_recovery_environment("demo-env-001")
         observation = env.reset()

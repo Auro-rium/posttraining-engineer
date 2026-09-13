@@ -7,11 +7,12 @@ SageMaker jobs, or otherwise perform an execution-side effect.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from aws_cdk import Arn, CfnOutput, Duration, RemovalPolicy, Stack, Tags
+from aws_cdk import Arn, CfnOutput, Duration, RemovalPolicy, Stack, Tags, Token
 from aws_cdk import aws_certificatemanager as acm
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
@@ -81,6 +82,10 @@ class PostTrainingStack(Stack):
 
         configured = self._text(name)
         if not configured:
+            if require_version:
+                raise ValueError(
+                    f"{name} must be explicitly configured with an immutable versionId"
+                )
             return f"s3://{bucket.bucket_name}/{prefix}/{suffix}"
         parsed = urlparse(configured)
         expected_bucket = self._text("artifact_bucket_name")
@@ -96,8 +101,9 @@ class PostTrainingStack(Stack):
             raise ValueError(
                 f"{name} must target the configured artifact bucket and prefix"
             )
-        if require_version and not parse_qs(parsed.query).get("versionId"):
-            raise ValueError(f"{name} must include an immutable versionId")
+        version_ids = parse_qs(parsed.query).get("versionId", [])
+        if require_version and (len(version_ids) != 1 or not version_ids[0]):
+            raise ValueError(f"{name} must include exactly one immutable versionId")
         return configured
 
     def _require_https_url(self, value: str) -> None:
@@ -111,6 +117,38 @@ class PostTrainingStack(Stack):
             value,
         ):
             raise ValueError("objective_certificate_arn must be a valid ACM certificate ARN")
+
+    def _coordinator_ingress_ipv4_cidrs(self) -> tuple[str, ...]:
+        """Require a narrow, explicit IPv4 allowlist for the public API ALB."""
+
+        raw = self._text("coordinator_ingress_cidrs").strip()
+        if not raw:
+            raise ValueError(
+                "coordinator_ingress_cidrs must explicitly allow the demo operator's IPv4 CIDR"
+            )
+        networks: set[str] = set()
+        for item in raw.split(","):
+            candidate = item.strip()
+            if "/" not in candidate:
+                raise ValueError(
+                    "coordinator_ingress_cidrs must contain valid IPv4 CIDRs"
+                )
+            try:
+                network = ipaddress.ip_network(candidate, strict=True)
+            except ValueError as exc:
+                raise ValueError(
+                    "coordinator_ingress_cidrs must contain valid IPv4 CIDRs"
+                ) from exc
+            if not isinstance(network, ipaddress.IPv4Network):
+                raise ValueError(
+                    "coordinator_ingress_cidrs must contain valid IPv4 CIDRs"
+                )
+            if network.prefixlen < 16:
+                raise ValueError(
+                    "coordinator_ingress_cidrs must be IPv4 networks with prefix /16 or narrower"
+                )
+            networks.add(str(network))
+        return tuple(sorted(networks))
 
     def _private_dns_contract(self) -> tuple[str, str]:
         """Validate the private DNS and certificate SAN contract.
@@ -155,10 +193,82 @@ class PostTrainingStack(Stack):
             )
         return hostname, zone_name
 
+    def _coordinator_public_dns_contract(self) -> tuple[str, str, str]:
+        """Require a public hostname and matching operator-supplied certificate SAN.
+
+        ACM certificate SANs and imported hosted-zone visibility cannot be
+        inspected during synthesis. The SAN and explicitly named public zone
+        are therefore deployment contracts, just as the zone ID is an
+        operator-supplied reference to the public Route 53 zone.
+        """
+
+        hostname = self._text("coordinator_public_dns_name").strip().rstrip(".").lower()
+        zone_name = (
+            self._text("coordinator_public_hosted_zone_name")
+            .strip()
+            .rstrip(".")
+            .lower()
+        )
+        zone_id = self._text("coordinator_public_hosted_zone_id").strip()
+        certificate_san = self._text("coordinator_certificate_san").strip().rstrip(".").lower()
+        label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        hostname_pattern = re.compile(rf"^(?:{label})(?:\.(?:{label})){{0,126}}$")
+        if not hostname or not hostname_pattern.fullmatch(hostname):
+            raise ValueError("coordinator_public_dns_name must be a valid DNS hostname")
+        if not zone_name or not hostname_pattern.fullmatch(zone_name):
+            raise ValueError(
+                "coordinator_public_hosted_zone_name must be a valid DNS hostname"
+            )
+        if not re.fullmatch(r"Z[A-Z0-9]+", zone_id):
+            raise ValueError(
+                "coordinator_public_hosted_zone_id must be a Route 53 zone ID"
+            )
+        san_to_validate = certificate_san.removeprefix("*.")
+        if not certificate_san or not hostname_pattern.fullmatch(san_to_validate):
+            raise ValueError("coordinator_certificate_san must be a valid DNS SAN")
+        if hostname != zone_name and not hostname.endswith("." + zone_name):
+            raise ValueError(
+                "coordinator_public_dns_name must be within coordinator_public_hosted_zone_name"
+            )
+        if certificate_san.startswith("*."):
+            wildcard_suffix = certificate_san[2:]
+            san_matches = (
+                hostname.endswith("." + wildcard_suffix)
+                and hostname.count(".") == wildcard_suffix.count(".") + 1
+            )
+        else:
+            san_matches = hostname == certificate_san
+        if not san_matches:
+            raise ValueError(
+                "coordinator_public_dns_name must match coordinator_certificate_san"
+            )
+        return hostname, zone_name, zone_id
+
     def __init__(self, scope: Construct, construct_id: str, **kwargs: Any) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         prefix = self._text("artifact_prefix", "post-training").strip("/") or "post-training"
+        coordinator_ingress_cidrs = self._coordinator_ingress_ipv4_cidrs()
+        coordinator_certificate_arn = self._text("coordinator_certificate_arn").strip()
+        if not coordinator_certificate_arn:
+            raise ValueError(
+                "coordinator_certificate_arn is required for the public HTTPS API"
+            )
+        self._require_certificate_arn(coordinator_certificate_arn)
+        certificate_region = coordinator_certificate_arn.split(":")[3]
+        if (
+            self.region
+            and not Token.is_unresolved(self.region)
+            and certificate_region != self.region
+        ):
+            raise ValueError(
+                "coordinator_certificate_arn must be in the stack's AWS region"
+            )
+        (
+            coordinator_dns_name,
+            coordinator_zone_name,
+            coordinator_zone_id,
+        ) = self._coordinator_public_dns_contract()
         target_model = self._text("target_model", "google/functiongemma-270m-it")
         reasoning_model = self._text("strands_model", "nvidia.nemotron-super-3-120b")
         objective_suite = self._text("objective_suite", "AgentGym/AgentEval")
@@ -257,6 +367,33 @@ class PostTrainingStack(Stack):
                 "objective_worker_url or objective_certificate_arn is required"
             )
         internal_objective = not objective_worker_url
+        objective_checkpoint_uri = ""
+        objective_checkpoint_revision = ""
+        objective_checkpoint_sha256 = ""
+        if internal_objective:
+            objective_checkpoint_uri = self._artifact_uri(
+                "checkpoint_s3_uri",
+                bucket=artifacts,
+                prefix=prefix,
+                suffix="checkpoints/base.tar.gz",
+                require_version=True,
+            )
+            objective_checkpoint_revision = self._text("hf_revision")
+            objective_checkpoint_sha256 = self._text("checkpoint_sha256")
+            uri = urlparse(objective_checkpoint_uri)
+            version_ids = parse_qs(uri.query).get("versionId", [])
+            if not version_ids or not version_ids[0]:
+                raise ValueError(
+                    "internal objective worker requires a version-pinned checkpoint_s3_uri"
+                )
+            if not re.fullmatch(r"[0-9a-f]{40}", objective_checkpoint_revision):
+                raise ValueError(
+                    "internal objective worker requires hf_revision as a lowercase commit SHA"
+                )
+            if not re.fullmatch(r"[0-9a-f]{64}", objective_checkpoint_sha256):
+                raise ValueError(
+                    "internal objective worker requires checkpoint_sha256 from checkpoint handoff"
+                )
 
         vpc = ec2.Vpc(self, "RuntimeVpc", max_azs=2, nat_gateways=1)
         cluster = ecs.Cluster(self, "RuntimeCluster", vpc=vpc, container_insights=True)
@@ -364,6 +501,17 @@ class PostTrainingStack(Stack):
                     "sagemaker:StopProcessingJob",
                     "sagemaker:StopTrainingJob",
                 ],
+                resources=[
+                    f"arn:{self.partition}:sagemaker:{self.region}:{self.account}:processing-job/*",
+                    f"arn:{self.partition}:sagemaker:{self.region}:{self.account}:training-job/*",
+                ],
+                conditions={"StringEquals": {"sagemaker:ResourceTag/project": project}},
+            )
+        )
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ListTagsForTaggedSageMakerJobs",
+                actions=["sagemaker:ListTags"],
                 resources=[
                     f"arn:{self.partition}:sagemaker:{self.region}:{self.account}:processing-job/*",
                     f"arn:{self.partition}:sagemaker:{self.region}:{self.account}:training-job/*",
@@ -517,8 +665,8 @@ class PostTrainingStack(Stack):
             objective_task_definition = ecs.FargateTaskDefinition(
                 self,
                 "ObjectiveTaskDefinition",
-                cpu=512,
-                memory_limit_mib=1024,
+                cpu=2048,
+                memory_limit_mib=4096,
                 task_role=objective_role,
                 execution_role=objective_execution_role,
             )
@@ -533,6 +681,13 @@ class PostTrainingStack(Stack):
                     "SERVICE_ROLE": "objective",
                     "AWS_REGION": self.region or "us-east-1",
                     "TARGET_MODEL": target_model,
+                    "OBJECTIVE_MODEL_CHECKPOINT_DIR": self._text(
+                        "objective_model_checkpoint_dir", "/opt/models/functiongemma"
+                    ),
+                    "OBJECTIVE_MODEL_REVISION": objective_checkpoint_revision,
+                    "OBJECTIVE_MODEL_SHA256": self._text("objective_model_sha256"),
+                    "OBJECTIVE_BASE_MODEL_URI": objective_checkpoint_uri,
+                    "OBJECTIVE_BASE_MODEL_SHA256": objective_checkpoint_sha256,
                     "OBJECTIVE_SUITE": objective_suite,
                     "OBJECTIVE_SUITE_VERSION": objective_suite_version,
                     "S3_ARTIFACT_BUCKET": artifacts.bucket_name,
@@ -624,18 +779,51 @@ class PostTrainingStack(Stack):
             },
             port_mappings=[ecs.PortMapping(container_port=8080)],
         )
-        service = ecs.FargateService(
+        requested_coordinator_count = int(self._context("desired_count", 1))
+        if requested_coordinator_count < 0:
+            raise ValueError("desired_count must be zero or greater")
+        bootstrap_without_tasks = requested_coordinator_count == 0
+        coordinator = ecs_patterns.ApplicationLoadBalancedFargateService(
             self,
-            "RuntimeService",
+            "CoordinatorService",
             cluster=cluster,
             task_definition=task_definition,
-            desired_count=int(self._context("desired_count", 1)),
+            # The pattern rejects zero even though ECS itself supports a
+            # zero-desired-count service. Build its constructs with one, then
+            # override the CloudFormation service so bootstrap deploys cannot
+            # start a coordinator task before immutable image digests exist.
+            desired_count=max(requested_coordinator_count, 1),
+            public_load_balancer=True,
             assign_public_ip=False,
             security_groups=[coordinator_security_group],
             health_check_grace_period=Duration.seconds(60),
+            listener_port=443,
+            open_listener=False,
+            protocol=elbv2.ApplicationProtocol.HTTPS,
+            certificate=acm.Certificate.from_certificate_arn(
+                self, "CoordinatorCertificate", coordinator_certificate_arn
+            ),
+            domain_name=coordinator_dns_name,
+            domain_zone=route53.HostedZone.from_hosted_zone_attributes(
+                self,
+                "CoordinatorPublicHostedZone",
+                hosted_zone_id=coordinator_zone_id,
+                zone_name=coordinator_zone_name,
+            ),
         )
+        if bootstrap_without_tasks:
+            coordinator.service.node.default_child.add_override(
+                "Properties.DesiredCount", 0
+            )
+        coordinator.target_group.configure_health_check(path="/health", port="8080")
+        for cidr in coordinator_ingress_cidrs:
+            coordinator.load_balancer.connections.allow_from(
+                ec2.Peer.ipv4(cidr),
+                ec2.Port.tcp(443),
+                "Allow the explicitly configured demo operator CIDR",
+            )
         if objective_service is not None:
-            service.connections.allow_to(
+            coordinator.service.connections.allow_to(
                 objective_service.load_balancer,
                 ec2.Port.tcp(443),
                 "Allow the coordinator to call the internal objective worker",
@@ -675,7 +863,15 @@ class PostTrainingStack(Stack):
         CfnOutput(self, "TrainerRepositoryUri", value=trainer_repository.repository_uri)
         CfnOutput(self, "EvaluatorRepositoryUri", value=evaluator_repository.repository_uri)
         CfnOutput(self, "ClusterName", value=cluster.cluster_name)
-        CfnOutput(self, "ServiceName", value=service.service_name)
+        CfnOutput(self, "ServiceName", value=coordinator.service.service_name)
+        CfnOutput(
+            self,
+            "CoordinatorUrl",
+            value="https://" + coordinator_dns_name,
+            description=(
+                "HTTPS coordinator API, reachable only from the configured IPv4 CIDR allowlist"
+            ),
+        )
         CfnOutput(
             self,
             "ObjectiveWorkerUrl",
@@ -759,7 +955,7 @@ class PostTrainingStack(Stack):
             "LIVE_APPROVAL_SECRET_ENV": self._text(
                 "approval_secret_env", "LIVE_APPROVAL_SECRET"
             ),
-            "LIVE_APPROVAL_TTL_SECONDS": self._text("approval_ttl_seconds", "900"),
+            "LIVE_APPROVAL_TTL_SECONDS": self._text("approval_ttl_seconds", "86400"),
             "MAX_EXPERIMENTS": self._text("max_experiments", "5"),
             "MAX_COST_USD": self._text("max_cost_usd", "25"),
             "MAX_TRAINING_TIME_MIN": self._text("max_training_time_min", "120"),

@@ -11,8 +11,8 @@ WORKDIR /srv/backend
 
 RUN addgroup --system app \
     && adduser --system --ingroup app app \
-    && mkdir -p /data/artifacts \
-    && chown -R app:app /data/artifacts
+    && mkdir -p /data/artifacts /opt/models \
+    && chown -R app:app /data/artifacts /opt/models
 
 COPY pyproject.toml uv.lock README.md ./
 RUN pip install --no-cache-dir uv \
@@ -22,10 +22,12 @@ COPY app ./app
 COPY prompts ./prompts
 # Reuse the strict FunctionGemma checkpoint validator in the objective role.
 COPY scripts/stage_functiongemma_checkpoint.py ./scripts/stage_functiongemma_checkpoint.py
+COPY scripts/bootstrap_objective_checkpoint.py ./scripts/bootstrap_objective_checkpoint.py
+COPY scripts/start_backend.py ./scripts/start_backend.py
 RUN uv sync --frozen --no-dev --extra cloud --extra objective
 
 ENV PATH="/srv/backend/.venv/bin:${PATH}"
 USER app
 EXPOSE 8080
 
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["python", "-m", "scripts.start_backend"]

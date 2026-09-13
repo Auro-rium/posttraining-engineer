@@ -23,6 +23,7 @@ cloud = [
   "opentelemetry-exporter-otlp>=1.39,<2",
 ]
 objective = [
+  "peft>=0.15,<1",
   "safetensors>=0.4.5,<1",
   "torch>=2.6,<3",
   "transformers>=4.52,<5",

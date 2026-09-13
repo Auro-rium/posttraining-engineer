@@ -127,7 +127,6 @@ def test_gated_incomplete_and_cache_lock_inputs_are_rejected(tmp_path: Path) -> 
     ("filename", "flag", "value"),
     [
         ("config.json", "private", "true"),
-        ("tokenizer.json", "access_restricted", "1"),
         ("tokenizer_config.json", "gated", "yes"),
         ("metadata.json", "private", "on"),
     ],
@@ -140,6 +139,21 @@ def test_truthy_restricted_json_flags_are_rejected(
 
     with pytest.raises(CheckpointStagingError, match="gated/private/restricted"):
         validate_checkpoint_directory(checkpoint, revision=REVISION)
+
+
+def test_tokenizer_vocab_words_are_not_treated_as_access_flags(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "model": {"vocab": {"private": 7, "access_restricted": 8}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    validate_checkpoint_directory(checkpoint, revision=REVISION)
 
 
 def test_nested_cache_refs_locks_and_symlink_roots_are_rejected(tmp_path: Path) -> None:

@@ -14,8 +14,13 @@ import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import parse_qs, unquote, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.posttraining.models import ArtifactReference
+from app.posttraining.models import EvidenceLabel as EvidenceLabel
+from app.posttraining.run_history import BenchmarkMetrics
 
 ALLOWED_TOOLS: tuple[str, ...] = (
     "get_logs",
@@ -113,6 +118,8 @@ class Trajectory(ContractModel):
     success: bool
     done: bool
     verified: bool = False
+    verifier_success: bool | None = None
+    repaired_from_trajectory_id: str | None = None
 
     @model_validator(mode="after")
     def validate_steps(self) -> Trajectory:
@@ -120,6 +127,14 @@ class Trajectory(ContractModel):
             raise ValueError("trajectory steps must be ordered from one")
         if self.split is ObjectiveSplit.HIDDEN:
             raise ValueError("hidden trajectories cannot cross the objective boundary")
+        if self.repaired_from_trajectory_id is not None:
+            if (
+                not _TRAJECTORY_IDENTIFIER.fullmatch(self.repaired_from_trajectory_id)
+                or self.repaired_from_trajectory_id.lower() == "unknown"
+            ):
+                raise ValueError("repair source must be a path-safe trajectory identifier")
+            if self.repaired_from_trajectory_id == self.trajectory_id:
+                raise ValueError("a trajectory cannot repair itself")
         return self
 
 
@@ -140,6 +155,12 @@ class ObjectiveReadinessResponse(ContractModel):
     status: Literal["ready", "blocked"]
     service: Literal["objective-worker"] = "objective-worker"
     model_id: Literal["google/functiongemma-270m-it"] = "google/functiongemma-270m-it"
+    configuration_ready: bool
+    checkpoint_ready: bool
+    model_load_ready: bool
+    generation_ready: bool
+    artifact_store_ready: bool
+    execution_ready: bool
     capabilities: ObjectiveWorkerCapabilities
     blockers: tuple[
         Literal[
@@ -147,19 +168,37 @@ class ObjectiveReadinessResponse(ContractModel):
             "checkpoint_unverified",
             "inference_runtime_unavailable",
             "artifact_store_incomplete",
+            "model_identity_unavailable",
+            "model_load_not_verified",
+            "generation_not_verified",
         ],
         ...,
     ] = Field(default_factory=tuple)
 
     @model_validator(mode="after")
     def status_matches_capabilities(self) -> ObjectiveReadinessResponse:
+        observed_execution_ready = all(
+            (
+                self.configuration_ready,
+                self.checkpoint_ready,
+                self.model_load_ready,
+                self.generation_ready,
+                self.artifact_store_ready,
+            )
+        )
+        if self.execution_ready != observed_execution_ready:
+            raise ValueError("execution readiness must match its component attestations")
         capabilities_ready = self.capabilities.benchmark and self.capabilities.verify_curation
-        if self.status == "ready" and (not capabilities_ready or self.blockers):
+        if self.status == "ready" and (
+            not capabilities_ready or self.blockers or not self.execution_ready
+        ):
             raise ValueError("ready status requires both capabilities and no blockers")
-        if self.status == "blocked" and (capabilities_ready and not self.blockers):
+        if self.status == "blocked" and (
+            capabilities_ready and not self.blockers and self.execution_ready
+        ):
             raise ValueError("blocked status requires a missing capability or blocker")
-        if not capabilities_ready and not self.blockers:
-            raise ValueError("blocked capabilities require a blocker")
+        if (not capabilities_ready or not self.execution_ready) and not self.blockers:
+            raise ValueError("blocked readiness requires a blocker")
         return self
 
 
@@ -178,7 +217,24 @@ class DatasetRow(ContractModel):
     messages: tuple[dict[str, Any], ...] = Field(min_length=1)
     failure_label: str = Field(min_length=1)
     verifier_confirmed: bool
+    verifier_success: bool
+    repaired_from_trajectory_id: str | None = None
     source_type: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_successful_verifier_target(self) -> DatasetRow:
+        if not self.verifier_confirmed or not self.verifier_success:
+            raise ValueError("SFT rows require verifier-confirmed successful outcomes")
+        if (self.source_type == "repaired_replay") != (
+            self.repaired_from_trajectory_id is not None
+        ):
+            raise ValueError("repair lineage must match the dataset row source type")
+        if self.repaired_from_trajectory_id is not None and (
+            not _TRAJECTORY_IDENTIFIER.fullmatch(self.repaired_from_trajectory_id)
+            or self.repaired_from_trajectory_id.lower() == "unknown"
+        ):
+            raise ValueError("repair source must be a path-safe trajectory identifier")
+        return self
 
     def canonical_json(self) -> str:
         return json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
@@ -226,9 +282,39 @@ class Dataset(ContractModel):
 
 
 class BenchmarkRequest(ContractModel):
+    """Wire contract accepted from the autonomous coordinator.
+
+    ``task_ids`` remains an internal/legacy test hook. Live callers specify an
+    episode count; the worker derives stable task IDs from the immutable run
+    scope so a retry measures the same tasks.
+    """
+
     run_id: str = Field(min_length=1)
+    model_uri: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    suite: str = Field(default="service-recovery", min_length=1)
+    suite_version: str = Field(default="service-recovery-v1", min_length=1)
+    seed: int | None = None
+    num_episodes: int | None = Field(default=None, ge=1, le=100)
     split: ObjectiveSplit = ObjectiveSplit.TRAIN
-    task_ids: tuple[str, ...] = Field(default=("train-001",), min_length=1, max_length=100)
+    task_ids: tuple[str, ...] | None = Field(default=None, min_length=1, max_length=100)
+    output_s3_uri: str | None = None
+
+    @field_validator("model_uri")
+    @classmethod
+    def require_immutable_model_uri(cls, value: str) -> str:
+        parsed = urlparse(value)
+        versions = parse_qs(parsed.query).get("versionId", [])
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or not parsed.path
+            or len(versions) != 1
+            or not versions[0]
+            or versions[0].strip().lower() == "null"
+        ):
+            raise ValueError("model_uri must be an immutable S3 object version")
+        return value
 
     @field_validator("split")
     @classmethod
@@ -237,12 +323,62 @@ class BenchmarkRequest(ContractModel):
             raise ValueError(f"split {value.value!r} is outside the train/replay scope")
         return value
 
+    @field_validator("output_s3_uri")
+    @classmethod
+    def require_s3_output_scope(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        parsed = urlparse(value)
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or not parsed.path.strip("/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("output_s3_uri must be an S3 prefix without query or fragment")
+        path = unquote(parsed.path.lstrip("/"))
+        if any(not item or item in {".", ".."} for item in path.split("/")):
+            raise ValueError("output_s3_uri contains an unsafe path")
+        return value
+
     @field_validator("task_ids")
     @classmethod
     def require_unique_task_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(set(value)) != len(value):
+        if value is not None and len(set(value)) != len(value):
             raise ValueError("task_ids must be unique")
         return value
+
+    @model_validator(mode="after")
+    def resolve_episode_scope(self) -> BenchmarkRequest:
+        if self.task_ids is None and self.num_episodes is None:
+            raise ValueError("num_episodes is required")
+        if self.task_ids is not None:
+            if self.num_episodes is not None and len(self.task_ids) != self.num_episodes:
+                raise ValueError("task_ids count must match num_episodes")
+            object.__setattr__(self, "num_episodes", len(self.task_ids))
+            return self
+        if self.seed is None:
+            raise ValueError("seed is required when task_ids are derived from num_episodes")
+
+        digest = hashlib.sha256(
+            f"{self.run_id}:{self.suite}:{self.suite_version}:{self.seed}:{self.split.value}".encode()
+        ).hexdigest()[:16]
+        object.__setattr__(
+            self,
+            "task_ids",
+            tuple(
+                f"{self.split.value}-{digest}-{index:03d}"
+                for index in range(1, int(self.num_episodes or 0) + 1)
+            ),
+        )
+        return self
+
+    @property
+    def execution_task_ids(self) -> tuple[str, ...]:
+        """Stable task IDs consumed by the execution adapter."""
+
+        return self.task_ids or ()
 
 
 class TrajectoryReference(ContractModel):
@@ -262,6 +398,133 @@ class TrajectoryReference(ContractModel):
     def public_reference_only(self) -> TrajectoryReference:
         if self.split is ObjectiveSplit.HIDDEN:
             raise ValueError("hidden trajectory references cannot cross the objective boundary")
+        return self
+
+
+class CorrectionProposal(ContractModel):
+    """Untrusted action proposal tied to one public failed trajectory."""
+
+    source_trajectory_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    split: ObjectiveSplit
+    actions: tuple[ToolCall, ...] = Field(min_length=1, max_length=10)
+
+    @field_validator("source_trajectory_id")
+    @classmethod
+    def require_stored_trajectory_identifier(cls, value: str) -> str:
+        if not _TRAJECTORY_IDENTIFIER.fullmatch(value) or value.lower() == "unknown":
+            raise ValueError("correction source must be a path-safe trajectory identifier")
+        return value
+
+    @field_validator("split")
+    @classmethod
+    def correction_scope_only(cls, value: ObjectiveSplit) -> ObjectiveSplit:
+        if value not in {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}:
+            raise ValueError("correction proposal scope is limited to train and replay")
+        return value
+
+    @model_validator(mode="after")
+    def action_arguments_are_allowlisted(self) -> CorrectionProposal:
+        allowed_arguments = {
+            "get_logs": {"service"},
+            "inspect_service": {"service"},
+            "read_config": {"service"},
+            "edit_config": {"service", "content"},
+            "restart_service": {"service"},
+            "run_healthcheck": {"service"},
+        }
+        for action in self.actions:
+            if set(action.arguments).difference(allowed_arguments[action.tool]):
+                raise ValueError("correction action contains unrecognized arguments")
+            if any(not isinstance(value, str) for value in action.arguments.values()):
+                raise ValueError("correction action arguments must be strings")
+        return self
+
+    @property
+    def proposal_id(self) -> str:
+        """Stable, content-derived ID used only to correlate a replay response."""
+
+        payload = json.dumps(
+            self.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        )
+        return "correction-" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
+class CorrectionReplayRequest(ContractModel):
+    run_id: str = Field(min_length=1)
+    experiment_id: str = Field(min_length=1)
+    split: ObjectiveSplit
+    proposals: tuple[CorrectionProposal, ...] = Field(min_length=1, max_length=100)
+
+    @field_validator("split")
+    @classmethod
+    def replay_scope_only(cls, value: ObjectiveSplit) -> ObjectiveSplit:
+        if value not in {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}:
+            raise ValueError("correction replay scope is limited to train and replay")
+        return value
+
+    @model_validator(mode="after")
+    def proposals_match_scope_and_are_unique(self) -> CorrectionReplayRequest:
+        if any(proposal.split is not self.split for proposal in self.proposals):
+            raise ValueError("correction proposal split does not match replay scope")
+        if len({proposal.proposal_id for proposal in self.proposals}) != len(self.proposals):
+            raise ValueError("correction proposals must be unique")
+        return self
+
+
+class CorrectionReplayOutcome(ContractModel):
+    proposal_id: str = Field(min_length=1)
+    source_trajectory_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    split: ObjectiveSplit
+    status: Literal["PASS", "REJECTED"]
+    reason: Literal["replay_passed", "replay_failed", "invalid_correction"]
+    trajectory_reference: TrajectoryReference | None = None
+
+    @field_validator("split")
+    @classmethod
+    def outcome_scope_only(cls, value: ObjectiveSplit) -> ObjectiveSplit:
+        if value not in {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}:
+            raise ValueError("correction replay outcome scope is limited to train and replay")
+        return value
+
+    @model_validator(mode="after")
+    def pass_requires_verified_reference(self) -> CorrectionReplayOutcome:
+        reference = self.trajectory_reference
+        if self.status == "PASS":
+            if self.reason != "replay_passed" or reference is None:
+                raise ValueError("passed correction requires successful replay provenance")
+            if (
+                not reference.verified
+                or reference.trajectory_id == self.source_trajectory_id
+                or reference.task_id != self.task_id
+                or reference.split is not self.split
+            ):
+                raise ValueError("passed correction reference does not match replay provenance")
+        elif self.reason == "replay_passed" or reference is not None:
+            raise ValueError("rejected correction cannot expose an admitted trajectory")
+        return self
+
+
+class CorrectionReplayResponse(ContractModel):
+    run_id: str = Field(min_length=1)
+    experiment_id: str = Field(min_length=1)
+    split: ObjectiveSplit
+    outcomes: tuple[CorrectionReplayOutcome, ...]
+
+    @field_validator("split")
+    @classmethod
+    def response_scope_only(cls, value: ObjectiveSplit) -> ObjectiveSplit:
+        if value not in {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}:
+            raise ValueError("correction replay response scope is limited to train and replay")
+        return value
+
+    @model_validator(mode="after")
+    def outcomes_match_scope(self) -> CorrectionReplayResponse:
+        if any(outcome.split is not self.split for outcome in self.outcomes):
+            raise ValueError("correction replay outcome split does not match request")
+        if len({outcome.proposal_id for outcome in self.outcomes}) != len(self.outcomes):
+            raise ValueError("correction replay outcomes must have unique proposal IDs")
         return self
 
 
@@ -299,13 +562,45 @@ def decode_trajectory_reference(value: str) -> TrajectoryReference:
 
 
 class BenchmarkResponse(ContractModel):
+    """Typed result wire-compatible with the coordinator's evidence model."""
+
     benchmark_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
+    suite: str = Field(min_length=1)
+    suite_version: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    seed: int
     split: ObjectiveSplit
-    total_tasks: int = Field(ge=0)
-    successful_tasks: int = Field(ge=0)
-    success_rate: float = Field(ge=0, le=1)
+    metrics: BenchmarkMetrics
+    trajectory_artifact: ArtifactReference | None = None
     trajectory_references: tuple[TrajectoryReference, ...] = Field(default_factory=tuple)
+    report_artifact: ArtifactReference | None = None
+    manifest_sha256: str | None = None
+    evidence_label: EvidenceLabel = EvidenceLabel.EXPLANATION
+    verified: bool = False
+
+    @field_validator("manifest_sha256")
+    @classmethod
+    def validate_manifest_sha256(cls, value: str | None) -> str | None:
+        if value is not None and not _SHA256.fullmatch(value):
+            raise ValueError("manifest_sha256 must be a lowercase SHA-256 digest")
+        return value
+
+    @model_validator(mode="after")
+    def validate_verified_artifact(self) -> BenchmarkResponse:
+        if self.evidence_label in {EvidenceLabel.LIVE, EvidenceLabel.PRIOR_VERIFIED_RUN}:
+            if not self.verified:
+                raise ValueError("verified benchmark evidence must set verified=True")
+            if self.manifest_sha256 is None:
+                raise ValueError("verified benchmark evidence requires manifest_sha256")
+            if self.trajectory_artifact is None and self.report_artifact is None:
+                raise ValueError("verified benchmark evidence requires an artifact reference")
+        if any(not reference.verified for reference in self.trajectory_references):
+            raise ValueError("benchmark trajectory references must be verifier-confirmed")
+        if any(reference.split is not self.split for reference in self.trajectory_references):
+            raise ValueError("benchmark trajectory reference split does not match response")
+        return self
 
 
 class CurationRequest(ContractModel):

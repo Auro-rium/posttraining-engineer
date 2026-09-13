@@ -1,5 +1,29 @@
 # Change Log
 
+## 2026-09-13 — `OBJECTIVE-STAGE-TRACE-001`
+
+- **Goal:** Diagnose and then resolve the first real objective-worker HTTP 503 without leaking prompts, task data, completions, or credentials.
+- **Summary of changes:** Added per-request correlation IDs and safe stage-level objective telemetry for checkpoint resolve, processor/model load, prompt render, generation/decode, tool parsing, environment actions, trajectory verification, S3 persistence, and benchmark completion. The HTTP boundary returns only a generic 503 and correlation ID. Objective readiness now separates configuration, checkpoint, model load, generation, artifact-store interface, and aggregate execution attestations. Coordinator `/health` reports shallow objective endpoint configuration and injected build provenance; runtime CDK injects bounded baseline episode count and build metadata. Updated the live FunctionGemma S3 version reference in `Flow.md`.
+- **Affected files and components:** Objective worker service/execution/readiness, coordinator health and build info, runtime CDK configuration, focused tests, `Flow.md`, `Decisions.md`, and this log.
+- **Tests and verification:** Full backend suite passed from `backend/` using the configured pytest asyncio mode and dev extra; focused Ruff and mypy passed; read-only AWS checks confirmed bootstrap/runtime stacks are deployed, API `/health` is HTTP 200, and `/api/live/readiness` reports READY.
+- **Known limitations:** The deployed API still reflects the prior image: `/health` reports `objective_worker: not_configured` and no build-info fields. Its previous one-episode objective call returned HTTP 503 and produced no verified trajectory/report. No SageMaker training or Processing job exists. The telemetry/readiness source changes remain uncommitted and undeployed; a successful objective smoke is still the first live gate.
+
+## 2026-09-13 — `AWS-CODEBUILD-OBJECTIVE-CONTRACT-001`
+
+- **Goal:** Move multi-gigabyte worker-image dependency downloads to AWS and unblock the real objective-worker request contract.
+- **Summary of changes:** Added an AWS CodeBuild buildspec for `linux/amd64` backend/trainer/evaluator images with immutable ECR digest reporting. Created a dedicated privileged CodeBuild project and narrowly scoped role for one versioned S3 source object, the three ECR repositories, the bootstrap KMS key, and one CloudWatch log group. Stopped the local trainer image build; no image was published by that cancelled build. Aligned objective benchmark request/response fields, configured train/replay episode counts, and verified artifact/evidence provenance. Corrected the explicit EvidenceLabel re-export and local inference adapter typing.
+- **Affected files and components:** `backend/aws-image-buildspec.yml`, objective API/client/storage contracts and tests, objective model export/type annotations, `Flow.md`, `Decisions.md`, `ChangeLog.md`, and AWS CodeBuild project/role.
+- **Tests and verification:** Focused objective/live-execution pytest passed 84 tests; focused Ruff and mypy passed; buildspec YAML parsing, docs synchronization, `git diff --check`, CodeBuild project configuration, trust policy, and scoped role policy were verified.
+- **Known limitations and follow-up:** No source archive has been uploaded and no CodeBuild job started yet; no trainer/evaluator digest exists. API Gateway HTTP API still imposes a 30-second integration ceiling, while the benchmark is synchronous and a 10-episode inference duration has not been measured. No runtime stack, objective inference smoke, SageMaker GPU smoke/job, or live autonomous run has been executed.
+
+## 2026-09-13 — `CONTAINER-RETRY-2026-09-13-001`
+
+- **Goal:** Make trainer and evaluator dependency installation resilient to slow or interrupted package downloads.
+- **Summary of changes:** Added a persistent BuildKit pip-cache mount and a 300-second pip timeout with five retries to both worker Dockerfiles. No application source was changed.
+- **Affected files and components:** `backend/workers/trainer/Dockerfile` and `backend/workers/evaluator/Dockerfile`.
+- **Tests and verification:** `backend/.venv/bin/python -m pytest -q backend/tests/test_image_smoke_contract.py` passed 3 tests; `backend/.venv/bin/python backend/scripts/check_docs_sync.py` and `git diff --check` passed. A backend image was published and its loopback `/health` endpoint returned `healthy`, but that image predates subsequent shared backend edits and is not the final deployment digest. The trainer build was cancelled before push; the evaluator image was not built.
+- **Known limitations and follow-up:** Rebuild and publish the trainer/evaluator images with immutable digests, then rebuild the backend from the final shared source tree. No SageMaker job, model inference, or training run was started.
+
 ## 2026-09-08 — `MAINT-2026-09-08-001`
 
 - **Goal:** Align local configuration and deployment documentation with the guarded Nemotron/AWS live path.
@@ -216,3 +240,107 @@ This file is append-only. Entries describe repository changes and the verificati
 - **Affected files and components:** `infra/cdk/stacks/post_training_stack.py` and `infra/cdk/tests/test_post_training_stack.py`.
 - **Verification:** CDK stack tests passed (22 tests); documentation sync and `git diff --check` were run after this entry was added.
 - **Known limitations:** No AWS deployment or resource mutation was performed.
+
+## 2026-09-12 — `WORKER-IMAGE-SMOKE-001`
+
+- **Goal:** Add offline model-load smoke entrypoints for the amd64 SageMaker trainer and evaluator images.
+- **Summary of changes:** Added a trainer image smoke that requires CUDA/bitsandbytes, loads the staged FunctionGemma directory locally in 4-bit, performs one LoRA optimizer step, and writes a throwaway adapter; added an evaluator image smoke that loads the same local base plus adapter and runs one forward pass without sealed tasks. Copied both entrypoints into their images and documented network-disabled smoke commands using the existing `linux/amd64` Buildx instructions.
+- **Affected files and components:** `backend/workers/trainer/image_smoke.py`, `backend/workers/evaluator/image_smoke.py`, both worker Dockerfiles, image smoke contract tests, `infra/cdk/README.md`, `Flow.md`, and `Decisions.md`.
+- **Verification:** The three image smoke contract tests passed; Ruff, mypy, Python compilation, documentation sync, and `git diff --check` passed; trainer and evaluator Dockerfiles passed BuildKit `--check` for `linux/amd64`.
+- **Known limitations:** The CUDA image was not built or run, no adapter smoke was executed against a staged checkpoint, and no image was pushed or AWS job started. In the shared in-progress checkout, the broader `test_worker_contracts.py` run failed because its existing dataset fixture still uses the deprecated `verified_replay`/`verifier_confirmed` contract after the curation-admission change.
+
+## 2026-09-12 — `AWS-COORDINATOR-RECOVERY-INGRESS-001`
+
+- **Goal:** Close coordinator restart/reachability gaps and authorize deterministic SageMaker job-tag reconciliation.
+- **Summary of changes:** Replaced blocking startup recovery with an immediate, nonblocking 30-second durable dispatcher loop; added scoped `sagemaker:ListTags`; added an internet-facing coordinator ALB restricted to required operator IPv4 CIDRs and emitted `CoordinatorUrl`; raised the approval TTL default to 24 hours to cover the bounded five-experiment worst case.
+- **Affected files and components:** Autonomous live API and tests, CDK stack and contract tests, `.env.example`, `infra/cdk/cdk.json`, `infra/cdk/README.md`, `Flow.md`, and `Decisions.md`.
+- **Verification:** `tests/test_autonomous_live_api.py` passed (18); `infra/cdk/tests/test_post_training_stack.py` passed (27). No AWS deployment, resource mutation, or live run was performed.
+- **Known limitations:** Coordinator ALB currently uses HTTP and must remain restricted to a trusted operator network; do not transmit approval tokens over untrusted networks. Live SageMaker readiness, GPU quota, image availability, and external credentials remain separate prerequisites.
+
+## 2026-09-12 — `VERIFIER-BACKED-CORRECTIONS-001`
+
+- **Goal:** Let the curator propose repairs for failed trajectories without teaching the failed source actions.
+- **Summary of changes:** Added a strict train/replay-only correction proposal contract to the DataCuratorAgent handoff; added authenticated `/v1/replay-corrections` that binds proposals to stored verifier-confirmed failures, replays deterministically, persists only passing repairs with lineage, and discards rejected proposals; connected the live objective client to replay passing proposals before curation; filtered failed originals from SFT rows while leaving the lower-level dataset builder fail-closed.
+- **Affected files and components:** Data-curator contracts/prompt, objective models/service/engine, live objective client, focused agent/objective tests, `Flow.md`, `Decisions.md`, and `backend/README.md`.
+- **Verification:** Focused autonomous-agent, objective-engine, objective-execution, prompt-contract, objective-client, artifact-store, and objective-role integration tests passed; Ruff, mypy, documentation sync, and `git diff --check` passed.
+- **Known limitations:** No GPU inference, AWS deployment, or live AgentGym correction replay was performed. Correction-only curation still fails closed if no proposal passes and no successful original is available. A broader `test_main_integration.py` run in the shared dirty checkout also failed its unrelated AWS-mode coordinator-route expectations.
+
+## 2026-09-12 — `OBJECTIVE-FARGATE-SIZING-001`
+
+- **Goal:** Give the internal FunctionGemma objective worker sufficient bounded Fargate task resources for its Python/model-loading runtime.
+- **Summary of changes:** Raised only the internal objective task definition from 0.5 vCPU / 1 GiB to a fixed 2 vCPU / 4 GiB; kept the coordinator at 1 vCPU / 2 GiB and added a synthesis contract for both allocations.
+- **Affected files and components:** `infra/cdk/stacks/post_training_stack.py`, `infra/cdk/tests/test_post_training_stack.py`, `Flow.md`, and `Decisions.md`.
+- **Verification:** Focused CDK stack tests passed (34). Ruff reports two unrelated existing findings in these already-modified files (`TRY004` in coordinator CIDR validation and `RUF100` for the existing `E402` suppression); with those two findings excluded, Ruff passed for both Python files. Documentation sync and `git diff --check` passed.
+- **Known limitations:** No AWS deployment, Fargate startup, FunctionGemma model-load, GPU execution, or live post-training run was performed.
+
+## 2026-09-12 — `PROCESSING-REPORT-PINNING-001`
+
+- **Goal:** Prevent SageMaker Processing output prefixes or ambiguous outputs from being treated as verified evaluation artifacts.
+- **Summary of changes:** The provider now selects exactly one named `evaluation` output from a completed Processing job. The S3 artifact store paginates the output prefix, requires exactly one `evaluation.json` or `evaluation.tar.gz`, resolves and downloads the exact source `VersionId`, hashes its bytes, and retains a versioned content-addressed copy before the live reader validates the report.
+- **Affected files and components:** `backend/app/providers/sagemaker.py`, `backend/app/providers/artifacts.py`, focused provider/artifact/evaluation tests, `Flow.md`, and `Decisions.md`.
+- **Tests and verification:** `uv run pytest -q tests/test_aws_providers.py tests/test_artifact_integrity.py tests/test_live_execution.py` passed (93 tests).
+- **Known limitations and follow-up:** This is local contract verification only. No live SageMaker Processing job or AWS artifact discovery was performed.
+
+## 2026-09-12 — `AWS-DISPATCHER-CANCELLATION-001`
+
+- **Goal:** Prevent shutdown cancellation from releasing a run lease while its supervisor child is still executing.
+- **Summary of changes:** The durable dispatcher now cancels and awaits its supervisor task when the dispatcher itself is cancelled, before heartbeat shutdown and the outer lease-release path. Added a regression test proving child cancellation precedes lease release and documented hard-kill recovery as lease-expiry/provider reconciliation.
+- **Affected files and components:** `backend/app/autonomous/dispatcher.py`, `backend/tests/test_autonomous_supervisor.py`, `Flow.md`, and `Decisions.md`.
+- **Verification:** The regression test failed before the fix and passed afterward; focused dispatcher and autonomous live API tests passed (21 tests). No AWS resource mutation or live provider job was performed.
+- **Known limitations:** This covers cooperative asyncio cancellation. A forced process kill still depends on durable lease expiry and persisted provider IDs for reconciliation.
+
+## 2026-09-12 — `OBJECTIVE-STARTUP-CHECKPOINT-001`
+
+- **Goal:** Ensure an internal objective worker cannot serve requests before loading the approved immutable FunctionGemma checkpoint.
+- **Summary of changes:** Added a role-aware backend entrypoint that bootstraps the exact versioned S3 bundle, verifies its digest and pinned snapshot identity, then replaces itself with Uvicorn; coordinator startup skips model staging, and any objective bootstrap failure prevents service startup. Documented the task's scoped S3/KMS dependency.
+- **Affected files and components:** `backend/Dockerfile`, `backend/scripts/start_backend.py`, `backend/scripts/bootstrap_objective_checkpoint.py`, checkpoint bootstrap tests, `backend/README.md`, `infra/cdk/README.md`, `Flow.md`, and `Decisions.md`.
+- **Verification:** Focused bootstrap/startup tests, Ruff, mypy, documentation sync, and diff checks; no AWS deployment or checkpoint-backed objective inference is implied.
+- **Known limitations:** No staged checkpoint object or running internal objective task was verified in AWS; task download, decryption, and model loading remain live prerequisites.
+
+## 2026-09-12 — `AWS-READINESS-RECONCILIATION-001`
+
+- **Goal:** Reconcile implementation and AWS readiness against the concrete live-run caveat list without claiming deployment or model improvement.
+- **Summary of changes:** Closed the duplicate objective-checkpoint-bootstrap path so the role-aware image entrypoint stages the immutable bundle once before Uvicorn, guarded the legacy process-local mutation routes with `410 Gone` in AWS mode, and corrected current documentation for dynamic per-experiment training data, TLS coordinator ingress, and the latest quota/readiness evidence.
+- **Affected files and components:** Backend startup and route handlers/tests, live-execution and SageMaker adapter contracts, trainer/evaluator worker contracts, CDK ingress/IAM/resource contracts, and `Flow.md`, `Decisions.md`, `backend/README.md`, and `infra/cdk/README.md`.
+- **Verification:** The focused startup, objective execution, and main integration tests passed. AWS Service Quotas returned `ml.g5.xlarge` training-job allowance `1.0`; one SigV4 Strands Nemotron `AgentResult` smoke returned the exact requested `OK`. Local `scripts/live_preflight.py` remains `BLOCKED` for absent bucket, table, role, image digests, objective URL, model/revision, and sealed evaluation URI. Read-only inventory found no matching CloudFormation stack, DynamoDB run table, dedicated artifact bucket, trainer/evaluator ECR repositories, ACM certificate, or Route 53 zone. No AWS resources were created or modified.
+- **Known limitations:** The coordinator image import smoke passed earlier, but trainer/evaluator image builds stalled during the 554.6 MB PyTorch wheel download and were stopped safely. No FunctionGemma bundle, verified objective trajectory, SageMaker training/evaluation job, promotion, or end-to-end autonomous live run was produced. A quota allowance is not placement capacity, and one provider call does not validate all four agent schemas.
+
+## 2026-09-12 — `CHECKPOINT-VERSION-PIN-001`
+
+- **Goal:** Prevent CDK from silently generating an unversioned default checkpoint URI for live workloads.
+- **Summary of changes:** CDK now requires an explicitly configured S3 checkpoint URI with exactly one non-empty `versionId` whenever a live checkpoint is required. Added regression coverage for missing and unversioned checkpoint configuration.
+- **Affected files and components:** `infra/cdk/stacks/post_training_stack.py` and `infra/cdk/tests/test_post_training_stack.py`.
+- **Verification:** CDK stack contract suite passed (37 tests); focused Ruff passed; local `cdk synth` passed using explicitly labeled review-only placeholder values. No placeholder was deployed.
+- **Known limitations:** AWS deployment remains blocked by missing real checkpoint/version, trainer/evaluator image digests, sealed evaluation input, and HTTPS ingress domain/certificate. The quota allowance does not prove placement capacity; no live training or evaluation was submitted.
+
+## 2026-09-13 — `AWS-DISPATCHER-LEASE-EXCLUSIVITY-001`
+
+- **Goal:** Prevent two concurrent dispatcher scans in one process from claiming and executing the same live run lease.
+- **Summary of changes:** In-memory and DynamoDB `claim_lease` now reject every unexpired lease, including one with the same owner string. Explicit renewal remains a separate owner-checked compare-and-swap path. Added repository tests for same-owner rejection and renewal, plus a stale-scan concurrent-dispatch test proving only one supervisor starts.
+- **Affected files and components:** `backend/app/autonomous/repository.py`, `backend/tests/test_autonomous_repository.py`, `backend/tests/test_autonomous_supervisor.py`, `Flow.md`, and `Decisions.md`.
+- **Verification:** The two in-memory/concurrency regression tests and DynamoDB lease regression test failed before the fix and passed after it. Focused `test_autonomous_repository.py` and `test_autonomous_supervisor.py` passed; Ruff and mypy passed for the changed backend files. No deployment or AWS operation was performed.
+- **Known limitations:** DynamoDB conditional writes and SageMaker reconciliation were validated locally with repository/provider contracts only; no concurrent dispatcher or recovery test was run against a deployed AWS stack.
+
+## 2026-09-13 — `RUNTIME-QUOTA-AND-BEDROCK-READINESS-001`
+
+- **Goal:** Keep live runtime readiness truthful for GPU training, GPU evaluation, and provider-backed Nemotron agent calls.
+- **Summary of changes:** Runtime CDK now requires validated, separate SageMaker training and Processing quota codes and injects both into the coordinator. Readiness queries each account quota and blocks if either is missing, unavailable, or below the requested instance count. The coordinator role also receives only `bedrock:GetFoundationModel` and `bedrock:InvokeModel` on its exact regional configured foundation-model ARN, using AWS's foundation-model ARN shape.
+- **Affected files and components:** `infra/cdk/stacks/runtime_stack.py`, runtime CDK tests, `backend/app/live_execution.py`, focused live-execution tests, `Flow.md`, and `backend/README.md`.
+- **Verification:** Runtime CDK synthesis tests passed (51); backend live-execution, preflight-hardening, and readiness tests passed (78); Ruff passed on all changed Python files; mypy passed for the runtime stack, its tests, and `backend/app/live_execution.py`; documentation sync and `git diff --check` passed. No AWS resources were created or deployed by this change.
+- **Known limitations:** A Service Quotas allowance does not guarantee SageMaker placement capacity. Runtime deployment and live provider execution remain separate verification steps.
+
+## 2026-09-13 — `PROCESSING-LOCALPATH-CONTRACT-001`
+
+- **Goal:** Verify the SageMaker Processing evaluator's input mount contract alongside immutable Processing-output discovery.
+- **Summary of changes:** Documented the fixed `base_model`, `candidate`, `champion`, and `sealed` `LocalPath` to `SM_CHANNEL_*` mapping and the shared output path in `Flow.md`; recorded the contract in `Decisions.md`. Audited the existing provider/artifact-store implementation and regression tests: the completed job's named output remains an S3 prefix, listing requires exactly one `evaluation.json` or `evaluation.tar.gz`, and the selected object's exact `VersionId` is used for download and byte-derived SHA-256 retention.
+- **Affected files and components:** SageMaker provider and S3 artifact-store contracts/tests, `Flow.md`, and `Decisions.md`.
+- **Verification:** Focused provider/artifact/live-evaluation tests passed (99); Ruff passed on the provider/artifact modules and focused tests; targeted mypy passed for `app/providers/sagemaker.py`, `app/providers/artifacts.py`, and `app/live_execution.py`; docs sync and `git diff --check` passed.
+- **Known limitations:** The broader `mypy app tests` run reports 178 errors across 29 source/test files; targeted production-file mypy passes. No AWS Processing job or live artifact discovery was performed.
+
+## 2026-09-13 — `AWS-DISPATCHER-RECOVERY-IDEMPOTENCY-001`
+
+- **Goal:** Verify restart recovery reconciles an accepted SageMaker training request after its durable lease expires, without submitting a duplicate job.
+- **Summary of changes:** Added an integrated in-memory regression that persists a deterministic SageMaker operation intent, simulates a lost create response after provider acceptance, expires the prior lease, and resumes through a fresh dispatcher/supervisor; recovery completes with one training submission.
+- **Affected files and components:** `backend/tests/test_autonomous_supervisor.py`, durable dispatcher recovery, supervisor operation intents, and SageMaker reconciliation contracts.
+- **Verification:** Focused dispatcher, supervisor, repository, live API, and SageMaker reconciliation suites passed (124 tests); scoped Ruff and production-file mypy passed; living-document sync and `git diff --check` passed.
+- **Known limitations:** The regression uses in-memory repositories and a SageMaker contract double. It does not validate a deployed DynamoDB lease, SageMaker control-plane timing, or a live AWS recovery.

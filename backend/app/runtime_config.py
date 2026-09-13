@@ -61,6 +61,8 @@ class RuntimeConfig(BaseSettings):
     objective_model_checkpoint_dir: str | None = None
     objective_model_revision: str | None = None
     objective_model_sha256: str | None = None
+    objective_base_model_uri: str | None = None
+    objective_base_model_sha256: str | None = None
     dynamodb_table_name: str | None = None
     sagemaker_training_role_arn: str | None = None
     sagemaker_training_image_uri: str | None = None

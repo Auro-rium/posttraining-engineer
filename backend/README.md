@@ -50,7 +50,8 @@ deployment or a completed post-training run.
 
 ### Objective worker and FunctionGemma checkpoint
 
-`SERVICE_ROLE=objective` exposes the isolated `/v1/benchmark` endpoint. It
+`SERVICE_ROLE=objective` exposes the isolated `/v1/benchmark`,
+`/v1/replay-corrections`, and `/v1/verify-curation` endpoints. It
 requires `OBJECTIVE_AUTH_TOKEN` and `S3_ARTIFACT_BUCKET`; benchmark execution
 also requires all three values below:
 
@@ -67,28 +68,61 @@ configuration, inference errors, replay failures, or artifact-store failures
 block the request. The code and contract tests do not establish that a complete
 checkpoint is available or that a real FunctionGemma benchmark has succeeded.
 
+The backend image entrypoint detects `SERVICE_ROLE=objective` and, before
+starting Uvicorn, runs `scripts/bootstrap_objective_checkpoint.py`. It fetches
+the exact `OBJECTIVE_BASE_MODEL_URI` S3 `versionId`, verifies
+`OBJECTIVE_BASE_MODEL_SHA256`, safely extracts and validates the pinned
+FunctionGemma revision, then supplies the extracted snapshot digest as
+`OBJECTIVE_MODEL_SHA256`. A bootstrap error is fatal and the objective service
+does not become healthy. Coordinator startup skips this model download. The
+internal CDK task supplies the required URI, revision, bundle digest, and local
+directory and grants only artifact-prefix access plus the artifact KMS key; a
+local bootstrap test is not evidence of an AWS task download or model load.
+The curator may submit structured actions bound to a stored verifier-confirmed
+failure. The objective worker persists only successful deterministic replays;
+failed proposals are discarded, and the failed original actions are omitted
+from SFT rows. Hidden and validation splits remain inaccessible to this API.
+
 Before the first job, configure `CHECKPOINT_SHA256`,
-`SAGEMAKER_GPU_QUOTA_CODE`, `GPU_INSTANCE_ALLOWLIST`, and a secret in
-`LIVE_APPROVAL_SECRET`. The scripts print a metadata-only approval packet when
-no token is supplied. An operator signs that packet with
+`SAGEMAKER_GPU_QUOTA_CODE`, `SAGEMAKER_PROCESSING_GPU_QUOTA_CODE`,
+`GPU_INSTANCE_ALLOWLIST`, and a secret in `LIVE_APPROVAL_SECRET`. Preflight
+checks both training-job and processing-job GPU quotas; evaluation uses
+SageMaker Processing, so training quota alone is insufficient. The runtime CDK
+requires both quota IDs as validated context (`sagemaker_gpu_quota_code` and
+`sagemaker_processing_gpu_quota_code`) and injects them into the coordinator.
+The scripts print a metadata-only approval packet when no token is supplied.
+An operator signs that packet with
 `issue_approval_token(packet, secret)` and reruns with the resulting token.
 For the included signer: `LIVE_APPROVAL_SECRET=... uv run python
 scripts/issue_approval_token.py packet.json`.
-Service Quotas confirms account allowance; it is not a placement reservation,
-so SageMaker remains the final capacity decision after approval. Only the
-current run's training/processing jobs are stopped during cleanup; S3,
+
+The bounded live timing defaults match the five-experiment ceiling:
+`LIVE_APPROVAL_TTL_SECONDS=86400` (24 hours), with each training and evaluation
+job independently capped by `MAX_TRAINING_TIME_MIN=120`. Configuration rejects
+an approval window shorter than `MAX_EXPERIMENTS * 2 * MAX_TRAINING_TIME_MIN`
+minutes; an explicitly requested expiry must also cover its approved run size.
+Provider status is checked every 30 seconds, including one terminal check after
+the SageMaker runtime bound. Objective-worker requests default to
+`OBJECTIVE_WORKER_TIMEOUT_SECONDS=600` and cannot be configured above 10 minutes.
+
+Service Quotas confirms account allowance for both job types; it is not a
+placement reservation, so SageMaker remains the final capacity decision after
+approval. Only the current run's training/processing jobs are stopped during
+cleanup; S3,
 DynamoDB, IAM, ECR, and networking resources are reused and never deleted by
 the controller.
 
 The complete variable template is the repository-level `.env.example`. The
-live path additionally requires `OBJECTIVE_WORKER_URL`, `HF_REPO_ID`, an
-immutable `HF_REVISION`, `TRAINING_INPUT_S3_URI`,
-`EVALUATION_INPUT_S3_URI`, `CHECKPOINT_S3_URI`, and a matching lowercase
-`CHECKPOINT_SHA256`. The checkpoint must already exist in versioned S3; the
-controller does not download or stage a Hugging Face checkpoint automatically.
-`SAGEMAKER_INSTANCE_TYPE` must be present in `GPU_INSTANCE_ALLOWLIST`, and
-the quota check confirms account allowance only—it is not a placement
-reservation. SageMaker makes the final capacity decision.
+live path needs an authenticated objective worker (an external HTTPS URL or the
+CDK-managed internal worker), `HF_REPO_ID`, an immutable `HF_REVISION`, a
+version-pinned `CHECKPOINT_S3_URI` with its bundle SHA-256, and a staged sealed
+`EVALUATION_INPUT_S3_URI`. Autonomous runs create a content-addressed training
+dataset per experiment, so `TRAINING_INPUT_S3_URI` is optional and is not a
+live-run readiness gate. The Hugging Face token, if the source requires one,
+is used only to obtain the checkpoint for staging; workers load the verified
+S3 bundle locally and have no Hugging Face fallback. `SAGEMAKER_INSTANCE_TYPE`
+must be present in `GPU_INSTANCE_ALLOWLIST`; the Service Quotas check validates
+account allowance, not placement capacity.
 
 For Bedrock authentication, use the configured AWS IAM/SigV4 credential chain
 with `nvidia.nemotron-super-3-120b` and leave `AWS_BEARER_TOKEN_BEDROCK`
@@ -97,11 +131,15 @@ it only when a valid Bedrock API key is intentionally being used. A successful
 STS check alone is not proof that Bedrock model invocation is authorized.
 
 Any deployment and live-run actions described by this backend are scoped only
-to the AWS Agents for Humans hackathon. As of 2026-09-12, the operator-reported
-SageMaker GPU quota request `9a3453884e2c4230a6e8bb0004c8cca57FuK8VC5` is
-`PENDING`; this is not evidence of granted quota or placement capacity. No
-live post-training completion is claimed by this documentation. Recheck the
-request and run the read-only preflight before authorizing compute.
+to the AWS Agents for Humans hackathon. A read-only Service Quotas query on
+2026-09-12 confirmed allowance `1.0` for `ml.g5.xlarge` training jobs in
+`us-east-1`; this is not a capacity reservation. The same day's local
+`scripts/live_preflight.py` report is `BLOCKED` because runtime resource and
+artifact configuration is absent. AWS inventory found no matching post-training
+CloudFormation stack, no DynamoDB run table, no dedicated artifact bucket,
+trainer/evaluator ECR repositories, coordinator certificate, or Route 53 zone.
+No live SageMaker training, held-out evaluation, promotion, or completed
+autonomous run is claimed.
 
 All agent prompts are versioned contracts. They include explicit schemas,
 evidence rules, sealed held-out-data boundaries, and bounded creative latitude.

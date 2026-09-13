@@ -12,8 +12,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from stage_functiongemma_checkpoint import (
@@ -26,6 +28,76 @@ from stage_functiongemma_checkpoint import (
 
 class CheckpointHandoffError(RuntimeError):
     """The isolated remote checkpoint handoff could not produce evidence."""
+
+
+def _remove_huggingface_local_metadata(snapshot_dir: Path) -> None:
+    """Remove only the Hub's known local-dir metadata before checkpoint validation.
+
+    ``snapshot_download(local_dir=...)`` writes bookkeeping under
+    ``.cache/huggingface/download``. That directory is not model content and is
+    intentionally rejected by the immutable checkpoint validator. Reject
+    unexpected paths instead of silently discarding arbitrary downloaded data.
+    """
+
+    cache_dir = snapshot_dir / ".cache"
+    if cache_dir.is_symlink():
+        raise CheckpointHandoffError("unexpected Hugging Face local metadata path")
+    if not cache_dir.exists():
+        return
+    if not cache_dir.is_dir():
+        raise CheckpointHandoffError("unexpected Hugging Face local metadata path")
+
+    cache_children = list(cache_dir.iterdir())
+    if any(child.name != "huggingface" for child in cache_children):
+        raise CheckpointHandoffError("unexpected Hugging Face local metadata content")
+    hub_metadata = cache_dir / "huggingface"
+    if hub_metadata.exists():
+        if hub_metadata.is_symlink() or not hub_metadata.is_dir():
+            raise CheckpointHandoffError("unexpected Hugging Face local metadata content")
+        hub_children = list(hub_metadata.iterdir())
+        if any(child.name not in {"download", ".gitignore"} for child in hub_children):
+            raise CheckpointHandoffError("unexpected Hugging Face local metadata content")
+        hub_gitignore = hub_metadata / ".gitignore"
+        if hub_gitignore.exists():
+            if (
+                hub_gitignore.is_symlink()
+                or not hub_gitignore.is_file()
+                or hub_gitignore.read_text(encoding="utf-8") != "*"
+            ):
+                raise CheckpointHandoffError(
+                    "unexpected Hugging Face local metadata content"
+                )
+        download_metadata = hub_metadata / "download"
+        if download_metadata.exists():
+            if download_metadata.is_symlink() or not download_metadata.is_dir():
+                raise CheckpointHandoffError("unexpected Hugging Face local metadata content")
+            metadata_files: set[Path] = set()
+            lock_files: set[Path] = set()
+            for entry in download_metadata.rglob("*"):
+                if entry.is_symlink():
+                    raise CheckpointHandoffError(
+                        "unexpected Hugging Face local metadata content"
+                    )
+                if entry.is_dir():
+                    continue
+                if not entry.is_file() or entry.suffix not in {".metadata", ".lock"}:
+                    raise CheckpointHandoffError(
+                        "unexpected Hugging Face local metadata content"
+                    )
+                relative = entry.relative_to(download_metadata)
+                if entry.suffix == ".metadata":
+                    metadata_files.add(relative)
+                else:
+                    lock_files.add(relative)
+            expected_lock_files = {
+                path.with_suffix(".lock") for path in metadata_files
+            }
+            if not lock_files.issubset(expected_lock_files):
+                raise CheckpointHandoffError(
+                    "unexpected Hugging Face local metadata content"
+                )
+
+    shutil.rmtree(cache_dir)
 
 
 def stage_from_huggingface(
@@ -45,7 +117,7 @@ def stage_from_huggingface(
         raise CheckpointHandoffError("HF_TOKEN is required for checkpoint handoff")
     if snapshot_download is None:
         try:
-            from huggingface_hub import (  # type: ignore[import-not-found]
+            from huggingface_hub import (
                 snapshot_download as hub_snapshot_download,
             )
         except ImportError as exc:  # pragma: no cover - image dependency contract
@@ -59,6 +131,7 @@ def stage_from_huggingface(
                 local_dir=directory,
                 token=token,
             )
+            _remove_huggingface_local_metadata(Path(directory))
             staged = stage_checkpoint(
                 directory,
                 bucket=bucket,

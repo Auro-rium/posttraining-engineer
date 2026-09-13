@@ -20,9 +20,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from math import isfinite
+from math import ceil, isfinite
 from typing import Any, Literal, Protocol, cast
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -68,6 +68,9 @@ _SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ECR_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+OBJECTIVE_WORKER_TIMEOUT_MAX_SECONDS = 600
+LIVE_PROVIDER_POLL_INTERVAL_SECONDS = 30.0
+SAGEMAKER_PHASES_PER_EXPERIMENT = 2  # one training job and one evaluation job
 _ECR_REGISTRY = re.compile(
     r"^(?P<account>[0-9]{12})\.dkr\.ecr\.(?P<region>[a-z0-9-]+)\.amazonaws\.com$"
 )
@@ -309,7 +312,9 @@ class LiveExecutionConfig(BaseModel):
     seed: int = 7
     baseline_episodes: int = Field(default=10, ge=1)
     held_out_episodes: int = Field(default=15, ge=1)
-    training_input_s3_uri: str
+    # /api/live generates and pins each experiment dataset independently.
+    # The legacy synchronous controller still requires this static prefix.
+    training_input_s3_uri: str | None = None
     evaluation_input_s3_uri: str
     checkpoint_s3_uri: str | None = None
     # Required for run 1; later runs derive this from the promoted artifact.
@@ -317,10 +322,12 @@ class LiveExecutionConfig(BaseModel):
     instance_type: str = "ml.g5.xlarge"
     gpu_instance_allowlist: tuple[str, ...] = ("ml.g5.xlarge",)
     sagemaker_gpu_quota_code: str | None = None
+    sagemaker_processing_gpu_quota_code: str | None = None
     minimum_gpu_quota: float = Field(default=1.0, gt=0)
     instance_count: int = Field(default=1, ge=1)
     volume_size_gb: int = Field(default=30, ge=1)
     max_runtime_seconds: int = Field(default=120 * 60, ge=1, le=120 * 60)
+    # Declared per-instance estimates; actual AWS charges may differ.
     training_hourly_cost_usd: float = Field(default=1.50, ge=0)
     evaluation_hourly_cost_usd: float = Field(default=1.00, ge=0)
     max_runs: int = Field(default=MAX_RUNS, ge=1, le=MAX_RUNS)
@@ -328,7 +335,12 @@ class LiveExecutionConfig(BaseModel):
     artifact_prefix: str = "post-training"
     approval_token_env: str = "LIVE_APPROVAL_TOKEN"
     approval_secret_env: str = "LIVE_APPROVAL_SECRET"
-    approval_ttl_seconds: int = Field(default=900, ge=60, le=86400)
+    approval_ttl_seconds: int = Field(default=86400, ge=60, le=86400)
+    objective_worker_timeout_seconds: int = Field(
+        default=OBJECTIVE_WORKER_TIMEOUT_MAX_SECONDS,
+        ge=1,
+        le=OBJECTIVE_WORKER_TIMEOUT_MAX_SECONDS,
+    )
     preflight_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
 
     @field_validator("hf_revision")
@@ -380,11 +392,11 @@ class LiveExecutionConfig(BaseModel):
             raise ValueError("gpu_instance_allowlist must not contain duplicates")
         return value
 
-    @field_validator("sagemaker_gpu_quota_code")
+    @field_validator("sagemaker_gpu_quota_code", "sagemaker_processing_gpu_quota_code")
     @classmethod
     def validate_quota_code(cls, value: str | None) -> str | None:
         if value is not None and not re.fullmatch(r"[A-Za-z0-9-]{1,128}", value):
-            raise ValueError("sagemaker_gpu_quota_code must be a safe Service Quotas code")
+            raise ValueError("SageMaker GPU quota codes must be safe Service Quotas codes")
         return value
 
     @field_validator("approval_secret_env", "approval_token_env")
@@ -399,6 +411,7 @@ class LiveExecutionConfig(BaseModel):
         runtime_hours = self.max_runtime_seconds / 3600
         worst_case = (
             self.max_runs
+            * self.instance_count
             * runtime_hours
             * (self.training_hourly_cost_usd + self.evaluation_hourly_cost_usd)
         )
@@ -407,12 +420,38 @@ class LiveExecutionConfig(BaseModel):
                 f"worst-case SageMaker estimate ${worst_case:.2f} exceeds "
                 f"the ${self.max_cost_usd:.2f} ceiling"
             )
+        if self.approval_ttl_seconds < self.minimum_approval_ttl_seconds:
+            raise ValueError(
+                "approval_ttl_seconds must cover every bounded training/evaluation pair "
+                "in the approved experiment window"
+            )
         return self
+
+    @property
+    def minimum_approval_ttl_seconds(self) -> int:
+        """SageMaker-only worst-case window for every approved experiment pair."""
+
+        return (
+            self.max_runs
+            * SAGEMAKER_PHASES_PER_EXPERIMENT
+            * self.max_runtime_seconds
+        )
+
+    @property
+    def provider_poll_interval_seconds(self) -> float:
+        return LIVE_PROVIDER_POLL_INTERVAL_SECONDS
+
+    @property
+    def provider_max_polls(self) -> int:
+        """Include the terminal poll after a job reaches its configured time limit."""
+
+        return ceil(self.max_runtime_seconds / self.provider_poll_interval_seconds) + 1
 
     @property
     def estimated_worst_case_cost_usd(self) -> float:
         return round(
             self.max_runs
+            * self.instance_count
             * (self.max_runtime_seconds / 3600)
             * (self.training_hourly_cost_usd + self.evaluation_hourly_cost_usd),
             6,
@@ -423,10 +462,41 @@ class LiveExecutionConfig(BaseModel):
         """Worst-case cost for one training plus evaluation pair."""
 
         return round(
-            (self.max_runtime_seconds / 3600)
+            self.instance_count
+            * (self.max_runtime_seconds / 3600)
             * (self.training_hourly_cost_usd + self.evaluation_hourly_cost_usd),
             6,
         )
+
+    @property
+    def phase_cost_upper_bounds_usd(self) -> dict[str, float]:
+        """Declared per-job reservation estimates, not a guaranteed AWS bill cap.
+
+        Each phase uses its configured hourly estimate for the full SageMaker
+        runtime and multiplies by the requested instance count. Round up to a
+        micro-dollar so precision handling cannot reduce the declared reserve.
+        """
+
+        instance_hours = self.max_runtime_seconds * self.instance_count / 3600
+        microdollars_per_dollar = 1_000_000
+        return {
+            "training": (
+                ceil(
+                    self.training_hourly_cost_usd
+                    * instance_hours
+                    * microdollars_per_dollar
+                )
+                / microdollars_per_dollar
+            ),
+            "evaluation": (
+                ceil(
+                    self.evaluation_hourly_cost_usd
+                    * instance_hours
+                    * microdollars_per_dollar
+                )
+                / microdollars_per_dollar
+            ),
+        }
 
 
 # The name used by the live-plan contract remains available to callers.
@@ -477,11 +547,25 @@ def _safe_detail(exc: BaseException) -> str:
     return f"{exc.__class__.__name__}: operation unavailable"
 
 
+def _objective_worker_endpoint(base_url: str, endpoint: str) -> str:
+    """Join an objective API route to a worker root or a `/v1/` base URL."""
+
+    parsed_base = urlparse(base_url)
+    base_path = parsed_base.path.rstrip("/")
+    route = endpoint.lstrip("/")
+    if route.startswith("v1/") and base_path.rsplit("/", 1)[-1] == "v1":
+        route = route.removeprefix("v1/")
+    endpoint_path = f"{base_path}/{route}" if base_path else f"/{route}"
+    return parsed_base._replace(path=endpoint_path, params="", query="", fragment="").geturl()
+
+
 class PreflightRunner:
-    """Read-only AWS/Hugging Face readiness checks.
+    """Read-only AWS readiness checks for an immutably staged base model.
 
     Client factories are injectable.  Tests can verify that no write method is
-    called, and production uses lazy boto3/Hugging Face clients.
+    called, and production uses lazy boto3 clients. Live readiness never
+    contacts the Hugging Face Hub; it validates the pinned revision against
+    staged S3 checkpoint metadata and content identity.
     """
 
     def __init__(
@@ -489,11 +573,9 @@ class PreflightRunner:
         config: LiveExecutionConfig,
         *,
         clients: Mapping[str, Any] | None = None,
-        hf_api: Any | None = None,
     ) -> None:
         self.config = config
         self.clients = dict(clients or {})
-        self.hf_api = hf_api
         self._gpu_quota_status = GpuQuotaStatus.UNKNOWN
         self._gpu_capacity_status = GpuCapacityStatus.UNKNOWN
 
@@ -565,17 +647,16 @@ class PreflightRunner:
                 lambda: self._check_bedrock_readiness(),
             )
         )
-        checks.append(self._check_hugging_face())
         checks.append(
             self._check(
-                "s3_artifact_bucket",
-                lambda: self._check_s3_readiness(),
+                "configured_base_model_revision",
+                self._check_configured_model_revision,
             )
         )
         checks.append(
             self._check(
-                "sagemaker_training_input",
-                lambda: self._check_input_readiness("training"),
+                "s3_artifact_bucket",
+                lambda: self._check_s3_readiness(),
             )
         )
         checks.append(
@@ -677,24 +758,19 @@ class PreflightRunner:
             metadata={"binding": "HMAC-SHA256"},
         )
 
-    def _check_hugging_face(self) -> CheckResult:
-        def operation() -> Mapping[str, Any]:
-            api = self.hf_api
-            if api is None:
-                try:
-                    from huggingface_hub import HfApi  # type: ignore[import-not-found]
-                except ImportError as exc:  # pragma: no cover
-                    raise LiveExecutionBlocked(
-                        "huggingface_hub is required for HF preflight"
-                    ) from exc
-                api = HfApi()
-            info = api.model_info(self.config.hf_repo_id, revision=self.config.hf_revision)
-            resolved = str(getattr(info, "sha", ""))
-            if resolved.lower() != self.config.hf_revision.lower():
-                raise ValueError("Hugging Face revision did not resolve to the requested commit")
-            return {"repo_id": self.config.hf_repo_id, "revision": resolved.lower()}
+    def _check_configured_model_revision(self) -> Mapping[str, Any]:
+        """Report the immutable model identity configured for the staged bundle."""
 
-        return self._check("huggingface_pinned_revision", operation)
+        if not _SHA1.fullmatch(self.config.hf_revision):
+            raise LiveExecutionBlocked(
+                "HF_REVISION must be a 40-character immutable commit SHA",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        return {
+            "repo_id": self.config.hf_repo_id,
+            "revision": self.config.hf_revision,
+            "source": "configured_and_staged_s3",
+        }
 
     def _check_s3_readiness(self) -> Mapping[str, Any]:
         client = self._client("s3")
@@ -831,6 +907,22 @@ class PreflightRunner:
                 "checkpoint S3 metadata digest does not match CHECKPOINT_SHA256",
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
+        observed_model_id = (
+            str(metadata.get("model-id", "")) if isinstance(metadata, Mapping) else ""
+        )
+        if observed_model_id != self.config.hf_repo_id:
+            raise LiveExecutionBlocked(
+                "checkpoint S3 metadata model id does not match HF_REPO_ID",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        observed_revision = (
+            str(metadata.get("hf-revision", "")) if isinstance(metadata, Mapping) else ""
+        )
+        if observed_revision != self.config.hf_revision:
+            raise LiveExecutionBlocked(
+                "checkpoint S3 metadata revision does not match HF_REVISION",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
         observed_version_id = response.get("VersionId")
         if not observed_version_id or str(observed_version_id) != version_id:
             raise LiveExecutionBlocked(
@@ -839,6 +931,8 @@ class PreflightRunner:
             )
         return {
             "checkpoint": "verified",
+            "repo_id": observed_model_id,
+            "revision": observed_revision,
             "version_id": version_id,
         }
 
@@ -1025,27 +1119,45 @@ class PreflightRunner:
                 classification=PreflightClassification.BLOCKED_GPU_ALLOWLIST,
             )
 
-        if not self.config.sagemaker_gpu_quota_code:
+        quota_codes = (
+            ("training", self.config.sagemaker_gpu_quota_code),
+            ("processing", self.config.sagemaker_processing_gpu_quota_code),
+        )
+        missing_quotas = [name for name, code in quota_codes if not code]
+        if missing_quotas:
             self._gpu_quota_status = GpuQuotaStatus.NOT_CONFIGURED
             self._gpu_capacity_status = GpuCapacityStatus.UNKNOWN
             return CheckResult(
                 name="gpu_quota",
                 status=CheckStatus.BLOCKED,
-                detail="SageMaker GPU Service Quotas code is not configured",
-                metadata={"instance_type": self.config.instance_type},
+                detail=(
+                    "SageMaker GPU Service Quotas code is not configured for: "
+                    + ", ".join(missing_quotas)
+                ),
+                metadata={
+                    "instance_type": self.config.instance_type,
+                    "missing_quota_types": ",".join(missing_quotas),
+                },
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
 
+        quota_values: dict[str, float] = {}
         try:
-            response = self._client("service-quotas").get_service_quota(
-                ServiceCode="sagemaker",
-                QuotaCode=self.config.sagemaker_gpu_quota_code,
-            )
-            quota = response.get("Quota", {})
-            raw_value = quota.get("Value")
-            quota_value = float(raw_value)
-            if not isfinite(quota_value) or quota_value < 0:
-                raise ValueError("SageMaker GPU quota value is not finite")
+            client = self._client("service-quotas")
+            for quota_type, quota_code in quota_codes:
+                if quota_code is None:
+                    continue
+                response = client.get_service_quota(
+                    ServiceCode="sagemaker",
+                    QuotaCode=quota_code,
+                )
+                quota = response.get("Quota", {})
+                quota_value = float(quota.get("Value"))
+                if not isfinite(quota_value) or quota_value < 0:
+                    raise ValueError(
+                        f"SageMaker {quota_type} GPU quota value is not finite"
+                    )
+                quota_values[quota_type] = quota_value
         except Exception as exc:
             self._gpu_quota_status = GpuQuotaStatus.UNKNOWN
             self._gpu_capacity_status = GpuCapacityStatus.UNKNOWN
@@ -1053,30 +1165,47 @@ class PreflightRunner:
                 name="gpu_quota",
                 status=CheckStatus.BLOCKED,
                 detail=_safe_detail(exc),
-                metadata={"instance_type": self.config.instance_type},
+                metadata={
+                    "instance_type": self.config.instance_type,
+                    **{
+                        f"{quota_type}_quota_value": str(value)
+                        for quota_type, value in quota_values.items()
+                    },
+                },
                 classification=PreflightClassification.BLOCKED_GPU_QUOTA,
             )
 
-        self._gpu_quota_status = GpuQuotaStatus.VERIFIED
-        self._gpu_capacity_status = GpuCapacityStatus.VERIFIED_BY_QUOTA
+        required_capacity = max(
+            self.config.minimum_gpu_quota, float(self.config.instance_count)
+        )
         metadata = {
             "instance_type": self.config.instance_type,
-            "quota_code": self.config.sagemaker_gpu_quota_code,
-            "quota_value": str(quota_value),
-            "required_capacity": str(self.config.minimum_gpu_quota),
-            "capacity_status": self._gpu_capacity_status.value,
+            "training_quota_code": quota_codes[0][1] or "",
+            "training_quota_value": str(quota_values["training"]),
+            "processing_quota_code": quota_codes[1][1] or "",
+            "processing_quota_value": str(quota_values["processing"]),
+            "required_capacity": str(required_capacity),
         }
-        if quota_value < self.config.minimum_gpu_quota or quota_value < self.config.instance_count:
+        insufficient = [
+            quota_type
+            for quota_type, value in quota_values.items()
+            if value < required_capacity
+        ]
+        if insufficient:
             self._gpu_quota_status = GpuQuotaStatus.INSUFFICIENT
             self._gpu_capacity_status = GpuCapacityStatus.UNAVAILABLE
             metadata["capacity_status"] = self._gpu_capacity_status.value
+            metadata["insufficient_quota_types"] = ",".join(insufficient)
             return CheckResult(
                 name="gpu_quota",
                 status=CheckStatus.BLOCKED,
-                detail="SageMaker GPU quota is below the requested run capacity",
+                detail="SageMaker GPU quota is insufficient for: " + ", ".join(insufficient),
                 metadata=metadata,
                 classification=PreflightClassification.BLOCKED_GPU_QUOTA,
             )
+        self._gpu_quota_status = GpuQuotaStatus.VERIFIED
+        self._gpu_capacity_status = GpuCapacityStatus.VERIFIED_BY_QUOTA
+        metadata["capacity_status"] = self._gpu_capacity_status.value
         return CheckResult(
             name="gpu_quota",
             status=CheckStatus.PASSED,
@@ -1092,7 +1221,7 @@ class PreflightRunner:
                 classification=PreflightClassification.BLOCKED_CONFIGURATION,
             )
         response = _http_json(
-            urljoin(self.config.objective_worker_url, "health"),
+            _objective_worker_endpoint(self.config.objective_worker_url, "v1/health"),
             method="GET",
             timeout=self.config.preflight_timeout_seconds,
             headers={"Authorization": f"Bearer {token}"},
@@ -1106,7 +1235,7 @@ class PreflightRunner:
         headers = {"Authorization": f"Bearer {token}"}
         try:
             readiness = _http_json(
-                urljoin(self.config.objective_worker_url, "v1/readiness"),
+                _objective_worker_endpoint(self.config.objective_worker_url, "v1/readiness"),
                 method="GET",
                 timeout=self.config.preflight_timeout_seconds,
                 headers=headers,
@@ -1169,7 +1298,7 @@ def _verify_objective_worker_auth(
     """Prove worker auth with its dedicated read-only probe endpoint."""
 
     response = _http_json(
-        urljoin(base_url, "v1/auth-probe"),
+        _objective_worker_endpoint(base_url, "v1/auth-probe"),
         method="GET",
         timeout=timeout,
         headers=headers,
@@ -1189,7 +1318,7 @@ class ObjectiveWorkerClient:
         base_url: str,
         *,
         auth_token: str | None = None,
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = OBJECTIVE_WORKER_TIMEOUT_MAX_SECONDS,
     ) -> None:
         parsed = urlparse(base_url)
         if parsed.scheme != "https" or not parsed.netloc:
@@ -1197,6 +1326,10 @@ class ObjectiveWorkerClient:
         self.base_url = base_url.rstrip("/") + "/"
         if auth_token is not None and not auth_token.strip():
             raise ValueError("objective worker auth token must not be empty")
+        if not 0 < timeout_seconds <= OBJECTIVE_WORKER_TIMEOUT_MAX_SECONDS:
+            raise ValueError(
+                "objective worker timeout_seconds must be greater than zero and at most 600"
+            )
         self._auth_token = auth_token
         self.timeout_seconds = timeout_seconds
 
@@ -1210,7 +1343,7 @@ class ObjectiveWorkerClient:
 
     def health(self) -> Mapping[str, Any]:
         response = _http_json(
-            urljoin(self.base_url, "health"),
+            _objective_worker_endpoint(self.base_url, "v1/health"),
             method="GET",
             timeout=self.timeout_seconds,
             headers=self._headers(),
@@ -1231,7 +1364,7 @@ class ObjectiveWorkerClient:
 
     def execute_benchmark(self, request: ObjectiveBenchmarkRequest) -> ObjectiveBenchmarkResult:
         response = _http_json(
-            urljoin(self.base_url, "v1/benchmark"),
+            _objective_worker_endpoint(self.base_url, "v1/benchmark"),
             method="POST",
             timeout=self.timeout_seconds,
             headers=self._headers(),
@@ -1274,7 +1407,7 @@ class ObjectiveWorkerClient:
             raise LiveExecutionFailed("objective curation requires verifier-confirmed references")
 
         response = _http_json(
-            urljoin(self.base_url, "v1/verify-curation"),
+            _objective_worker_endpoint(self.base_url, "v1/verify-curation"),
             method="POST",
             timeout=self.timeout_seconds,
             headers=self._headers(),
@@ -1290,6 +1423,62 @@ class ObjectiveWorkerClient:
         if not isinstance(response, Mapping):
             raise LiveExecutionFailed("objective worker returned a non-object curation response")
         return response
+
+    def replay_corrections(
+        self,
+        *,
+        run_id: str,
+        experiment_id: str,
+        split: Any,
+        proposals: Sequence[Any],
+    ) -> Any:
+        """Submit untrusted action proposals for deterministic objective replay."""
+
+        from app.objective.models import (
+            CorrectionProposal,
+            CorrectionReplayRequest,
+            CorrectionReplayResponse,
+            ObjectiveSplit,
+        )
+
+        try:
+            scope = ObjectiveSplit(split)
+            request = CorrectionReplayRequest(
+                run_id=run_id,
+                experiment_id=experiment_id,
+                split=scope,
+                proposals=tuple(
+                    item
+                    if isinstance(item, CorrectionProposal)
+                    else CorrectionProposal.model_validate(item)
+                    for item in proposals
+                ),
+            )
+        except Exception as exc:
+            raise LiveExecutionFailed("objective correction proposal is malformed") from exc
+
+        response = _http_json(
+            _objective_worker_endpoint(self.base_url, "v1/replay-corrections"),
+            method="POST",
+            timeout=self.timeout_seconds,
+            headers=self._headers(),
+            payload=request.model_dump(mode="json"),
+        )
+        try:
+            parsed = CorrectionReplayResponse.model_validate(response)
+        except Exception as exc:
+            raise LiveExecutionFailed(
+                "objective worker returned malformed correction replay evidence"
+            ) from exc
+        if (
+            parsed.run_id != run_id
+            or parsed.experiment_id != experiment_id
+            or parsed.split is not scope
+            or tuple(outcome.proposal_id for outcome in parsed.outcomes)
+            != tuple(proposal.proposal_id for proposal in request.proposals)
+        ):
+            raise LiveExecutionFailed("objective correction replay provenance does not match")
+        return parsed
 
 
 class RunSlotStore(Protocol):
@@ -1407,13 +1596,28 @@ class AutonomousRunController:
     _owned_job_names: set[str] = field(default_factory=set, init=False, repr=False)
     _used_approval_digests: set[str] = field(default_factory=set, init=False, repr=False)
 
+    def _require_legacy_training_input_uri(self) -> str:
+        uri = self.config.training_input_s3_uri
+        if not isinstance(uri, str) or not uri.strip():
+            raise LiveExecutionBlocked(
+                "legacy synchronous execution requires TRAINING_INPUT_S3_URI",
+                classification=PreflightClassification.BLOCKED_CONFIGURATION,
+            )
+        return uri
+
     def run_once(self, *, run_number: int, approval_token: str) -> LiveRunSummary:
         self._validate_run_number(run_number)
+        training_input_s3_uri = self._require_legacy_training_input_uri()
         # Decode and authenticate before touching a provider.  The signed
         # packet carries the run id and manifest digest, so a token cannot be
         # replayed against a different run or configuration.
         packet = self._require_approval(approval_token, run_number=run_number)
-        preflight = PreflightRunner(self.config).run()
+        preflight_runner = PreflightRunner(self.config)
+        # Normal readiness omits this obsolete static input. Preserve the
+        # legacy controller's original gate before writing its run manifest
+        # or submitting a static-input SageMaker training job.
+        preflight_runner._check_input_readiness("training")
+        preflight = preflight_runner.run()
         if not preflight.ready:
             raise LiveExecutionBlocked("preflight is BLOCKED; no cloud job was submitted")
 
@@ -1476,6 +1680,7 @@ class AutonomousRunController:
             baseline = self._benchmark(
                 run_id=run_id,
                 model_uri=checkpoint_uri,
+                model_sha256=self._checkpoint_sha256(None),
                 split="baseline",
                 episodes=self.config.baseline_episodes,
                 output_s3_uri=f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/{run_id}/baseline",
@@ -1485,7 +1690,7 @@ class AutonomousRunController:
                 job_name=f"apt-{run_id}-train",
                 role_arn=self.config.training_role_arn,
                 image_uri=self.config.training_image,
-                input_s3_uri=self.config.training_input_s3_uri,
+                input_s3_uri=training_input_s3_uri,
                 output_s3_uri=f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/{run_id}/candidate",
                 instance_type=self.config.instance_type,
                 instance_count=self.config.instance_count,
@@ -1581,6 +1786,7 @@ class AutonomousRunController:
             candidate = self._benchmark(
                 run_id=run_id,
                 model_uri=training_job.artifact_uri,
+                model_sha256=getattr(training_job, "artifact_sha256", ""),
                 split="held_out",
                 episodes=self.config.held_out_episodes,
                 output_s3_uri=f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/{run_id}/held-out",
@@ -1848,7 +2054,7 @@ class AutonomousRunController:
             "hf_revision": self.config.hf_revision,
             "checkpoint_sha256": checkpoint_sha256,
             "checkpoint_s3_uri": checkpoint_uri,
-            "training_input_s3_uri": self.config.training_input_s3_uri,
+            "training_input_s3_uri": self._require_legacy_training_input_uri(),
             "evaluation_input_s3_uri": self.config.evaluation_input_s3_uri,
             "suite": self.config.objective_suite,
             "suite_version": self.config.objective_suite_version,
@@ -1936,6 +2142,7 @@ class AutonomousRunController:
         *,
         run_id: str,
         model_uri: str,
+        model_sha256: str,
         split: str,
         episodes: int,
         output_s3_uri: str,
@@ -1948,6 +2155,7 @@ class AutonomousRunController:
         request = ObjectiveBenchmarkRequest(
             run_id=run_id,
             model_uri=model_uri,
+            model_sha256=model_sha256,
             suite=self.config.objective_suite,
             suite_version=self.config.objective_suite_version,
             seed=self.config.seed,
@@ -2131,7 +2339,10 @@ class AutonomousRunController:
     def _wait_policy(self) -> Any:
         from app.posttraining.objective_workflow import JobWaitPolicy
 
-        return JobWaitPolicy(max_attempts=120, poll_interval_seconds=30.0)
+        return JobWaitPolicy(
+            max_attempts=self.config.provider_max_polls,
+            poll_interval_seconds=self.config.provider_poll_interval_seconds,
+        )
 
     def _cleanup(
         self,
@@ -2234,6 +2445,14 @@ class LiveObjectiveAdapter:
             raise LiveExecutionBlocked("a verified checkpoint URI is required")
         return uri
 
+    def _model_sha256(self, state: Any) -> str:
+        digest = getattr(state, "champion_checkpoint_sha256", None) or getattr(
+            state, "base_checkpoint_sha256", None
+        )
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise LiveExecutionBlocked("a verified champion model SHA-256 is required")
+        return digest
+
     @staticmethod
     def _evidence(result: ObjectiveBenchmarkResult, *, run_number: int) -> Any:
         from app.autonomous.supervisor import BenchmarkEvidence
@@ -2298,12 +2517,13 @@ class LiveObjectiveAdapter:
         request = ObjectiveBenchmarkRequest(
             run_id=state.run_id,
             model_uri=self._model_uri(state),
+            model_sha256=self._model_sha256(state),
             suite=self.config.objective_suite,
             suite_version=self.config.objective_suite_version,
             seed=self.config.seed,
             num_episodes=(
                 self.config.baseline_episodes
-                if split == "baseline"
+                if split == "train"
                 else self.config.held_out_episodes
             ),
             split=cast(Literal["train", "replay"], split),
@@ -2324,9 +2544,10 @@ class LiveObjectiveAdapter:
             result.run_id != request.run_id
             or result.suite != request.suite
             or result.suite_version != request.suite_version
+            or result.model_id != request.model_uri
+            or result.model_sha256 != request.model_sha256
             or result.seed != request.seed
             or result.split != request.split
-            or result.benchmark_id != self.config.benchmark_id
         ):
             raise LiveExecutionFailed("objective result provenance does not match the run scope")
         return result
@@ -2334,6 +2555,7 @@ class LiveObjectiveAdapter:
     def build_dataset(self, state: Any, plan: Any, *, experiment_number: int) -> Any:
         from app.autonomous.supervisor import DatasetArtifact
         from app.objective.models import (
+            CorrectionReplayResponse,
             Dataset,
             ObjectiveSplit,
             decode_trajectory_reference,
@@ -2348,20 +2570,69 @@ class LiveObjectiveAdapter:
             raise LiveExecutionFailed(
                 "curation plan contains malformed trajectory provenance"
             ) from exc
-        if not references:
-            raise LiveExecutionFailed("curation plan selected no trajectory references")
         if len({reference.trajectory_id for reference in references}) != len(references):
             raise LiveExecutionFailed("curation plan contains duplicate trajectory references")
-        splits = {reference.split for reference in references}
+        proposals = tuple(getattr(plan, "correction_proposals", ()))
+        if not references and not proposals:
+            raise LiveExecutionFailed("curation plan contains neither selected records nor repairs")
+        splits = {reference.split for reference in references} | {
+            proposal.split for proposal in proposals
+        }
         if len(splits) != 1 or not splits.issubset(
             {ObjectiveSplit.TRAIN, ObjectiveSplit.REPLAY}
         ):
             raise LiveExecutionFailed("curation plan must use one actual train/replay split")
 
+        accepted_references: tuple[Any, ...] = ()
+        if proposals:
+            replay = self.client.replay_corrections(
+                run_id=state.run_id,
+                experiment_id=f"{state.run_id}-{experiment_number}",
+                split=next(iter(splits)),
+                proposals=proposals,
+            )
+            if not isinstance(replay, CorrectionReplayResponse):
+                try:
+                    replay = CorrectionReplayResponse.model_validate(replay)
+                except Exception as exc:
+                    raise LiveExecutionFailed(
+                        "objective correction response is not typed replay evidence"
+                    ) from exc
+            expected_proposal_ids = tuple(proposal.proposal_id for proposal in proposals)
+            if (
+                replay.run_id != state.run_id
+                or replay.experiment_id != f"{state.run_id}-{experiment_number}"
+                or replay.split is not next(iter(splits))
+                or tuple(outcome.proposal_id for outcome in replay.outcomes)
+                != expected_proposal_ids
+            ):
+                raise LiveExecutionFailed("objective correction replay provenance does not match")
+            expected_proposals = {proposal.proposal_id: proposal for proposal in proposals}
+            for outcome in replay.outcomes:
+                proposal = expected_proposals[outcome.proposal_id]
+                if (
+                    outcome.source_trajectory_id != proposal.source_trajectory_id
+                    or outcome.task_id != proposal.task_id
+                    or outcome.split is not proposal.split
+                ):
+                    raise LiveExecutionFailed("objective correction lineage differs from proposal")
+            accepted_references = tuple(
+                outcome.trajectory_reference
+                for outcome in replay.outcomes
+                if outcome.status == "PASS" and outcome.trajectory_reference is not None
+            )
+        all_references = references + accepted_references
+        if not all_references:
+            raise LiveExecutionFailed("no selected or verifier-passing correction is available")
+        if len({reference.trajectory_id for reference in all_references}) != len(all_references):
+            raise LiveExecutionFailed(
+                "objective curation references contain duplicate trajectories"
+            )
+
         response = self.client.verify_curation(
             run_id=state.run_id,
             experiment_id=f"{state.run_id}-{experiment_number}",
-            trajectory_references=references,
+            trajectory_references=all_references,
         )
         try:
             dataset = Dataset.model_validate(response)
@@ -2369,21 +2640,41 @@ class LiveObjectiveAdapter:
             raise LiveExecutionFailed(
                 "objective curation response is not a verified dataset"
             ) from exc
-        expected_provenance = tuple(
-            (reference.trajectory_id, reference.task_id, reference.split)
-            for reference in references
-        )
-        actual_provenance = tuple(
-            (row.source_trajectory_id, row.task_id, row.split) for row in dataset.rows
-        )
+        expected_provenance = {
+            reference.trajectory_id: (reference.task_id, reference.split)
+            for reference in all_references
+        }
+        accepted_lineage = {
+            outcome.trajectory_reference.trajectory_id: outcome.source_trajectory_id
+            for outcome in replay.outcomes
+            if proposals
+            and outcome.status == "PASS"
+            and outcome.trajectory_reference is not None
+        } if proposals else {}
+        actual_ids = tuple(row.source_trajectory_id for row in dataset.rows)
         if (
             dataset.manifest.run_id != state.run_id
             or dataset.manifest.experiment_id != f"{state.run_id}-{experiment_number}"
-            or dataset.manifest.source_trajectory_ids
-            != tuple(reference.trajectory_id for reference in references)
-            or actual_provenance != expected_provenance
+            or dataset.manifest.source_trajectory_ids != actual_ids
+            or len(set(actual_ids)) != len(actual_ids)
             or any(
-                not row.verifier_confirmed or row.source_type != "verified_replay"
+                row.source_trajectory_id not in expected_provenance
+                or (row.task_id, row.split)
+                != expected_provenance[row.source_trajectory_id]
+                or row.repaired_from_trajectory_id
+                != accepted_lineage.get(row.source_trajectory_id)
+                or row.source_type
+                != (
+                    "repaired_replay"
+                    if row.source_trajectory_id in accepted_lineage
+                    else "successful_replay"
+                )
+                for row in dataset.rows
+            )
+            or any(
+                not row.verifier_confirmed
+                or not row.verifier_success
+                or row.source_type not in {"successful_replay", "repaired_replay"}
                 for row in dataset.rows
             )
         ):
@@ -2524,8 +2815,16 @@ class LiveRequestFactory:
             "APPROVED_DATASET_ARTIFACT_ID": artifact_id,
             "BASE_MODEL_ID": model_id,
             "BASE_MODEL_REVISION": model_revision,
+            "BASE_MODEL_BUNDLE_SHA256": self._sha(
+                getattr(state, "base_checkpoint_sha256", None), "base model bundle SHA-256"
+            ),
             "QLORA_CONFIG": json.dumps(dict(qlora_config), sort_keys=True, separators=(",", ":")),
         }
+        base_model_uri = self._versioned_content_uri(
+            getattr(state, "base_checkpoint_uri", None),
+            environment["BASE_MODEL_BUNDLE_SHA256"],
+            suffix=".tar.gz",
+        )
         parent_uri = None
         if experiment_number > 1:
             metadata = getattr(state, "metadata", {})
@@ -2563,6 +2862,7 @@ class LiveRequestFactory:
             input_s3_uri=self._dataset_prefix(dataset),
             output_s3_uri=f"s3://{self.config.artifact_bucket}/{self.config.artifact_prefix}/{state.run_id}/train/{experiment_number}",
             instance_type=cast(str, instance_type),
+            base_model_s3_uri=base_model_uri,
             parent_adapter_s3_uri=parent_uri,
             instance_count=cast(int, instance_count),
             volume_size_gb=cast(int, volume_size_gb),
@@ -2583,13 +2883,31 @@ class LiveRequestFactory:
         candidate_uri = self._versioned_content_uri(
             getattr(candidate, "uri", None), getattr(candidate, "sha256", None), suffix=".tar.gz"
         )
-        champion_uri_raw = getattr(state, "champion_checkpoint_uri", None) or getattr(
-            state, "base_checkpoint_uri", None
+        base_model_id = getattr(state, "model_id", self.config.target_model)
+        base_model_revision = getattr(state, "checkpoint_revision", self.config.hf_revision)
+        if (
+            base_model_id != self.config.target_model
+            or base_model_revision != self.config.hf_revision
+        ):
+            raise LiveExecutionBlocked("approved base model identity does not match configuration")
+        base_model_sha = self._sha(
+            getattr(state, "base_checkpoint_sha256", None), "base model bundle SHA-256"
         )
-        champion_sha = getattr(state, "champion_checkpoint_sha256", None) or getattr(
-            state, "base_checkpoint_sha256", None
+        base_model_uri = self._versioned_content_uri(
+            getattr(state, "base_checkpoint_uri", None), base_model_sha, suffix=".tar.gz"
         )
-        champion_uri = self._versioned_content_uri(champion_uri_raw, champion_sha, suffix=".tar.gz")
+        champion_kind = "base-model"
+        champion_uri = base_model_uri
+        champion_sha = base_model_sha
+        if experiment_number > 1:
+            promoted_uri = getattr(state, "champion_checkpoint_uri", None)
+            promoted_sha = getattr(state, "champion_checkpoint_sha256", None)
+            if promoted_uri is not None or promoted_sha is not None:
+                champion_uri = self._versioned_content_uri(
+                    promoted_uri, promoted_sha, suffix=".tar.gz"
+                )
+                champion_sha = self._sha(promoted_sha, "promoted champion archive SHA-256")
+                champion_kind = "qlora-adapter"
         sealed_uri = self.config.evaluation_input_s3_uri
         sealed = urlparse(sealed_uri)
         if (
@@ -2615,6 +2933,7 @@ class LiveRequestFactory:
             candidate_s3_uri=candidate_uri,
             champion_s3_uri=champion_uri,
             sealed_s3_uri=sealed_uri,
+            base_model_s3_uri=base_model_uri,
             instance_type=cast(str, instance_type),
             instance_count=cast(int, instance_count),
             volume_size_gb=cast(int, volume_size_gb),
@@ -2629,6 +2948,10 @@ class LiveRequestFactory:
                     getattr(candidate, "sha256", None), "candidate archive SHA-256"
                 ),
                 "CHAMPION_ARCHIVE_SHA256": self._sha(champion_sha, "champion archive SHA-256"),
+                "CHAMPION_KIND": champion_kind,
+                "BASE_MODEL_ID": base_model_id,
+                "BASE_MODEL_REVISION": base_model_revision,
+                "BASE_MODEL_BUNDLE_SHA256": base_model_sha,
             },
         )
 
@@ -2706,7 +3029,7 @@ class LiveEvaluationReader:
             f"{self.config.artifact_prefix}/{state.run_id}/eval/{experiment_number}"
         )
         try:
-            artifact = self.artifact_store.canonicalize_sagemaker_output(
+            artifact = self.artifact_store.canonicalize_sagemaker_processing_output(
                 job.artifact_uri,
                 retained_prefix=f"{self.config.artifact_prefix}/{state.run_id}/evaluations",
                 allowed_source_bucket=self.config.artifact_bucket,
@@ -2716,7 +3039,7 @@ class LiveEvaluationReader:
                 raise LiveExecutionFailed(
                     "SageMaker evaluator artifact exceeds the report size limit"
                 )
-            archive_bytes = self.artifact_store.get_bytes(artifact)
+            artifact_bytes = self.artifact_store.get_bytes(artifact)
         except LiveExecutionFailed:
             raise
         except Exception as exc:
@@ -2724,29 +3047,42 @@ class LiveEvaluationReader:
                 "SageMaker evaluator artifact could not be retained and verified"
             ) from exc
         try:
-            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
-                candidates = []
-                for member in archive.getmembers():
-                    components = member.name.split("/")
+            retained_filename = artifact.key.rsplit("/", 1)[-1]
+            if retained_filename.endswith(".json"):
+                if not artifact_bytes or len(artifact_bytes) > 4 * 1024 * 1024:
+                    raise ValueError("evaluation.json must be non-empty and bounded")
+                report_bytes = artifact_bytes
+            elif retained_filename.endswith(".tar.gz"):
+                with tarfile.open(fileobj=io.BytesIO(artifact_bytes), mode="r:gz") as archive:
+                    candidates = []
+                    for member in archive.getmembers():
+                        components = member.name.split("/")
+                        if (
+                            member.isfile()
+                            and components[-1] == "evaluation.json"
+                            and not member.name.startswith("/")
+                            and all(part not in {"", ".", ".."} for part in components)
+                        ):
+                            candidates.append(member)
                     if (
-                        member.isfile()
-                        and components[-1] == "evaluation.json"
-                        and not member.name.startswith("/")
-                        and all(part not in {"", ".", ".."} for part in components)
+                        len(candidates) != 1
+                        or candidates[0].size < 1
+                        or candidates[0].size > 4 * 1024 * 1024
                     ):
-                        candidates.append(member)
-                if (
-                    len(candidates) != 1
-                    or candidates[0].size < 1
-                    or candidates[0].size > 4 * 1024 * 1024
-                ):
-                    raise ValueError("archive must contain one bounded evaluation.json")
-                report_stream = archive.extractfile(candidates[0])
-                if report_stream is None:
-                    raise ValueError("evaluation report is unreadable")
-                report_bytes = report_stream.read(4 * 1024 * 1024 + 1)
-                if len(report_bytes) != candidates[0].size or len(report_bytes) > 4 * 1024 * 1024:
-                    raise ValueError("evaluation report size does not match archive metadata")
+                        raise ValueError("archive must contain one bounded evaluation.json")
+                    report_stream = archive.extractfile(candidates[0])
+                    if report_stream is None:
+                        raise ValueError("evaluation report is unreadable")
+                    report_bytes = report_stream.read(4 * 1024 * 1024 + 1)
+                    if (
+                        len(report_bytes) != candidates[0].size
+                        or len(report_bytes) > 4 * 1024 * 1024
+                    ):
+                        raise ValueError("evaluation report size does not match archive metadata")
+            else:
+                raise ValueError(
+                    "retained Processing object is not a supported evaluation artifact"
+                )
             report = json.loads(report_bytes.decode("utf-8"))
             if not isinstance(report, Mapping):
                 raise ValueError("evaluation report must be an object")
@@ -3079,6 +3415,7 @@ def create_autonomous_live_components(
     worker = objective_worker or ObjectiveWorkerClient(
         config.objective_worker_url,
         auth_token=config.objective_worker_auth_token,
+        timeout_seconds=config.objective_worker_timeout_seconds,
     )
     sagemaker = provider or SageMakerProvider(region_name=config.aws_region)
     store = artifact_store or S3ArtifactStore(
@@ -3115,8 +3452,9 @@ def create_autonomous_live_components(
         readiness=cast(Any, readiness),
         approval_verifier=approval_verifier,
         telemetry=cast(Any, durable_telemetry),
-        max_polls=120,
-        poll_interval_seconds=30.0,
+        max_polls=config.provider_max_polls,
+        poll_interval_seconds=config.provider_poll_interval_seconds,
+        phase_cost_upper_bounds_usd=config.phase_cost_upper_bounds_usd,
     )
     dispatcher = AutonomousRunDispatcher(
         repository=repository,
@@ -3143,7 +3481,6 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> LiveExe
         "objective_worker_url": "OBJECTIVE_WORKER_URL",
         "hf_repo_id": "HF_REPO_ID",
         "hf_revision": "HF_REVISION",
-        "training_input_s3_uri": "TRAINING_INPUT_S3_URI",
         "evaluation_input_s3_uri": "EVALUATION_INPUT_S3_URI",
     }
     missing = [key for key, variable in required.items() if not env.get(variable)]
@@ -3152,6 +3489,7 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> LiveExe
     values: dict[str, Any] = {key: env[variable] for key, variable in required.items()}
     values.update(
         {
+            "training_input_s3_uri": env.get("TRAINING_INPUT_S3_URI") or None,
             "aws_region": env.get("AWS_REGION", "us-east-1"),
             "objective_worker_auth_token": (
                 env.get("OBJECTIVE_WORKER_AUTH_TOKEN") or env.get("OBJECTIVE_WORKER_TOKEN")
@@ -3173,11 +3511,17 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> LiveExe
                 if item.strip()
             ),
             "sagemaker_gpu_quota_code": env.get("SAGEMAKER_GPU_QUOTA_CODE") or None,
+            "sagemaker_processing_gpu_quota_code": (
+                env.get("SAGEMAKER_PROCESSING_GPU_QUOTA_CODE") or None
+            ),
             "minimum_gpu_quota": float(env.get("MINIMUM_GPU_QUOTA", "1")),
             "instance_count": int(env.get("SAGEMAKER_INSTANCE_COUNT", "1")),
             "volume_size_gb": int(env.get("SAGEMAKER_VOLUME_SIZE_GB", "30")),
             "approval_secret_env": env.get("LIVE_APPROVAL_SECRET_ENV", "LIVE_APPROVAL_SECRET"),
-            "approval_ttl_seconds": int(env.get("LIVE_APPROVAL_TTL_SECONDS", "900")),
+            "approval_ttl_seconds": int(env.get("LIVE_APPROVAL_TTL_SECONDS", "86400")),
+            "objective_worker_timeout_seconds": int(
+                env.get("OBJECTIVE_WORKER_TIMEOUT_SECONDS", "600")
+            ),
         }
     )
     return LiveExecutionConfig.model_validate(values)

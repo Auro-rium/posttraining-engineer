@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import struct
+import sys
 import tarfile
+import types
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -12,11 +15,14 @@ import pytest
 
 from app.objective.engine import ServiceRecoveryEngine
 from app.objective.models import DatasetManifest, DatasetRow, ObjectiveSplit
+from scripts.stage_functiongemma_checkpoint import build_deterministic_bundle
 from workers.evaluator.evaluate import (
     EvaluationMetrics,
     EvaluationWorkerError,
     InvalidModelAction,
     _decode_actions,
+    _model_policy,
+    _sealed_manifest,
     build_evaluation_report,
     parse_evaluation_inputs,
     render_action_prompt,
@@ -25,6 +31,7 @@ from workers.evaluator.evaluate import (
 )
 from workers.trainer.train import (
     BASE_MODEL_ID,
+    TrainingInputs,
     TrainingWorkerError,
     format_sft_example,
     load_training_dataset,
@@ -45,7 +52,9 @@ def _dataset_fixture(root: Path) -> Path:
         messages=({"role": "tool", "name": "get_logs", "arguments": {}},),
         failure_label="service_recovery",
         verifier_confirmed=True,
-        source_type="verified_replay",
+        verifier_success=True,
+        repaired_from_trajectory_id=None,
+        source_type="successful_replay",
     )
     payload = row.canonical_json()
     digest = hashlib.sha256(payload.encode()).hexdigest()
@@ -70,6 +79,28 @@ def _dataset_fixture(root: Path) -> Path:
         + "\n"
     )
     return train
+
+
+def _base_model_channel(root: Path) -> tuple[Path, str]:
+    snapshot = root / "base-model-snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text(
+        json.dumps({"architectures": ["Gemma3ForCausalLM"], "model_type": "gemma3_text"})
+    )
+    (snapshot / "tokenizer.json").write_text('{"version":1}')
+    (snapshot / "tokenizer_config.json").write_text("{}")
+    header = json.dumps(
+        {"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}},
+        separators=(",", ":"),
+    ).encode()
+    (snapshot / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + b"\x00" * 4
+    )
+    bundle = build_deterministic_bundle(snapshot, revision="a" * 40)
+    channel = root / "base-model-channel"
+    channel.mkdir()
+    (channel / f"{bundle.sha256}.tar.gz").write_bytes(bundle.data)
+    return channel, bundle.sha256
 
 
 def _dataset_digest(train: Path) -> str:
@@ -257,11 +288,13 @@ def test_training_manifest_rejects_output_without_a_real_peft_adapter(tmp_path: 
 
 def test_training_refuses_to_reuse_a_preexisting_model_output(tmp_path: Path) -> None:
     train = _dataset_fixture(tmp_path)
+    base_model_channel, base_model_sha256 = _base_model_channel(tmp_path)
     model_dir = tmp_path / "model"
     _write_adapter_artifacts(model_dir, b"stale-adapter")
     inputs = parse_training_inputs(
         {
             "SM_CHANNEL_TRAIN": str(train),
+            "SM_CHANNEL_BASE_MODEL": str(base_model_channel),
             "SM_MODEL_DIR": str(model_dir),
             "RUN_ID": "run-1",
             "EXPERIMENT_ID": "exp-1",
@@ -270,6 +303,7 @@ def test_training_refuses_to_reuse_a_preexisting_model_output(tmp_path: Path) ->
             "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
             "BASE_MODEL_ID": BASE_MODEL_ID,
             "BASE_MODEL_REVISION": "a" * 40,
+            "BASE_MODEL_BUNDLE_SHA256": base_model_sha256,
             "QLORA_CONFIG": json.dumps(_qlora_config()),
         }
     )
@@ -383,6 +417,7 @@ def test_parent_adapter_manifest_is_verified_and_carried_into_lineage(tmp_path: 
 
 def test_trainer_extracts_and_verifies_approved_parent_channel(tmp_path: Path) -> None:
     train = _dataset_fixture(tmp_path)
+    base_model_channel, base_model_sha256 = _base_model_channel(tmp_path)
     parent = tmp_path / "parent"
     parent.mkdir()
     _write_adapter_artifacts(parent, b"approved parent")
@@ -411,6 +446,7 @@ def test_trainer_extracts_and_verifies_approved_parent_channel(tmp_path: Path) -
     inputs = parse_training_inputs(
         {
             "SM_CHANNEL_TRAIN": str(train),
+            "SM_CHANNEL_BASE_MODEL": str(base_model_channel),
             "SM_CHANNEL_PARENT_ADAPTER": str(channel),
             "SM_MODEL_DIR": str(tmp_path / "model"),
             "RUN_ID": "run-1",
@@ -420,6 +456,7 @@ def test_trainer_extracts_and_verifies_approved_parent_channel(tmp_path: Path) -
             "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
             "BASE_MODEL_ID": BASE_MODEL_ID,
             "BASE_MODEL_REVISION": "a" * 40,
+            "BASE_MODEL_BUNDLE_SHA256": base_model_sha256,
             "QLORA_CONFIG": json.dumps(_qlora_config()),
             "APPROVED_PARENT_ARTIFACT_ID": parent_manifest["artifact_id"],
             "APPROVED_PARENT_MANIFEST_SHA256": parent_manifest["manifest_sha256"],
@@ -489,6 +526,273 @@ def test_evaluator_extracts_candidate_and_champion_archives(tmp_path: Path) -> N
     )["kind"] == "qlora-adapter"
     assert inputs.champion_dir is not None
     assert (inputs.champion_dir / "manifest.json").is_file()
+
+
+def test_evaluator_extracts_content_addressed_base_model_channel(tmp_path: Path) -> None:
+    base_snapshot = tmp_path / "base-snapshot"
+    base_snapshot.mkdir()
+    (base_snapshot / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma3_text",
+                "architectures": ["Gemma3ForCausalLM"],
+            }
+        )
+    )
+    (base_snapshot / "model.safetensors").write_bytes(b"immutable-base-weights")
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+        for path in base_snapshot.iterdir():
+            bundle.add(path, arcname=path.name)
+    archive_bytes = archive.getvalue()
+    archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+    base_channel = tmp_path / "base-model-channel"
+    base_channel.mkdir()
+    (base_channel / f"{archive_sha}.tar.gz").write_bytes(archive_bytes)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+
+    inputs = parse_evaluation_inputs(
+        {
+            "RUN_ID": "run-1",
+            "EXPERIMENT_ID": "exp-1",
+            "EVALUATION_MANIFEST_SHA256": "b" * 64,
+            "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+            "OBJECTIVE_SEED": "7",
+            "BASE_MODEL_ID": BASE_MODEL_ID,
+            "BASE_MODEL_REVISION": "a" * 40,
+            "BASE_MODEL_BUNDLE_SHA256": archive_sha,
+            "EVALUATION_BASE_MODEL_DIR": str(base_channel),
+            "SM_OUTPUT_DATA_DIR": str(tmp_path / "output"),
+        },
+        {"candidate": candidate, "sealed": sealed},
+    )
+
+    assert inputs.base_model_dir is not None
+    assert (inputs.base_model_dir / "model.safetensors").read_bytes() == b"immutable-base-weights"
+    assert inputs.base_model_archive_sha256 == archive_sha
+    assert inputs.base_model_revision == "a" * 40
+
+
+def test_evaluator_base_model_policy_loads_only_local_and_skips_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class _Model:
+        device = "cpu"
+
+        def eval(self) -> _Model:
+            return self
+
+    class _Processor:
+        pass
+
+    class _AutoProcessor:
+        @staticmethod
+        def from_pretrained(path: Path, **kwargs: object) -> _Processor:
+            calls.append(("processor", str(path), dict(kwargs)))
+            return _Processor()
+
+    class _AutoModel:
+        @staticmethod
+        def from_pretrained(path: Path, **kwargs: object) -> _Model:
+            calls.append(("model", str(path), dict(kwargs)))
+            return _Model()
+
+    transformer_module = types.ModuleType("transformers")
+    transformer_module.AutoProcessor = _AutoProcessor
+    transformer_module.AutoModelForCausalLM = _AutoModel
+    peft_module = types.ModuleType("peft")
+
+    class _UnexpectedPeft:
+        @staticmethod
+        def from_pretrained(*_: object, **__: object) -> _Model:
+            raise AssertionError("base-model champion must not load a LoRA adapter")
+
+    peft_module.PeftModel = _UnexpectedPeft
+    monkeypatch.setitem(sys.modules, "transformers", transformer_module)
+    monkeypatch.setitem(sys.modules, "peft", peft_module)
+    base_dir = tmp_path / "immutable-base"
+    base_dir.mkdir()
+    (base_dir / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text", "architectures": ["Gemma3ForCausalLM"]})
+    )
+    (base_dir / "model.safetensors").write_bytes(b"weights")
+
+    _model_policy(
+        base_dir,
+        {"base_model_id": BASE_MODEL_ID, "base_model_revision": "a" * 40},
+        base_model_dir=base_dir,
+        use_adapter=False,
+    )
+
+    assert [(kind, path) for kind, path, _ in calls] == [
+        ("processor", str(base_dir)),
+        ("model", str(base_dir)),
+    ]
+    assert all(call[2].get("local_files_only") is True for call in calls)
+
+
+def test_evaluator_adapter_policy_applies_lora_to_local_base_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class _Model:
+        device = "cpu"
+
+        def eval(self) -> _Model:
+            return self
+
+    class _Processor:
+        pass
+
+    class _AutoProcessor:
+        @staticmethod
+        def from_pretrained(path: Path, **kwargs: object) -> _Processor:
+            calls.append(("processor", str(path), dict(kwargs)))
+            return _Processor()
+
+    class _AutoModel:
+        @staticmethod
+        def from_pretrained(path: Path, **kwargs: object) -> _Model:
+            calls.append(("base", str(path), dict(kwargs)))
+            return _Model()
+
+    class _PeftModel:
+        @staticmethod
+        def from_pretrained(model: _Model, path: Path, **kwargs: object) -> _Model:
+            calls.append(("adapter", str(path), dict(kwargs)))
+            return model
+
+    transformer_module = types.ModuleType("transformers")
+    transformer_module.AutoProcessor = _AutoProcessor
+    transformer_module.AutoModelForCausalLM = _AutoModel
+    peft_module = types.ModuleType("peft")
+    peft_module.PeftModel = _PeftModel
+    monkeypatch.setitem(sys.modules, "transformers", transformer_module)
+    monkeypatch.setitem(sys.modules, "peft", peft_module)
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    adapter_dir = tmp_path / "candidate-adapter"
+    adapter_dir.mkdir()
+
+    _model_policy(
+        adapter_dir,
+        {"base_model_id": BASE_MODEL_ID, "base_model_revision": "a" * 40},
+        base_model_dir=base_dir,
+        use_adapter=True,
+    )
+
+    assert [(kind, path) for kind, path, _ in calls] == [
+        ("processor", str(base_dir)),
+        ("base", str(base_dir)),
+        ("adapter", str(adapter_dir)),
+    ]
+    assert all(call[2].get("local_files_only") is True for call in calls)
+
+
+def test_first_evaluation_accepts_base_model_champion_and_adapter_candidate(
+    tmp_path: Path,
+) -> None:
+    train = tmp_path / "training-input"
+    train.mkdir()
+    dataset_sha = "c" * 64
+    (train / "dataset.json").write_text(
+        json.dumps(
+            {
+                "manifest": {
+                    "dataset_id": "dataset-1",
+                    "run_id": "run-1",
+                    "experiment_id": "exp-1",
+                    "sha256": dataset_sha,
+                }
+            }
+        )
+    )
+    candidate = tmp_path / "candidate"
+    _write_adapter_artifacts(candidate, b"candidate-adapter")
+    write_training_manifest(
+        train,
+        output_dir=candidate,
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=dataset_sha,
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        qlora_config=_qlora_config(),
+    )
+
+    base_snapshot = tmp_path / "base-snapshot"
+    base_snapshot.mkdir()
+    (base_snapshot / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text", "architectures": ["Gemma3ForCausalLM"]})
+    )
+    (base_snapshot / "model.safetensors").write_bytes(b"immutable-base-weights")
+    base_archive = io.BytesIO()
+    with tarfile.open(fileobj=base_archive, mode="w:gz") as bundle:
+        for path in base_snapshot.iterdir():
+            bundle.add(path, arcname=path.name)
+    base_archive_bytes = base_archive.getvalue()
+    base_archive_sha = hashlib.sha256(base_archive_bytes).hexdigest()
+    base_model_channel = tmp_path / "base-model-channel"
+    champion_channel = tmp_path / "champion-channel"
+    sealed = tmp_path / "sealed"
+    for directory in (base_model_channel, champion_channel, sealed):
+        directory.mkdir()
+    for directory in (base_model_channel, champion_channel):
+        (directory / f"{base_archive_sha}.tar.gz").write_bytes(base_archive_bytes)
+
+    task_bytes = b'{"tasks":["hidden-1"]}\n'
+    (sealed / "tasks.json").write_bytes(task_bytes)
+    unsigned = {
+        "objective_seed": 7,
+        "suite": "AgentGym/AgentEval",
+        "suite_version": "agent-eval-v1",
+        "task_bundle_sha256": hashlib.sha256(task_bytes).hexdigest(),
+        "task_count": 1,
+    }
+    evaluation_digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    (sealed / "manifest.json").write_text(
+        json.dumps({**unsigned, "manifest_sha256": evaluation_digest}, sort_keys=True)
+    )
+    inputs = parse_evaluation_inputs(
+        {
+            "RUN_ID": "run-1",
+            "EXPERIMENT_ID": "exp-1",
+            "EVALUATION_MANIFEST_SHA256": evaluation_digest,
+            "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+            "OBJECTIVE_SEED": "7",
+            "BASE_MODEL_ID": BASE_MODEL_ID,
+            "BASE_MODEL_REVISION": "a" * 40,
+            "BASE_MODEL_ARCHIVE_SHA256": base_archive_sha,
+            "CHAMPION_ARCHIVE_SHA256": base_archive_sha,
+            "CHAMPION_KIND": "base-model",
+            "SM_OUTPUT_DATA_DIR": str(tmp_path / "output"),
+        },
+        {
+            "candidate": candidate,
+            "base_model": base_model_channel,
+            "champion": champion_channel,
+            "sealed": sealed,
+        },
+    )
+
+    report_path = run_evaluation(inputs, policy=lambda task: ())
+    report = json.loads(report_path.read_text())
+    assert report["candidate_kind"] == "qlora-adapter"
+    assert report["champion_kind"] == "base-model"
+    assert report["champion_artifact_sha256"] == base_archive_sha
+
+    assert inputs.base_model_dir is not None
+    with pytest.raises(EvaluationWorkerError, match=r"manifest\.json"):
+        verify_checkpoint_artifact(inputs.base_model_dir)
 
 
 def test_training_and_evaluation_share_action_prompt_serialization() -> None:
@@ -567,8 +871,6 @@ def test_sealed_manifest_binds_task_bytes_and_rejects_duplicates(tmp_path: Path)
     task_bytes = b'{"tasks":["hidden-1"]}\n'
     (sealed / "tasks.json").write_bytes(task_bytes)
     unsigned = {
-        "run_id": "run-1",
-        "experiment_id": "exp-1",
         "objective_seed": 7,
         "suite": "AgentGym/AgentEval",
         "suite_version": "agent-eval-v1",
@@ -595,9 +897,80 @@ def test_sealed_manifest_binds_task_bytes_and_rejects_duplicates(tmp_path: Path)
     report_path = run_evaluation(inputs, policy=lambda task: ())
     report = json.loads(report_path.read_text())
     assert len(report["report_sha256"]) == 64
+    assert report["run_id"] == "run-1"
+    assert report["experiment_id"] == "exp-1"
     (sealed / "tasks.json").write_bytes(b'{"tasks":["hidden-2"]}\n')
     with pytest.raises(EvaluationWorkerError, match="task bundle"):
         run_evaluation(inputs, policy=lambda task: ())
+
+
+@pytest.mark.parametrize("identity_key", ["run_id", "experiment_id"])
+def test_static_sealed_manifest_rejects_per_run_identity(identity_key: str, tmp_path: Path) -> None:
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    task_bytes = b'{"tasks":["hidden-1"]}\n'
+    (sealed / "tasks.json").write_bytes(task_bytes)
+    unsigned = {
+        "objective_seed": 7,
+        "suite": "AgentGym/AgentEval",
+        "suite_version": "agent-eval-v1",
+        "task_bundle_sha256": hashlib.sha256(task_bytes).hexdigest(),
+        "task_count": 1,
+        identity_key: "run-1" if identity_key == "run_id" else "run-1-1",
+    }
+    digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    (sealed / "manifest.json").write_text(json.dumps({**unsigned, "manifest_sha256": digest}))
+    inputs = parse_evaluation_inputs(
+        {
+            "RUN_ID": "run-1",
+            "EXPERIMENT_ID": "run-1-1",
+            "EVALUATION_MANIFEST_SHA256": digest,
+            "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+            "OBJECTIVE_SEED": "7",
+            "SM_OUTPUT_DATA_DIR": str(tmp_path / "output"),
+        },
+        {"candidate": tmp_path, "sealed": sealed},
+    )
+
+    with pytest.raises(EvaluationWorkerError, match=r"static sealed manifest.*run identity"):
+        _sealed_manifest(inputs)
+
+
+def test_static_sealed_manifest_is_reused_across_run_scopes(tmp_path: Path) -> None:
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    task_bytes = b'{"tasks":["hidden-1"]}\n'
+    (sealed / "tasks.json").write_bytes(task_bytes)
+    unsigned = {
+        "objective_seed": 7,
+        "suite": "AgentGym/AgentEval",
+        "suite_version": "agent-eval-v1",
+        "task_bundle_sha256": hashlib.sha256(task_bytes).hexdigest(),
+        "task_count": 1,
+    }
+    digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    (sealed / "manifest.json").write_text(json.dumps({**unsigned, "manifest_sha256": digest}))
+
+    for run_id, experiment_id in (("run-1", "run-1-1"), ("run-2", "run-2-3")):
+        inputs = parse_evaluation_inputs(
+            {
+                "RUN_ID": run_id,
+                "EXPERIMENT_ID": experiment_id,
+                "EVALUATION_MANIFEST_SHA256": digest,
+                "EVALUATION_SUITE_VERSION": "agent-eval-v1",
+                "OBJECTIVE_SEED": "7",
+                "SM_OUTPUT_DATA_DIR": str(tmp_path / "output" / experiment_id),
+            },
+            {"candidate": tmp_path, "sealed": sealed},
+        )
+        manifest, task_ids = _sealed_manifest(inputs)
+
+        assert manifest["manifest_sha256"] == digest
+        assert task_ids == ["hidden-1"]
 
 
 def test_training_admission_rejects_untrusted_source_type(tmp_path: Path) -> None:
@@ -608,18 +981,17 @@ def test_training_admission_rejects_untrusted_source_type(tmp_path: Path) -> Non
         DatasetRow.model_validate(raw["rows"][0]).canonical_json().encode()
     ).hexdigest()
     (train / "dataset.json").write_text(json.dumps(raw))
-    inputs = parse_training_inputs(
-        {
-            "RUN_ID": "run-1",
-            "EXPERIMENT_ID": "exp-1",
-                "DATASET_ID": "dataset-1",
-                "DATASET_SHA256": raw["manifest"]["sha256"],
-                "APPROVED_DATASET_ARTIFACT_ID": "dataset://dataset-1",
-                "BASE_MODEL_ID": BASE_MODEL_ID,
-            "BASE_MODEL_REVISION": "a" * 40,
-            "SM_MODEL_DIR": str(tmp_path / "model"),
-        },
-        {"train": train},
+    inputs = TrainingInputs(
+        train_dir=train,
+        model_dir=tmp_path / "model",
+        base_model_dir=tmp_path / "base-model",
+        run_id="run-1",
+        experiment_id="exp-1",
+        dataset_id="dataset-1",
+        dataset_sha256=raw["manifest"]["sha256"],
+        base_model_id=BASE_MODEL_ID,
+        base_model_revision="a" * 40,
+        dataset_artifact_id="dataset://dataset-1",
     )
     with pytest.raises(TrainingWorkerError, match=r"source|verified"):
         load_training_dataset(inputs)
@@ -768,7 +1140,7 @@ def test_evaluator_binds_checkpoint_run_and_experiment_before_scoring(tmp_path: 
         verify_checkpoint_artifact(checkpoint, run_id="run-1", experiment_id="other-exp")
 
 
-def test_evaluator_binds_sealed_manifest_seed_and_run_identity(tmp_path: Path) -> None:
+def test_evaluator_binds_sealed_manifest_identity(tmp_path: Path) -> None:
     train = _dataset_fixture(tmp_path)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
@@ -789,8 +1161,6 @@ def test_evaluator_binds_sealed_manifest_seed_and_run_identity(tmp_path: Path) -
     task_bytes = b'{"tasks":["hidden-1"]}\n'
     (sealed / "tasks.json").write_bytes(task_bytes)
     unsigned = {
-        "run_id": "run-1",
-        "experiment_id": "exp-1",
         "objective_seed": 7,
         "suite": "AgentGym/AgentEval",
         "suite_version": "agent-eval-v1",
@@ -800,9 +1170,7 @@ def test_evaluator_binds_sealed_manifest_seed_and_run_identity(tmp_path: Path) -
     digest = hashlib.sha256(
         json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    (sealed / "manifest.json").write_text(
-        json.dumps({**unsigned, "manifest_sha256": digest})
-    )
+    (sealed / "manifest.json").write_text(json.dumps({**unsigned, "manifest_sha256": digest}))
     inputs = parse_evaluation_inputs(
         {
             "RUN_ID": "run-1",
