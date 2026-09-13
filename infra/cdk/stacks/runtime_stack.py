@@ -491,7 +491,10 @@ class PostTrainingRuntimeStack(Stack):
         bucket.grant_read_write(objective_role, f"{prefix}/*")
         state_table.grant_read_write_data(task_role)
         artifact_key.grant_encrypt_decrypt(task_role)
-        artifact_key.grant_decrypt(objective_role)
+        # The objective worker persists newly verified trajectories and datasets
+        # into the KMS-encrypted artifact bucket, so it needs data-key/encrypt
+        # permissions in addition to decrypting the staged base checkpoint.
+        artifact_key.grant_encrypt_decrypt(objective_role)
 
         task_role.add_to_policy(
             iam.PolicyStatement(

@@ -311,6 +311,29 @@ def test_coordinator_readiness_access_is_readonly_and_scoped_to_runtime_inputs()
     }
 
 
+def test_objective_worker_can_encrypt_new_verified_artifacts() -> None:
+    policies = template().find_resources("AWS::IAM::Policy")
+    objective_policy = next(
+        item
+        for logical_id, item in policies.items()
+        if logical_id.startswith("ObjectiveTaskRoleDefaultPolicy")
+    )
+    statements = objective_policy["Properties"]["PolicyDocument"]["Statement"]
+    kms_actions = {
+        action
+        for statement in statements
+        for action in (
+            statement.get("Action", [])
+            if isinstance(statement.get("Action"), list)
+            else [statement.get("Action")]
+        )
+        if isinstance(action, str) and action.startswith("kms:")
+    }
+
+    assert {"kms:Decrypt", "kms:Encrypt"} <= kms_actions
+    assert {"kms:GenerateDataKey", "kms:GenerateDataKey*"} & kms_actions
+
+
 def test_objective_bearer_credential_is_injected_from_imported_secret() -> None:
     task_definitions = template().find_resources("AWS::ECS::TaskDefinition")
     objective = next(
