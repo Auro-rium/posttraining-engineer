@@ -521,6 +521,19 @@ def test_functiongemma_prompt_explicitly_activates_function_calling_mode() -> No
     assert task.objective in messages[1]["content"]
 
 
+def test_functiongemma_observations_are_user_turns_without_orphan_tool_messages() -> None:
+    task = ServiceRecoveryEngine(seed=7).reset(
+        split=ObjectiveSplit.TRAIN,
+        task_id="train-observation-contract",
+    )
+
+    messages = _messages(task, ({"service": "checkout", "healthy": False},))
+
+    assert messages[-1]["role"] == "user"
+    assert "checkout" in messages[-1]["content"]
+    assert all(message["role"] != "tool" for message in messages)
+
+
 def test_function_parse_failure_telemetry_uses_safe_categorical_code(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

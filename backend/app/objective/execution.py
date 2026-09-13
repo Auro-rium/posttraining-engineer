@@ -638,10 +638,14 @@ def _messages(task: Task, observations: Sequence[Mapping[str, Any]]) -> list[dic
             ),
         },
     ]
+    # We retain only public observations, not an assistant tool-call transcript.
+    # FunctionGemma's template correctly rejects an orphan ``tool`` turn, so an
+    # observation is supplied as a normal user turn for the next single action.
     messages.extend(
         {
-            "role": "tool",
-            "content": json.dumps(dict(observation), sort_keys=True, separators=(",", ":")),
+            "role": "user",
+            "content": "Result of the previous action: "
+            + json.dumps(dict(observation), sort_keys=True, separators=(",", ":")),
         }
         for observation in observations
     )
