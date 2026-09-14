@@ -903,6 +903,7 @@ def _coordinator_trajectory_metadata(
         "measurement_id",
         "artifact_id",
         "evidence_class",
+        "task_context",
     }
     result: dict[str, dict[str, Any]] = {}
     for ref, value in metadata.items():
@@ -932,6 +933,38 @@ def _coordinator_trajectory_metadata(
                 not isinstance(candidate, str) or not _REFERENCE_PATTERN.fullmatch(candidate)
             ):
                 raise ProviderHandoffError(f"trajectory metadata {key} must be an opaque reference")
+        task_context = value.get("task_context")
+        if task_context is not None:
+            if not isinstance(task_context, Mapping) or set(task_context) != {
+                "service_name",
+                "objective",
+                "allowed_tools",
+                "max_steps",
+            }:
+                raise ProviderHandoffError("trajectory task_context is not a public task contract")
+            service_name = task_context.get("service_name")
+            objective = task_context.get("objective")
+            tools = task_context.get("allowed_tools")
+            max_steps = task_context.get("max_steps")
+            if (
+                not isinstance(service_name, str)
+                or not service_name.strip()
+                or not isinstance(objective, str)
+                or not objective.strip()
+                or not isinstance(tools, list)
+                or tuple(tools)
+                != (
+                    "get_logs",
+                    "inspect_service",
+                    "read_config",
+                    "edit_config",
+                    "restart_service",
+                    "run_healthcheck",
+                )
+                or type(max_steps) is not int
+                or not 1 <= max_steps <= 10
+            ):
+                raise ProviderHandoffError("trajectory task_context is invalid")
         result[ref] = dict(value)
     return result
 
