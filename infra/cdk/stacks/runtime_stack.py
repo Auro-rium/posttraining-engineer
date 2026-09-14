@@ -594,7 +594,11 @@ class PostTrainingRuntimeStack(Stack):
         task_role.add_to_policy(
             iam.PolicyStatement(
                 sid="InvokePinnedBedrockFoundationModel",
-                actions=["bedrock:GetFoundationModel", "bedrock:InvokeModel"],
+                actions=[
+                    "bedrock:GetFoundationModel",
+                    "bedrock:InvokeModel",
+                    "bedrock:InvokeModelWithResponseStream",
+                ],
                 resources=[
                     f"arn:{self.partition}:bedrock:{self.region}::foundation-model/{strands_model}"
                 ],
