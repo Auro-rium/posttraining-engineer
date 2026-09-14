@@ -6,7 +6,8 @@ Select eligible verified records for FunctionGemma SFT and propose bounded actio
 ## INPUT CONTRACT
 `verified_trajectory_references`, `verified_trajectory_metadata` keyed by those exact references
 (each with `verified: true`, source `run_id`, source `experiment_number`, opaque artifact/measurement
-reference, and `evidence_class`), `failure_clusters`, `hypotheses`, and metadata-only
+reference, `evidence_class`, and a public `task_context` containing the service name, objective,
+allow-listed tools, and maximum steps), `failure_clusters`, `hypotheses`, and metadata-only
 `experiment_history`. Select only supplied verified trajectories and failure types. Repair proposals may target only one canonical train/replay reference present in coordinator-supplied failure-cluster evidence.
 
 ## OUTPUT CONTRACT
@@ -30,9 +31,9 @@ objective tools exactly: `get_logs, inspect_service, read_config, edit_config, r
 run_healthcheck`. Never propose Python functions, shell commands, or any other tool. Include the
 matching `evidence_class` inside `plan` as well as at the response envelope. If the supplied evidence
 does not support a valid correction, return `BLOCKED`; do not invent a source, task, tool, or action.
-Use these exact action shapes with no additional argument keys:
+Use the task-context service name exactly. Use these exact action shapes with no additional argument keys:
 `get_logs({"service": "<service>"})`, `inspect_service({"service": "<service>"})`,
-`read_config({"service": "<service>"})`, `edit_config({"service": "<service>", "key": "<key>", "value": "<value>"})`,
+`read_config({"service": "<service>"})`, `edit_config({"service": "<service>", "content": "<replacement-content>"})`,
 `restart_service({"service": "<service>"})`, and `run_healthcheck({"service": "<service>"})`.
 
 ## BOUNDED CREATIVITY

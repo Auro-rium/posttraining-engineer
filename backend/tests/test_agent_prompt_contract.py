@@ -169,8 +169,8 @@ def test_data_curator_prompt_names_the_objective_tool_and_reference_contract() -
     )
     assert "read_config({\"service\": \"<service>\"})" in prompt
     assert (
-        "edit_config({\"service\": \"<service>\", \"key\": \"<key>\", "
-        "\"value\": \"<value>\"})" in prompt
+        "edit_config({\"service\": \"<service>\", "
+        "\"content\": \"<replacement-content>\"})" in prompt
     )
     assert "never a full `trajectory://` URI" in prompt
     assert "matching `evidence_class`" in prompt

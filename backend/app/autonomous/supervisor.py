@@ -1734,8 +1734,33 @@ class AutonomousRunSupervisor:
         refs = _reference_sequence(benchmark.trajectory_refs, "trajectory")
         if len(set(refs)) != len(refs):
             raise SupervisorBlocked("benchmark evidence contains duplicate trajectory references")
-        return {
-            ref: {
+        # The curator needs the task's public contract to propose an executable
+        # repair.  These fields are reconstructed from the deterministic public
+        # AgentGym task definition; they never disclose the failure mode or the
+        # sealed verifier.
+        from app.objective.engine import ServiceRecoveryEngine
+        from app.objective.models import decode_trajectory_reference
+
+        metadata: dict[str, dict[str, Any]] = {}
+        for ref in refs:
+            public_task_context: dict[str, Any] | None = None
+            try:
+                reference = decode_trajectory_reference(ref)
+                task = ServiceRecoveryEngine(seed=evidence.seed).reset(
+                    split=reference.split, task_id=reference.task_id
+                )
+                public_task_context = {
+                    "service_name": task.service_name,
+                    "objective": task.objective,
+                    "allowed_tools": list(task.allowed_tools),
+                    "max_steps": task.max_steps,
+                }
+            except Exception:
+                # Unit-test and third-party adapters may expose an opaque but
+                # valid provenance reference.  It remains usable evidence;
+                # simply omit optional public task hints in that case.
+                pass
+            item: dict[str, Any] = {
                 "verified": True,
                 "run_id": run_id,
                 "experiment_number": experiment_number,
@@ -1743,8 +1768,10 @@ class AutonomousRunSupervisor:
                 "measurement_id": ref,
                 "evidence_class": evidence_class,
             }
-            for ref in refs
-        }
+            if public_task_context is not None:
+                item["task_context"] = public_task_context
+            metadata[ref] = item
+        return metadata
 
     @staticmethod
     def _validate_benchmark(

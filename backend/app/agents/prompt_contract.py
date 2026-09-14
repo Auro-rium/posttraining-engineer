@@ -85,6 +85,11 @@ _HANDOFF_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
         "gradient_accumulation_steps",
         "target_modules",
         "target_failure_classes",
+        "task_context",
+        "service_name",
+        "objective",
+        "allowed_tools",
+        "max_steps",
     }
 )
 _HANDOFF_REFERENCE_KEYS: Final[frozenset[str]] = frozenset(
