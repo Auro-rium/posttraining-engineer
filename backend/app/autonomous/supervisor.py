@@ -321,6 +321,17 @@ async def _invoke_judgment(
     raise AssertionError("unreachable")
 
 
+async def _invoke_nonempty_judgment(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Give an empty judgment a few bounded chances before a safe stop."""
+
+    value: Any = ()
+    for _ in range(3):
+        value = await _invoke_judgment(function, *args, **kwargs)
+        if value:
+            return value
+    return value
+
+
 def _finite_cost(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(float(value)):
         raise SupervisorProviderFailure("provider returned invalid cost")
@@ -495,7 +506,7 @@ class AutonomousRunSupervisor:
                     benchmark = await self._run_benchmark(state, number)
                     state = self._reload(run_id)
                     try:
-                        failures = await _invoke_judgment(
+                        failures = await _invoke_nonempty_judgment(
                             self.agents.analyze_failures,
                             benchmark.trajectory_refs,
                             state.experiments,
@@ -543,7 +554,7 @@ class AutonomousRunSupervisor:
                     if failures is None:
                         state = self._reload(run_id)
                         try:
-                            failures = await _invoke_judgment(
+                            failures = await _invoke_nonempty_judgment(
                                 self.agents.analyze_failures,
                                 benchmark.trajectory_refs,
                                 state.experiments,

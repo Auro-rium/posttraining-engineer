@@ -766,6 +766,29 @@ async def test_judgment_agent_schema_failure_retries_without_repeating_provider_
 
 
 @pytest.mark.asyncio
+async def test_empty_failure_analysis_is_retried_before_stopping_the_run() -> None:
+    store = _StateStore()
+    agents = _Agents()
+    supervisor, _ = _supervisor(store, agents=agents)
+    original_analyze = agents.analyze_failures
+    analysis_attempts = 0
+
+    def empty_then_valid_analysis(*args: Any, **kwargs: Any) -> Sequence[FailureCluster]:
+        nonlocal analysis_attempts
+        analysis_attempts += 1
+        if analysis_attempts < 3:
+            return ()
+        return original_analyze(*args, **kwargs)
+
+    agents.analyze_failures = empty_then_valid_analysis  # type: ignore[method-assign]
+
+    result = await supervisor.run_optimization("run-1")
+
+    assert result.status is AutonomousRunStatus.SUCCEEDED
+    assert analysis_attempts == 3
+
+
+@pytest.mark.asyncio
 async def test_restart_reuses_persisted_benchmark_provenance_before_recuration() -> None:
     store = _StateStore()
     agents = _Agents()
