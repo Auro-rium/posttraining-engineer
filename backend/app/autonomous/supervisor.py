@@ -305,7 +305,7 @@ async def _invoke(function: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 async def _invoke_judgment(
-    function: Any, *args: Any, max_attempts: int = 3, **kwargs: Any
+    function: Any, *args: Any, max_attempts: int = 10, **kwargs: Any
 ) -> Any:
     """Retry side-effect-free agent judgment while keeping failures bounded."""
 

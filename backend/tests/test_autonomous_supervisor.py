@@ -750,7 +750,7 @@ async def test_judgment_agent_schema_failure_retries_without_repeating_provider_
     def flaky_curation(*args: Any, **kwargs: Any) -> CuratedDatasetPlan:
         nonlocal curation_attempts
         curation_attempts += 1
-        if curation_attempts < 3:
+        if curation_attempts < 10:
             raise ValueError("schema mismatch")
         return original_curate(*args, **kwargs)
 
@@ -759,7 +759,7 @@ async def test_judgment_agent_schema_failure_retries_without_repeating_provider_
     result = await supervisor.run_optimization("run-1")
 
     assert result.status is AutonomousRunStatus.SUCCEEDED
-    assert curation_attempts == 3
+    assert curation_attempts == 10
     assert objective.benchmarks == [("train", 1)]
     assert provider.training_submits == 1
     assert provider.evaluation_submits == 1
