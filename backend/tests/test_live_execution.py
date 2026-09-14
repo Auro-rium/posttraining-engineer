@@ -1042,6 +1042,7 @@ def test_live_supervisor_accepts_provider_unique_benchmark_evidence_id() -> None
     assert evidence.evaluation.evidence.benchmark_id == "service-recovery-v1"
     assert evidence.evaluation.evidence.model_id == "google/functiongemma-270m-it"
     assert evidence.evaluation.run_number == 0
+    assert evidence.artifact_ids == ("s3://demo-bucket/report.json?versionId=report-v1",)
 
 
 def test_cleanup_telemetry_contains_provider_job_id_and_phase() -> None:

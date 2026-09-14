@@ -2475,7 +2475,7 @@ class LiveObjectiveAdapter:
         from app.objective.models import ObjectiveSplit, encode_trajectory_reference
 
         artifact_ids = tuple(
-            artifact.artifact_id
+            artifact.uri
             for artifact in (result.trajectory_artifact, result.report_artifact)
             if artifact is not None
         )
