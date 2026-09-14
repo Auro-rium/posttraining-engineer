@@ -155,7 +155,7 @@ def test_failure_analysis_prompt_contains_all_prior_experiment_evidence() -> Non
     assert '"experiment_history"' in provider.prompts[0]
 
 
-def test_failure_analysis_cannot_upgrade_coordinator_evidence_class() -> None:
+def test_failure_analysis_binds_clusters_to_coordinator_evidence_class() -> None:
     provider = RecordingProvider(
         {
             "status": "SUCCEEDED",
@@ -165,8 +165,11 @@ def test_failure_analysis_cannot_upgrade_coordinator_evidence_class() -> None:
     )
     adapters = AutonomousAgentAdapters(provider)
 
-    with pytest.raises(ProviderHandoffError, match="match coordinator provenance"):
-        adapters.analyze_failures(["traj://verified"], evidence_class="PRIOR_VERIFIED_RUN")
+    clusters = adapters.analyze_failures(
+        ["traj://verified"], evidence_class="PRIOR_VERIFIED_RUN"
+    )
+
+    assert clusters == ()
 
     with pytest.raises(ProviderHandoffError, match="coordinator-verified evidence_class"):
         adapters.analyze_failures(["traj://verified"], evidence_class="EXPLANATION")
@@ -739,7 +742,7 @@ def test_trajectory_metadata_is_opaque_in_prompt_contract() -> None:
         )
 
 
-def test_curation_cannot_upgrade_coordinator_trajectory_evidence_class() -> None:
+def test_curation_binds_plan_to_coordinator_trajectory_evidence_class() -> None:
     provider = RecordingProvider(
         {
             "status": "SUCCEEDED",
@@ -754,22 +757,23 @@ def test_curation_cannot_upgrade_coordinator_trajectory_evidence_class() -> None
         }
     )
 
-    with pytest.raises(ProviderHandoffError, match="match coordinator provenance"):
-        AutonomousAgentAdapters(provider).curate(
-            ["traj://verified"],
-            failure_clusters=[
-                FailureCluster(
-                    cluster_id="cluster-1",
-                    failure_type="premature_completion",
-                    description="failed before healthcheck",
-                    count=1,
-                    evidence_refs=["traj://verified"],
-                )
-            ],
-            verified_trajectory_metadata=trajectory_evidence_metadata(
-                ["traj://verified"], evidence_class="PRIOR_VERIFIED_RUN"
-            ),
-        )
+    plan = AutonomousAgentAdapters(provider).curate(
+        ["traj://verified"],
+        failure_clusters=[
+            FailureCluster(
+                cluster_id="cluster-1",
+                failure_type="premature_completion",
+                description="failed before healthcheck",
+                count=1,
+                evidence_refs=["traj://verified"],
+            )
+        ],
+        verified_trajectory_metadata=trajectory_evidence_metadata(
+            ["traj://verified"], evidence_class="PRIOR_VERIFIED_RUN"
+        ),
+    )
+
+    assert plan.evidence_class == "PRIOR_VERIFIED_RUN"
 
 
 def test_curation_binds_missing_plan_evidence_class_to_verified_envelope() -> None:
@@ -802,7 +806,7 @@ def test_curation_binds_missing_plan_evidence_class_to_verified_envelope() -> No
     assert plan.evidence_class == "LIVE"
 
 
-def test_curation_rejects_explicit_null_plan_evidence_class() -> None:
+def test_curation_binds_explicit_null_plan_evidence_class_to_coordinator() -> None:
     provider = RecordingProvider(
         {
             "status": "SUCCEEDED",
@@ -824,12 +828,13 @@ def test_curation_rejects_explicit_null_plan_evidence_class() -> None:
         evidence_refs=["traj://verified"],
     )
 
-    with pytest.raises(ProviderHandoffError, match="plan evidence_class"):
-        AutonomousAgentAdapters(provider).curate(
-            ["traj://verified"],
-            failure_clusters=[cluster],
-            verified_trajectory_metadata=trajectory_evidence_metadata(["traj://verified"]),
-        )
+    plan = AutonomousAgentAdapters(provider).curate(
+        ["traj://verified"],
+        failure_clusters=[cluster],
+        verified_trajectory_metadata=trajectory_evidence_metadata(["traj://verified"]),
+    )
+
+    assert plan.evidence_class == "LIVE"
 
 
 def test_curation_rejects_failure_classes_outside_verified_clusters() -> None:

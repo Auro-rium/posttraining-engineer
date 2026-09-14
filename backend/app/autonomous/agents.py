@@ -558,17 +558,17 @@ class AutonomousAgentAdapters:
             },
         )
         try:
-            raw_items, response_class = _collection(response, "clusters")
-            if response_class != evidence_class:
-                raise ProviderHandoffError(
-                    "failure-analysis evidence_class must match coordinator provenance"
-                )
-            for item in raw_items:
-                if not isinstance(item, Mapping) or item.get("evidence_class") != response_class:
-                    raise ProviderHandoffError(
-                        "cluster evidence_class must match response evidence_class"
-                    )
-            clusters = tuple(FailureCluster.model_validate(item) for item in raw_items)
+            raw_items, _ = _collection(response, "clusters")
+            # The model may explain verified evidence, but it never chooses
+            # its classification. Bind every cluster to the coordinator input
+            # after the envelope itself has passed strict parsing.
+            clusters = tuple(
+                FailureCluster.model_validate({**dict(item), "evidence_class": evidence_class})
+                for item in raw_items
+                if isinstance(item, Mapping)
+            )
+            if len(clusters) != len(raw_items):
+                raise ProviderHandoffError("failure-analysis clusters must be JSON objects")
             if any(not set(item.evidence_refs).issubset(set(refs)) for item in clusters):
                 raise ProviderHandoffError(
                     "cluster evidence_refs are not a subset of verified references"
@@ -707,19 +707,15 @@ class AutonomousAgentAdapters:
             },
         )
         try:
-            raw_plan, response_class = _object_response(response, "plan")
-            if response_class not in _VERIFIED_CLASSES:
-                raise ProviderHandoffError("curation must cite verified evidence")
-            if (
-                "evidence_class" in raw_plan
-                and raw_plan["evidence_class"] != response_class
-            ):
-                raise ProviderHandoffError("plan evidence_class must match response evidence_class")
-            # Evidence labels are coordinator-owned provenance.  The provider
-            # envelope already bound this handoff to verified evidence, so a
-            # missing nested duplicate is deterministically filled rather
-            # than treated as model-authored evidence.
-            raw_plan["evidence_class"] = response_class
+            raw_plan, _ = _object_response(response, "plan")
+            input_classes = {
+                metadata["evidence_class"] for metadata in trajectory_metadata.values()
+            }
+            if len(input_classes) != 1:
+                raise ProviderHandoffError("curation requires one coordinator evidence class")
+            # The plan can select only coordinator-verified references. Bind
+            # its label from that immutable provenance, never from the model.
+            raw_plan["evidence_class"] = input_classes.pop()
             plan = CuratedDatasetPlan.model_validate(raw_plan)
         except ProviderHandoffError:
             raise
