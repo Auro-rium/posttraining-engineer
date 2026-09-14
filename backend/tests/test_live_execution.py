@@ -1039,6 +1039,7 @@ def test_live_supervisor_accepts_provider_unique_benchmark_evidence_id() -> None
     evidence = adapter.benchmark(state, split="train", experiment_number=0)
 
     assert evidence.evaluation.evidence.evidence_id == "benchmark-7c883320d4dd"
+    assert evidence.evaluation.evidence.benchmark_id == "service-recovery-v1"
     assert evidence.evaluation.evidence.model_id == "google/functiongemma-270m-it"
     assert evidence.evaluation.run_number == 0
 

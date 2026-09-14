@@ -2469,6 +2469,7 @@ class LiveObjectiveAdapter:
         *,
         run_number: int,
         approved_model_id: str,
+        approved_benchmark_id: str,
     ) -> Any:
         from app.autonomous.supervisor import BenchmarkEvidence
         from app.objective.models import ObjectiveSplit, encode_trajectory_reference
@@ -2504,7 +2505,7 @@ class LiveObjectiveAdapter:
             artifact_ids=artifact_ids,
             metrics={"aggregate": result.metrics.aggregate, **result.metrics.per_environment},
             verified=result.verified,
-            benchmark_id=result.benchmark_id,
+            benchmark_id=approved_benchmark_id,
             suite=result.suite,
             suite_version=result.suite_version,
             manifest_sha256=result.manifest_sha256,
@@ -2551,6 +2552,9 @@ class LiveObjectiveAdapter:
             self._checked_result(self.client.execute_benchmark(request), request),
             run_number=max(0, experiment_number - 1),
             approved_model_id=getattr(state, "model_id", self.config.target_model),
+            approved_benchmark_id=getattr(
+                state, "benchmark_id", self.config.benchmark_id
+            ),
         )
 
     def _checked_result(
