@@ -739,6 +739,33 @@ async def test_strict_agent_handoffs_use_only_verified_benchmark_provenance() ->
 
 
 @pytest.mark.asyncio
+async def test_judgment_agent_schema_failure_retries_without_repeating_provider_work() -> None:
+    store = _StateStore()
+    agents = _Agents()
+    objective = _Objective()
+    supervisor, provider = _supervisor(store, objective=objective, agents=agents)
+    original_curate = agents.curate
+    curation_attempts = 0
+
+    def flaky_curation(*args: Any, **kwargs: Any) -> CuratedDatasetPlan:
+        nonlocal curation_attempts
+        curation_attempts += 1
+        if curation_attempts < 3:
+            raise ValueError("schema mismatch")
+        return original_curate(*args, **kwargs)
+
+    agents.curate = flaky_curation  # type: ignore[method-assign]
+
+    result = await supervisor.run_optimization("run-1")
+
+    assert result.status is AutonomousRunStatus.SUCCEEDED
+    assert curation_attempts == 3
+    assert objective.benchmarks == [("train", 1)]
+    assert provider.training_submits == 1
+    assert provider.evaluation_submits == 1
+
+
+@pytest.mark.asyncio
 async def test_restart_reuses_persisted_benchmark_provenance_before_recuration() -> None:
     store = _StateStore()
     agents = _Agents()

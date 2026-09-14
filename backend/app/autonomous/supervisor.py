@@ -304,6 +304,23 @@ async def _invoke(function: Any, *args: Any, **kwargs: Any) -> Any:
     return await _await(value)
 
 
+async def _invoke_judgment(
+    function: Any, *args: Any, max_attempts: int = 3, **kwargs: Any
+) -> Any:
+    """Retry side-effect-free agent judgment while keeping failures bounded."""
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await _invoke(function, *args, **kwargs)
+        except Exception:
+            if attempt == max_attempts:
+                raise
+            await asyncio.sleep(0)
+    raise AssertionError("unreachable")
+
+
 def _finite_cost(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(float(value)):
         raise SupervisorProviderFailure("provider returned invalid cost")
@@ -478,7 +495,7 @@ class AutonomousRunSupervisor:
                     benchmark = await self._run_benchmark(state, number)
                     state = self._reload(run_id)
                     try:
-                        failures = await _invoke(
+                        failures = await _invoke_judgment(
                             self.agents.analyze_failures,
                             benchmark.trajectory_refs,
                             state.experiments,
@@ -492,7 +509,7 @@ class AutonomousRunSupervisor:
                         state, AutonomousRunStatus.RUNNING, RunPhase.RESEARCH, "phase started"
                     )
                     try:
-                        hypotheses = await _invoke(
+                        hypotheses = await _invoke_judgment(
                             self.agents.research,
                             failures,
                             state.experiments,
@@ -526,7 +543,7 @@ class AutonomousRunSupervisor:
                     if failures is None:
                         state = self._reload(run_id)
                         try:
-                            failures = await _invoke(
+                            failures = await _invoke_judgment(
                                 self.agents.analyze_failures,
                                 benchmark.trajectory_refs,
                                 state.experiments,
@@ -539,7 +556,7 @@ class AutonomousRunSupervisor:
                                 state, "no valid next experiment", None, blocked=True
                             )
                     try:
-                        plan = await _invoke(
+                        plan = await _invoke_judgment(
                             self.agents.curate,
                             benchmark.trajectory_refs,
                             hypotheses=(hypothesis,),
@@ -585,7 +602,9 @@ class AutonomousRunSupervisor:
                         raise SupervisorBlocked("persisted QLoRA config is invalid") from exc
                 else:
                     try:
-                        config = await _invoke(self.agents.design_qlora, plan, state.experiments)
+                        config = await _invoke_judgment(
+                            self.agents.design_qlora, plan, state.experiments
+                        )
                     except Exception as exc:
                         raise SupervisorAgentFailure("agent failure") from exc
                 state = self._patch(
