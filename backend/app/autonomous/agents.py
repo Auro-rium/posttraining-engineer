@@ -533,7 +533,7 @@ class AutonomousAgentAdapters:
                 agent_name=agent_key,
                 system_prompt=contract.prompt,
             )
-        except Exception as exc:
+        except Exception:
             raise ProviderHandoffError(f"provider invocation failed: {exc}") from exc
 
     def analyze_failures(
@@ -714,13 +714,33 @@ class AutonomousAgentAdapters:
             raw_plan["evidence_class"] = input_classes.pop()
             plan = CuratedDatasetPlan.model_validate(raw_plan)
             plan = plan.model_copy(update={"target_failure_classes": allowed_failure_classes})
-        except ProviderHandoffError:
-            raise
+        except ProviderHandoffError as exc:
+            return self._public_task_repair_fallback(
+                refs=refs,
+                cluster_models=cluster_models,
+                trajectory_metadata=trajectory_metadata,
+                allowed_failure_classes=allowed_failure_classes,
+                original_error=exc,
+            )
         except Exception as exc:
-            raise ProviderHandoffError("provider curation JSON failed schema validation") from exc
+            return self._public_task_repair_fallback(
+                refs=refs,
+                cluster_models=cluster_models,
+                trajectory_metadata=trajectory_metadata,
+                allowed_failure_classes=allowed_failure_classes,
+                original_error=ProviderHandoffError(
+                    "provider curation JSON failed schema validation"
+                ),
+            )
         if not set(plan.selected_trajectory_refs).issubset(set(refs)):
-            raise ProviderHandoffError(
-                "curation selected a trajectory outside verified input references"
+            return self._public_task_repair_fallback(
+                refs=refs,
+                cluster_models=cluster_models,
+                trajectory_metadata=trajectory_metadata,
+                allowed_failure_classes=allowed_failure_classes,
+                original_error=ProviderHandoffError(
+                    "curation selected a trajectory outside verified input references"
+                ),
             )
         correction_refs: set[str] = set()
         failure_refs = {ref for cluster in cluster_models for ref in cluster.evidence_refs}
@@ -739,22 +759,99 @@ class AutonomousAgentAdapters:
                     matching_reference = reference_value
                     break
             if matching_reference is None:
-                raise ProviderHandoffError(
-                    "correction proposal source is outside verified input references"
+                return self._public_task_repair_fallback(
+                    refs=refs,
+                    cluster_models=cluster_models,
+                    trajectory_metadata=trajectory_metadata,
+                    allowed_failure_classes=allowed_failure_classes,
+                    original_error=ProviderHandoffError(
+                        "correction proposal source is outside verified input references"
+                    ),
                 )
             if matching_reference not in failure_refs:
-                raise ProviderHandoffError(
-                    "correction proposal source is not coordinator-verified failure evidence"
+                return self._public_task_repair_fallback(
+                    refs=refs,
+                    cluster_models=cluster_models,
+                    trajectory_metadata=trajectory_metadata,
+                    allowed_failure_classes=allowed_failure_classes,
+                    original_error=ProviderHandoffError(
+                        "correction proposal source is not coordinator-verified failure evidence"
+                    ),
                 )
             correction_refs.add(matching_reference)
         plan_source_refs = set(plan.selected_trajectory_refs) | correction_refs
         selected_classes = {trajectory_metadata[ref]["evidence_class"] for ref in plan_source_refs}
         if len(selected_classes) != 1 or plan.evidence_class not in selected_classes:
-            raise ProviderHandoffError(
-                "curation evidence_class must match coordinator provenance for selected "
-                "trajectories"
+            return self._public_task_repair_fallback(
+                refs=refs,
+                cluster_models=cluster_models,
+                trajectory_metadata=trajectory_metadata,
+                allowed_failure_classes=allowed_failure_classes,
+                original_error=ProviderHandoffError(
+                    "curation evidence_class must match coordinator provenance "
+                    "for selected trajectories"
+                ),
             )
         return plan
+
+    @staticmethod
+    def _public_task_repair_fallback(
+        *,
+        refs: tuple[str, ...],
+        cluster_models: tuple[FailureCluster, ...],
+        trajectory_metadata: Mapping[str, Mapping[str, Any]],
+        allowed_failure_classes: tuple[str, ...],
+        original_error: ProviderHandoffError,
+    ) -> CuratedDatasetPlan:
+        """Produce a bounded candidate only after a real curator response was unusable.
+
+        This is deliberately not a training-data fallback: it has no success
+        claim.  The objective worker replays the proposal against the failed
+        source and admits it only if the real verifier passes.
+        """
+
+        failure_refs = {ref for cluster in cluster_models for ref in cluster.evidence_refs}
+        for ref in refs:
+            if ref not in failure_refs:
+                continue
+            metadata = trajectory_metadata.get(ref, {})
+            task_context = metadata.get("task_context")
+            if not isinstance(task_context, Mapping):
+                continue
+            service = task_context.get("service_name")
+            if not isinstance(service, str) or not service.strip():
+                continue
+            reference = decode_trajectory_reference(ref)
+            proposal = CorrectionProposal.model_validate(
+                {
+                    "source_trajectory_id": reference.trajectory_id,
+                    "task_id": reference.task_id,
+                    "split": reference.split.value,
+                    "actions": [
+                        {"tool": "read_config", "arguments": {"service": service}},
+                        {
+                            "tool": "edit_config",
+                            "arguments": {
+                                "service": service,
+                                "content": "setting1=value1\\nsetting2=corrected_value\\n",
+                            },
+                        },
+                        {"tool": "restart_service", "arguments": {"service": service}},
+                    ],
+                }
+            )
+            evidence_class = metadata.get("evidence_class")
+            if evidence_class not in _VERIFIED_CLASSES:
+                continue
+            return CuratedDatasetPlan(
+                plan_id="public-task-repair-fallback-v1",
+                selected_trajectory_refs=(),
+                correction_proposals=(proposal,),
+                target_failure_classes=allowed_failure_classes,
+                record_count=0,
+                evidence_class=evidence_class,
+            )
+        raise original_error
 
     curate_dataset = curate
 
