@@ -837,7 +837,7 @@ def test_curation_binds_explicit_null_plan_evidence_class_to_coordinator() -> No
     assert plan.evidence_class == "LIVE"
 
 
-def test_curation_rejects_failure_classes_outside_verified_clusters() -> None:
+def test_curation_binds_target_failure_classes_to_verified_clusters() -> None:
     provider = RecordingProvider(
         {
             "status": "SUCCEEDED",
@@ -858,12 +858,53 @@ def test_curation_rejects_failure_classes_outside_verified_clusters() -> None:
         count=1,
         evidence_refs=["traj://verified"],
     )
-    with pytest.raises(ProviderHandoffError, match="outside coordinator-verified clusters"):
-        AutonomousAgentAdapters(provider).curate(
-            ["traj://verified"],
-            failure_clusters=[cluster],
-            verified_trajectory_metadata=trajectory_evidence_metadata(["traj://verified"]),
-        )
+    plan = AutonomousAgentAdapters(provider).curate(
+        ["traj://verified"],
+        failure_clusters=[cluster],
+        verified_trajectory_metadata=trajectory_evidence_metadata(["traj://verified"]),
+    )
+
+    assert plan.target_failure_classes == ("premature_completion",)
+
+
+def test_curation_does_not_block_on_a_model_hypothesis_cluster_label() -> None:
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "LIVE",
+            "plan": {
+                "plan_id": "plan-1",
+                "selected_trajectory_refs": ["traj://verified"],
+                "target_failure_classes": ["premature_completion"],
+                "record_count": 1,
+            },
+        }
+    )
+    cluster = FailureCluster(
+        cluster_id="cluster-1",
+        failure_type="premature_completion",
+        description="failed before healthcheck",
+        count=1,
+        evidence_refs=["traj://verified"],
+    )
+    hypothesis = ResearchHypothesis(
+        hypothesis_id="hypothesis-1",
+        cluster_id="model-generated-cluster",
+        statement="Repair the verified failure.",
+        prediction="Success improves.",
+        falsifier="Success does not improve.",
+        evidence_refs=["traj://verified"],
+        confidence=0.8,
+    )
+
+    plan = AutonomousAgentAdapters(provider).curate(
+        ["traj://verified"],
+        hypotheses=[hypothesis],
+        failure_clusters=[cluster],
+        verified_trajectory_metadata=trajectory_evidence_metadata(["traj://verified"]),
+    )
+
+    assert plan.plan_id == "plan-1"
 
 
 def test_evidence_ids_are_prior_refs_for_duplicate_hypothesis_rejection() -> None:

@@ -686,14 +686,10 @@ class AutonomousAgentAdapters:
         verified_refs = set(refs)
         if any(not set(item.evidence_refs).issubset(verified_refs) for item in hypothesis_models):
             raise ProviderHandoffError("hypothesis evidence_refs are not coordinator-verified")
-        cluster_ids = {item.cluster_id for item in cluster_models}
-        if any(item.cluster_id not in cluster_ids for item in hypothesis_models):
-            raise ProviderHandoffError(
-                "hypothesis references a failure cluster outside coordinator input"
-            )
         trajectory_metadata = _coordinator_trajectory_metadata(
             verified_trajectory_metadata, set(refs)
         )
+        allowed_failure_classes = tuple(sorted({item.failure_type for item in cluster_models}))
         clusters = [item.model_dump(mode="json") for item in cluster_models]
         hypothesis_values = [item.model_dump(mode="json") for item in hypothesis_models]
         response = self._call(
@@ -717,6 +713,7 @@ class AutonomousAgentAdapters:
             # its label from that immutable provenance, never from the model.
             raw_plan["evidence_class"] = input_classes.pop()
             plan = CuratedDatasetPlan.model_validate(raw_plan)
+            plan = plan.model_copy(update={"target_failure_classes": allowed_failure_classes})
         except ProviderHandoffError:
             raise
         except Exception as exc:
@@ -750,11 +747,6 @@ class AutonomousAgentAdapters:
                     "correction proposal source is not coordinator-verified failure evidence"
                 )
             correction_refs.add(matching_reference)
-        allowed_failure_classes = {item.failure_type for item in cluster_models}
-        if not set(plan.target_failure_classes).issubset(allowed_failure_classes):
-            raise ProviderHandoffError(
-                "curation selected a failure class outside coordinator-verified clusters"
-            )
         plan_source_refs = set(plan.selected_trajectory_refs) | correction_refs
         selected_classes = {trajectory_metadata[ref]["evidence_class"] for ref in plan_source_refs}
         if len(selected_classes) != 1 or plan.evidence_class not in selected_classes:
