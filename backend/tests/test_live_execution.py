@@ -383,6 +383,8 @@ def test_environment_config_uses_live_defaults_without_static_training_input() -
             "EVALUATION_INPUT_S3_URI": "s3://demo-bucket/eval",
             "SAGEMAKER_GPU_QUOTA_CODE": "L-01234567",
             "SAGEMAKER_PROCESSING_GPU_QUOTA_CODE": "L-89ABCDEF",
+            "BASELINE_EPISODES": "1",
+            "HELD_OUT_EPISODES": "2",
         }
     )
 
@@ -392,6 +394,8 @@ def test_environment_config_uses_live_defaults_without_static_training_input() -
     assert config.provider_max_polls == 241
     assert config.sagemaker_gpu_quota_code == "L-01234567"
     assert config.sagemaker_processing_gpu_quota_code == "L-89ABCDEF"
+    assert config.baseline_episodes == 1
+    assert config.held_out_episodes == 2
 
 
 def test_legacy_synchronous_controller_fails_closed_without_static_training_input() -> None:

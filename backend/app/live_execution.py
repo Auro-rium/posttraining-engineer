@@ -3498,6 +3498,8 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> LiveExe
             "objective_suite": env.get("OBJECTIVE_SUITE", "AgentGym/AgentEval"),
             "objective_suite_version": env.get("OBJECTIVE_SUITE_VERSION", "agent-eval-v1"),
             "seed": int(env.get("POSTTRAINING_SEED", "7")),
+            "baseline_episodes": int(env.get("BASELINE_EPISODES", "10")),
+            "held_out_episodes": int(env.get("HELD_OUT_EPISODES", "15")),
             "max_runs": int(env.get("MAX_EXPERIMENTS", "5")),
             "max_cost_usd": float(env.get("MAX_COST_USD", "25")),
             "max_runtime_seconds": int(env.get("MAX_TRAINING_TIME_MIN", "120")) * 60,
