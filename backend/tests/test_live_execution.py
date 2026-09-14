@@ -385,6 +385,7 @@ def test_environment_config_uses_live_defaults_without_static_training_input() -
             "SAGEMAKER_PROCESSING_GPU_QUOTA_CODE": "L-89ABCDEF",
             "BASELINE_EPISODES": "1",
             "HELD_OUT_EPISODES": "2",
+            "LIVE_BENCHMARK_MANIFEST_SHA256": "b" * 64,
         }
     )
 
@@ -396,6 +397,7 @@ def test_environment_config_uses_live_defaults_without_static_training_input() -
     assert config.sagemaker_processing_gpu_quota_code == "L-89ABCDEF"
     assert config.baseline_episodes == 1
     assert config.held_out_episodes == 2
+    assert config.benchmark_manifest_sha256 == "b" * 64
 
 
 def test_legacy_synchronous_controller_fails_closed_without_static_training_input() -> None:
@@ -1037,6 +1039,8 @@ def test_live_supervisor_accepts_provider_unique_benchmark_evidence_id() -> None
     evidence = adapter.benchmark(state, split="train", experiment_number=0)
 
     assert evidence.evaluation.evidence.evidence_id == "benchmark-7c883320d4dd"
+    assert evidence.evaluation.evidence.model_id == "google/functiongemma-270m-it"
+    assert evidence.evaluation.run_number == 0
 
 
 def test_cleanup_telemetry_contains_provider_job_id_and_phase() -> None:

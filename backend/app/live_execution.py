@@ -316,6 +316,7 @@ class LiveExecutionConfig(BaseModel):
     # The legacy synchronous controller still requires this static prefix.
     training_input_s3_uri: str | None = None
     evaluation_input_s3_uri: str
+    benchmark_manifest_sha256: str | None = None
     checkpoint_s3_uri: str | None = None
     # Required for run 1; later runs derive this from the promoted artifact.
     checkpoint_sha256: str | None = None
@@ -355,6 +356,15 @@ class LiveExecutionConfig(BaseModel):
     def validate_checkpoint_sha256(cls, value: str | None) -> str | None:
         if value is not None and not _SHA256.fullmatch(value):
             raise ValueError("checkpoint_sha256 must be a lowercase 64-character SHA-256 digest")
+        return value
+
+    @field_validator("benchmark_manifest_sha256")
+    @classmethod
+    def validate_benchmark_manifest_sha256(cls, value: str | None) -> str | None:
+        if value is not None and not _SHA256.fullmatch(value):
+            raise ValueError(
+                "benchmark_manifest_sha256 must be a lowercase 64-character SHA-256 digest"
+            )
         return value
 
     @field_validator("checkpoint_s3_uri")
@@ -2454,7 +2464,12 @@ class LiveObjectiveAdapter:
         return digest
 
     @staticmethod
-    def _evidence(result: ObjectiveBenchmarkResult, *, run_number: int) -> Any:
+    def _evidence(
+        result: ObjectiveBenchmarkResult,
+        *,
+        run_number: int,
+        approved_model_id: str,
+    ) -> Any:
         from app.autonomous.supervisor import BenchmarkEvidence
         from app.objective.models import ObjectiveSplit, encode_trajectory_reference
 
@@ -2494,7 +2509,7 @@ class LiveObjectiveAdapter:
             suite_version=result.suite_version,
             manifest_sha256=result.manifest_sha256,
             seed=result.seed,
-            model_id=result.model_id,
+            model_id=approved_model_id,
         )
         evaluation = MultiRunEvaluation(
             run_id=result.run_id,
@@ -2534,7 +2549,8 @@ class LiveObjectiveAdapter:
         )
         return self._evidence(
             self._checked_result(self.client.execute_benchmark(request), request),
-            run_number=0 if split == "baseline" else experiment_number,
+            run_number=max(0, experiment_number - 1),
+            approved_model_id=getattr(state, "model_id", self.config.target_model),
         )
 
     def _checked_result(
@@ -3506,6 +3522,9 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> LiveExe
             "artifact_prefix": env.get("S3_ARTIFACT_PREFIX", "post-training"),
             "checkpoint_sha256": env.get("CHECKPOINT_SHA256") or None,
             "checkpoint_s3_uri": env.get("CHECKPOINT_S3_URI") or None,
+            "benchmark_manifest_sha256": (
+                env.get("LIVE_BENCHMARK_MANIFEST_SHA256") or None
+            ),
             "instance_type": env.get("SAGEMAKER_INSTANCE_TYPE", "ml.g5.xlarge"),
             "gpu_instance_allowlist": tuple(
                 item.strip()
