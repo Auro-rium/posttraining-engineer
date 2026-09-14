@@ -116,6 +116,10 @@ _HANDOFF_HAZARD_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"raw[_ -]?completion))",
     re.IGNORECASE,
 )
+_HELD_OUT_TERM_PATTERN: Final[re.Pattern[str]] = re.compile(r"held[ -]?out", re.IGNORECASE)
+_HYPOTHESIS_TEXT_FIELDS: Final[frozenset[str]] = frozenset(
+    {"statement", "prediction", "falsifier"}
+)
 
 
 @dataclass(frozen=True)
@@ -331,7 +335,17 @@ def _validate_handoff_metadata(value: Any, *, field: str | None = None) -> None:
     if len(value) > 512 or any(ord(char) < 32 for char in value):
         raise ValueError("handoff metadata text is not safe")
     if _HANDOFF_HAZARD_PATTERN.search(value):
-        raise ValueError("handoff metadata contains sealed or instruction-bearing text")
+        # A ResearchAgent hypothesis is typed coordinator-visible metadata.  It
+        # may legitimately name the evaluation category ("held-out") without
+        # containing any sealed task content.  Strip only that category term
+        # for these three hypothesis fields; every other secret or injection
+        # marker remains forbidden.
+        without_held_out = _HELD_OUT_TERM_PATTERN.sub("", value)
+        if (
+            field not in _HYPOTHESIS_TEXT_FIELDS
+            or _HANDOFF_HAZARD_PATTERN.search(without_held_out)
+        ):
+            raise ValueError("handoff metadata contains sealed or instruction-bearing text")
     if (
         field in _HANDOFF_REFERENCE_KEYS
         and not _HANDOFF_REFERENCE_PATTERN.fullmatch(value)

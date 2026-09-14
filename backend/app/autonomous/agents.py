@@ -710,8 +710,16 @@ class AutonomousAgentAdapters:
             raw_plan, response_class = _object_response(response, "plan")
             if response_class not in _VERIFIED_CLASSES:
                 raise ProviderHandoffError("curation must cite verified evidence")
-            if raw_plan.get("evidence_class") != response_class:
+            if (
+                "evidence_class" in raw_plan
+                and raw_plan["evidence_class"] != response_class
+            ):
                 raise ProviderHandoffError("plan evidence_class must match response evidence_class")
+            # Evidence labels are coordinator-owned provenance.  The provider
+            # envelope already bound this handoff to verified evidence, so a
+            # missing nested duplicate is deterministically filled rather
+            # than treated as model-authored evidence.
+            raw_plan["evidence_class"] = response_class
             plan = CuratedDatasetPlan.model_validate(raw_plan)
         except ProviderHandoffError:
             raise

@@ -96,6 +96,50 @@ def test_contract_registry_has_exactly_eight_specialists() -> None:
     )
 
 
+def test_curation_handoff_allows_typed_hypothesis_to_reference_held_out_evaluation() -> None:
+    reference = "trajectory://train/task-1/trajectory-1/verified"
+
+    rendered = get_prompt_contract("DataCuratorAgent").render_handoff(
+        {
+            "verified_trajectory_references": [reference],
+            "verified_trajectory_metadata": {
+                reference: {
+                    "verified": True,
+                    "run_id": "run-1",
+                    "experiment_number": 1,
+                    "measurement_id": reference,
+                    "evidence_class": "LIVE",
+                }
+            },
+            "failure_clusters": [
+                {
+                    "cluster_id": "cluster-1",
+                    "failure_type": "tool_argument_error",
+                    "description": "Tool arguments are malformed.",
+                    "count": 1,
+                    "evidence_refs": [reference],
+                    "evidence_class": "LIVE",
+                }
+            ],
+            "hypotheses": [
+                {
+                    "hypothesis_id": "hypothesis-1",
+                    "cluster_id": "cluster-1",
+                    "statement": "Improve tool argument formatting.",
+                    "prediction": "Held-out success rate will increase.",
+                    "falsifier": "Held-out success rate will not increase.",
+                    "evidence_refs": [reference],
+                    "confidence": 0.8,
+                    "evidence_class": "EXPLANATION",
+                }
+            ],
+            "experiment_history": [],
+        }
+    )
+
+    assert "Held-out success rate" in rendered
+
+
 def test_prompt_library_has_one_reviewable_file_per_specialist() -> None:
     library_files = {
         path.name for path in PROMPT_LIBRARY_DIR.glob("*.md") if path.name != "README.md"
@@ -107,6 +151,29 @@ def test_prompt_library_has_one_reviewable_file_per_specialist() -> None:
         source = (PROMPT_LIBRARY_DIR / get_prompt_contract(agent_key).prompt_file).read_text()
         assert source.startswith(f"# {agent_key}\n")
         assert "held-out" in source.lower()
+
+
+def test_data_curator_prompt_names_the_objective_tool_and_reference_contract() -> None:
+    prompt = get_prompt_contract("DataCuratorAgent").prompt
+
+    assert all(
+        tool in prompt
+        for tool in (
+            "get_logs",
+            "inspect_service",
+            "read_config",
+            "edit_config",
+            "restart_service",
+            "run_healthcheck",
+        )
+    )
+    assert "read_config({\"service\": \"<service>\"})" in prompt
+    assert (
+        "edit_config({\"service\": \"<service>\", \"key\": \"<key>\", "
+        "\"value\": \"<value>\"})" in prompt
+    )
+    assert "never a full `trajectory://` URI" in prompt
+    assert "matching `evidence_class`" in prompt
 
 
 def test_adapter_prompt_handoff_schemas_match_typed_contracts() -> None:

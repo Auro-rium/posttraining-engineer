@@ -772,6 +772,66 @@ def test_curation_cannot_upgrade_coordinator_trajectory_evidence_class() -> None
         )
 
 
+def test_curation_binds_missing_plan_evidence_class_to_verified_envelope() -> None:
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "LIVE",
+            "plan": {
+                "plan_id": "plan-1",
+                "selected_trajectory_refs": ["traj://verified"],
+                "target_failure_classes": ["premature_completion"],
+                "record_count": 1,
+            },
+        }
+    )
+    cluster = FailureCluster(
+        cluster_id="cluster-1",
+        failure_type="premature_completion",
+        description="failed before healthcheck",
+        count=1,
+        evidence_refs=["traj://verified"],
+    )
+
+    plan = AutonomousAgentAdapters(provider).curate(
+        ["traj://verified"],
+        failure_clusters=[cluster],
+        verified_trajectory_metadata=trajectory_evidence_metadata(["traj://verified"]),
+    )
+
+    assert plan.evidence_class == "LIVE"
+
+
+def test_curation_rejects_explicit_null_plan_evidence_class() -> None:
+    provider = RecordingProvider(
+        {
+            "status": "SUCCEEDED",
+            "evidence_class": "LIVE",
+            "plan": {
+                "plan_id": "plan-1",
+                "selected_trajectory_refs": ["traj://verified"],
+                "target_failure_classes": ["premature_completion"],
+                "record_count": 1,
+                "evidence_class": None,
+            },
+        }
+    )
+    cluster = FailureCluster(
+        cluster_id="cluster-1",
+        failure_type="premature_completion",
+        description="failed before healthcheck",
+        count=1,
+        evidence_refs=["traj://verified"],
+    )
+
+    with pytest.raises(ProviderHandoffError, match="plan evidence_class"):
+        AutonomousAgentAdapters(provider).curate(
+            ["traj://verified"],
+            failure_clusters=[cluster],
+            verified_trajectory_metadata=trajectory_evidence_metadata(["traj://verified"]),
+        )
+
+
 def test_curation_rejects_failure_classes_outside_verified_clusters() -> None:
     provider = RecordingProvider(
         {

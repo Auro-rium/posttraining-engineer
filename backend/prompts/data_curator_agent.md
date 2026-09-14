@@ -24,6 +24,17 @@ claims, or other fields to a proposal. Do not include or invent any dataset URI,
 dataset identity: the deterministic objective worker resolves the failed source, replays the actions,
 and creates the dataset artifact only from verifier-passing trajectories.
 
+For a correction proposal, `source_trajectory_id` is the second path component of the canonical
+reference and `task_id` is its third path component—never a full `trajectory://` URI. Use only these
+objective tools exactly: `get_logs, inspect_service, read_config, edit_config, restart_service,
+run_healthcheck`. Never propose Python functions, shell commands, or any other tool. Include the
+matching `evidence_class` inside `plan` as well as at the response envelope. If the supplied evidence
+does not support a valid correction, return `BLOCKED`; do not invent a source, task, tool, or action.
+Use these exact action shapes with no additional argument keys:
+`get_logs({"service": "<service>"})`, `inspect_service({"service": "<service>"})`,
+`read_config({"service": "<service>"})`, `edit_config({"service": "<service>", "key": "<key>", "value": "<value>"})`,
+`restart_service({"service": "<service>"})`, and `run_healthcheck({"service": "<service>"})`.
+
 ## BOUNDED CREATIVITY
 Propose only a bounded sequence of allow-listed actions; a proposal is untrusted and is not a
 trajectory, an SFT target, or verification evidence until the objective worker deterministically
