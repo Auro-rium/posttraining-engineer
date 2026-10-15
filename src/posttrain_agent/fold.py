@@ -20,7 +20,13 @@ Per-type effects:
   checkpoint           append {checkpoint_id, step}
   telemetry.snapshot   telemetry merged key by key
   model.call, tool.call  log only
-``active_slots`` is the sorted list of slots of active agents.
+``active_slots`` is the numerically ascending sorted list of slots of active agents.
+
+Int rule: seq, attempt, slot and int summary fields accept integer-valued numbers such as 2.0
+(JS cannot tell them apart); they are stored/rendered as ints. Bools are never ints.
+Scope: state is per run, so a client must fold one run at a time and must reset its state when
+a snapshot's ``last_seq`` is lower than its own. job.log ``message=`` text is used raw (no
+trimming). Golden comparison must be strict deep-equal: an absent key is not the same as null.
 
 Log summary format (the TypeScript reducer must match byte for byte). ``log`` keeps the last 200
 entries ``{seq, ts, type, summary}``. summary is the ``key=value`` pairs for the fields listed
@@ -88,7 +94,12 @@ def empty_state() -> dict:
 
 
 def _is_int(v: Any) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool)
+    """JSON has no int/float split in JS: an integer-valued float (2.0) counts as an int."""
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    return isinstance(v, float) and math.isfinite(v) and v == int(v)
 
 
 def _is_json(v: Any, depth: int = 0) -> bool:
@@ -118,7 +129,7 @@ def _parse(ev: Any) -> tuple[int, Any, str, dict] | None:
         return None
     if not isinstance(data, dict) or not _is_json(data):
         return None
-    return seq, ts, typ, data
+    return int(seq), ts, typ, data
 
 
 def _summary(typ: str, data: dict) -> str:
@@ -127,7 +138,9 @@ def _summary(typ: str, data: dict) -> str:
         v = data.get(key)
         if isinstance(v, bool):
             parts.append(f"{key}={'true' if v else 'false'}")
-        elif isinstance(v, (int, str)):
+        elif _is_int(v):
+            parts.append(f"{key}={int(v)}")
+        elif isinstance(v, str):
             parts.append(f"{key}={v}")
     return " ".join(parts)
 
@@ -146,18 +159,18 @@ def _apply(s: dict, typ: str, data: dict) -> bool:
         if isinstance(data.get("status"), str):
             s["status"] = data["status"]
         if _is_int(data.get("attempt")):
-            s["attempt"] = data["attempt"]
+            s["attempt"] = int(data["attempt"])
     elif typ in ("agent.start", "agent.end"):
         role, slot = data.get("role"), data.get("slot")
         if not isinstance(role, str) or not _is_int(slot):
             return False
         if typ == "agent.start":
-            s["agents"][role] = {"active": True, "slot": slot, "ok": None}
+            s["agents"][role] = {"active": True, "slot": int(slot), "ok": None}
         else:
             ok = data.get("ok")
             s["agents"][role] = {
                 "active": False,
-                "slot": slot,
+                "slot": int(slot),
                 "ok": ok if isinstance(ok, bool) else None,
             }
         s["active_slots"] = sorted(a["slot"] for a in s["agents"].values() if a["active"])

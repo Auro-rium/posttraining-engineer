@@ -19,6 +19,10 @@ def test_golden_fixtures(case: dict) -> None:
         state = fold(state, ev)
     for key, want in case["expected"].items():
         assert state[key] == want, key
+    for key, n in case.get("expected_len", {}).items():
+        assert len(state[key]) == n, key
+    for key, first in case.get("expected_first", {}).items():
+        assert state[key][0] == first, key
 
 
 def test_unknown_and_malformed_events_do_not_raise() -> None:
