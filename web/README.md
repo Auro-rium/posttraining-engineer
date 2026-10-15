@@ -25,7 +25,8 @@ dashboard at it:
 ```bash
 # repo root
 cp .env.example .env              # set READ_TOKEN, and ALLOWED_ORIGIN=http://localhost:3000
-docker compose up --build         # api on 127.0.0.1:8787
+mkdir -p state                    # so Docker does not create ./state root-owned
+docker compose up --build         # api on 127.0.0.1:8787 (503 until the first run writes the journal)
 
 # web/
 cp .env.example .env.local        # NEXT_PUBLIC_API_URL=http://127.0.0.1:8787
@@ -103,6 +104,7 @@ in this repository deploys automatically).
 1. **Expose the API over https** (from the repo root, see the root README):
 
    ```bash
+   mkdir -p state                          # once, before the first `docker compose up`
    docker compose --profile tunnel up -d   # named tunnel, stable hostname (needs TUNNEL_TOKEN)
    docker compose --profile quick up       # or a temporary https://<random>.trycloudflare.com
    ```
@@ -150,7 +152,7 @@ in this repository deploys automatically).
 | `REPLAY · SAMPLE DATA (backend unreachable)` on Vercel | The browser never got an answer from the API. Usual causes: the tunnel is down or its quick-tunnel URL changed; `ALLOWED_ORIGIN` is not exactly the Vercel URL (the browser drops the response as a CORS error); the API URL is `http://` (mixed content, see below). Open the browser console to see which. |
 | Mixed content / blocked request | Vercel serves https, so the browser blocks an `http://` API. Use the tunnel's `https://` URL in `NEXT_PUBLIC_API_URL`; never a LAN IP or `http://127.0.0.1:8787` in production. |
 | `RECONNECTING (too many streams (429))` | The API caps concurrent streams (20). Close other dashboard tabs; it retries by itself. |
-| `RECONNECTING (journal unavailable (503))` | The API cannot read `state/events.sqlite` (no run yet, or wrong `./state` mount or UID/GID). See the root README. |
+| `RECONNECTING (journal unavailable (503))` | Expected on a fresh checkout: the API returns 503 until the first run writes `state/events.sqlite` (start one with `posttrain run`). If it persists after a run, check the `./state` mount and UID/GID. See the root README. |
 | `RECONNECTING (backend unreachable / connection lost)` | The tunnel or API went away after a successful connect. The last state stays on screen; it resumes from the last seq when the API is back. |
 | `OFFLINE (invalid API URL ...)` | `NEXT_PUBLIC_API_URL` lacks `https://`. Fix it and redeploy. |
 | Stuck at `CONNECTING` | The health check has not answered yet; check `curl <API URL>/v1/health`. |

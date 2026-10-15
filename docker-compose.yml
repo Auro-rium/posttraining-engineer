@@ -44,7 +44,9 @@ services:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
     depends_on:
       api:
-        condition: service_healthy
+        # service_started, not service_healthy: the API itself returns 503 to clients until the
+        # first run writes the journal, so it would never be healthy on a fresh checkout.
+        condition: service_started
     restart: unless-stopped
 
   tunnel-quick:
@@ -53,5 +55,6 @@ services:
     command: tunnel --no-autoupdate --url http://api:8787
     depends_on:
       api:
-        condition: service_healthy
+        # see tunnel: the API returns 503 to clients until the first run writes the journal.
+        condition: service_started
     restart: unless-stopped

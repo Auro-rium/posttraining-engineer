@@ -611,17 +611,20 @@ the CLI.
 
 ## Live dashboard
 
-Every run appends redacted events (statuses, scores, job progress, budget, approvals; never prompts,
-completions or secrets) to a SQLite journal under the state directory. A read-only API streams them
-to the dashboard over Server-Sent Events.
+Every run appends redacted events (statuses, scores, job progress, budget, approvals) to a SQLite journal under the state directory. A read-only API streams them
+to the dashboard over Server-Sent Events. Failures are journaled as exception type names only; the
+journal never holds prompts, completions or secrets.
 
 ```bash
 cp .env.example .env                  # set READ_TOKEN (required), ALLOWED_ORIGIN, UID/GID
+mkdir -p state                        # so Docker does not create ./state root-owned
 docker compose up --build             # api only: 127.0.0.1:8787, state in ./state
 docker compose --profile tunnel up    # also the named Cloudflare tunnel (needs TUNNEL_TOKEN)
 docker compose --profile quick up     # or a temporary trycloudflare.com URL, no token
 ```
 
+- On a fresh checkout the API answers 503 (`journal unavailable`) until the first run writes
+  `state/events.sqlite`; the tunnels start regardless. The dashboard shows RECONNECTING until then.
 - The api runs as `${UID}:${GID}` so it can open the host-owned `./state` files. bash does not
   export `UID`, so either set `UID`/`GID` in `.env` or run `export UID GID=$(id -g)` first.
 - `./state` is mounted read-write on purpose: a WAL reader needs a writable `-shm` file. The API
