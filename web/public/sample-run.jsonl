@@ -1,0 +1,30 @@
+{"seq":1,"ts":1792082894.0458822,"run":"sample-simulated-run","type":"run.started","data":{"goal_len":10,"experiment_budget":3,"backend":"stub"}}
+{"seq":2,"ts":1792082894.0511093,"run":"sample-simulated-run","type":"run.status","data":{"status":"RUNNING","attempt":1}}
+{"seq":3,"ts":1792082894.0734372,"run":"sample-simulated-run","type":"model.call","data":{"name":"backboard:claude-sonnet-4-5","ms":0.7,"ok":true,"input_tokens":0,"output_tokens":0,"fallback":true}}
+{"seq":4,"ts":1792082894.0782282,"run":"sample-simulated-run","type":"agent.start","data":{"role":"training_executor","slot":1}}
+{"seq":5,"ts":1792082894.102367,"run":"sample-simulated-run","type":"model.call","data":{"name":"backboard:claude-sonnet-4-5","ms":0.9,"ok":true,"input_tokens":0,"output_tokens":0,"fallback":true}}
+{"seq":6,"ts":1792082894.1136477,"run":"sample-simulated-run","type":"tool.call","data":{"name":"task","ms":33.1,"ok":false,"error":"GraphInterrupt"}}
+{"seq":7,"ts":1792082894.1156833,"run":"sample-simulated-run","type":"agent.end","data":{"role":"training_executor","slot":1,"ok":false}}
+{"seq":8,"ts":1792082894.1205304,"run":"sample-simulated-run","type":"checkpoint","data":{"checkpoint_id":"1f1c8b83-6999-6b37-8004-0805ff4173e6","step":4}}
+{"seq":9,"ts":1792082894.1235118,"run":"sample-simulated-run","type":"approval.pending","data":{"action":"launch_training","base_model":null,"dataset_ref":"d.jsonl","hyperparameters":{"lora_r":16,"lora_alpha":32,"lora_dropout":0.05,"learning_rate":0.0002,"n_epochs":3,"batch_size":8,"context_length":8192},"estimate_usd":0.0001,"cli_hint":"posttrain approve --thread sample-simulated-run"}}
+{"seq":10,"ts":1792082894.126407,"run":"sample-simulated-run","type":"run.status","data":{"status":"AWAITING_APPROVAL","attempt":1,"errors":[]}}
+{"seq":11,"ts":1792082894.409402,"run":"sample-simulated-run","type":"approval.resolved","data":{"decision":"approve","message_len":0}}
+{"seq":12,"ts":1792082894.459037,"run":"sample-simulated-run","type":"run.status","data":{"status":"RUNNING","attempt":1}}
+{"seq":13,"ts":1792082894.4656696,"run":"sample-simulated-run","type":"agent.start","data":{"role":"training_executor","slot":1}}
+{"seq":14,"ts":1792082894.475651,"run":"sample-simulated-run","type":"budget.update","data":{"spent_usd":0.0001,"cap_usd":25.0,"estimate_usd":0.0001,"price_known":true}}
+{"seq":15,"ts":1792082894.4779963,"run":"sample-simulated-run","type":"job.update","data":{"job_id":"stub-job-c0afbbd479","status":"succeeded","trained_steps":null,"total_steps":null,"trained_tokens":null,"evidence":"EXPLANATION"}}
+{"seq":16,"ts":1792082894.480105,"run":"sample-simulated-run","type":"tool.call","data":{"name":"launch_training","ms":5.7,"ok":true}}
+{"seq":17,"ts":1792082894.4937377,"run":"sample-simulated-run","type":"model.call","data":{"name":"backboard:claude-sonnet-4-5","ms":0.5,"ok":true,"input_tokens":3,"output_tokens":2,"fallback":true}}
+{"seq":18,"ts":1792082894.5389836,"run":"sample-simulated-run","type":"tool.call","data":{"name":"task","ms":69.7,"ok":true}}
+{"seq":19,"ts":1792082894.5461035,"run":"sample-simulated-run","type":"agent.end","data":{"role":"training_executor","slot":1,"ok":true}}
+{"seq":20,"ts":1792082894.5646608,"run":"sample-simulated-run","type":"model.call","data":{"name":"backboard:claude-sonnet-4-5","ms":0.6,"ok":true,"input_tokens":3,"output_tokens":2,"fallback":true}}
+{"seq":21,"ts":1792082894.574212,"run":"sample-simulated-run","type":"checkpoint","data":{"checkpoint_id":"1f1c8b83-6e4a-616a-8007-463793d23a38","step":7}}
+{"seq":22,"ts":1792082894.579628,"run":"sample-simulated-run","type":"run.status","data":{"status":"COMPLETED","attempt":1,"errors":[]}}
+{"seq":23,"ts":1792082894.5825648,"run":"sample-simulated-run","type":"score","data":{"split":"train","checkpoint":"base","value":0.5148,"n":null,"evidence":"EXPLANATION"}}
+{"seq":24,"ts":1792082894.584208,"run":"sample-simulated-run","type":"score","data":{"split":"heldout","checkpoint":"stub-ckpt-1","value":0.6787,"n":null,"evidence":"EXPLANATION"}}
+{"seq":25,"ts":1792082894.5863261,"run":"sample-simulated-run","type":"budget.update","data":{"spent_usd":0.0002,"cap_usd":25.0,"estimate_usd":0.0001,"price_known":true}}
+{"seq":26,"ts":1792082894.587858,"run":"sample-simulated-run","type":"job.update","data":{"job_id":"stub-job-c0afbbd479","status":"succeeded","trained_steps":null,"total_steps":null,"trained_tokens":null,"evidence":"EXPLANATION"}}
+{"seq":27,"ts":1792082894.5893445,"run":"sample-simulated-run","type":"job.update","data":{"job_id":"stub-job-c0afbbd479","status":"succeeded","trained_steps":null,"total_steps":null,"trained_tokens":null,"evidence":"EXPLANATION"}}
+{"seq":28,"ts":1792082894.5908332,"run":"sample-simulated-run","type":"job.log","data":{"level":"info","message":"simulated job; no real logs exist"}}
+{"seq":29,"ts":1792082894.5923126,"run":"sample-simulated-run","type":"gate.verdict","data":{"decision":"REJECT","reasons":["champion evidence None is not verified","candidate evidence None is not verified"],"champion_score":0.3,"candidate_score":0.5,"relative_improvement":0.6666666666666667}}
+{"seq":30,"ts":1792082894.5938318,"run":"sample-simulated-run","type":"telemetry.snapshot","data":{"p50_ms":120.0,"p95_ms":480.0,"error_rate":0.0,"input_tokens":12,"output_tokens":8}}

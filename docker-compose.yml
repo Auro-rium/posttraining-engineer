@@ -1,0 +1,47 @@
+# Live dashboard backend: read-only API over the run journal, published through a Cloudflare tunnel.
+# Set READ_TOKEN (and optionally ALLOWED_ORIGIN, TUNNEL_TOKEN) in .env. See README "Live dashboard".
+services:
+  api:
+    build: .
+    command: ["posttrain-api"]  # uvicorn entry point of posttrain_agent.api
+    environment:
+      READ_TOKEN: ${READ_TOKEN:?set READ_TOKEN in .env}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-}
+      STATE_DIR: /state
+      REPLAY_FILE: ${REPLAY_FILE:-}
+    volumes:
+      - ./state:/state
+    ports:
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.urlopen('http://127.0.0.1:8787/v1/health', timeout=4)"
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # Named tunnel: set TUNNEL_TOKEN. Without a token, use the quick-tunnel fallback:
+  #   docker compose --profile quick up
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  tunnel-quick:
+    profiles: ["quick"]
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://api:8787
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped

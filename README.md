@@ -609,6 +609,28 @@ the CLI.
 
 ---
 
+## Live dashboard
+
+Every run appends redacted events (statuses, scores, job progress, budget, approvals; never prompts,
+completions or secrets) to a SQLite journal under the state directory. A read-only API streams them
+to the dashboard over Server-Sent Events.
+
+```bash
+cp .env.example .env            # set READ_TOKEN (required), ALLOWED_ORIGIN, TUNNEL_TOKEN
+docker compose up --build api   # API on 127.0.0.1:8787, state in ./state
+docker compose up --build       # also starts the Cloudflare tunnel (needs TUNNEL_TOKEN)
+docker compose --profile quick up api tunnel-quick   # no token: temporary trycloudflare.com URL
+```
+
+- `GET /v1/health` needs no token (used by the Docker healthcheck); it returns 503 when the journal
+  cannot be read. Every other route needs `?token=<READ_TOKEN>`.
+- `REPLAY_FILE=web/public/sample-run.jsonl` serves a recorded journal instead of the live one.
+- `web/public/sample-run.jsonl` is a **simulated sample**: a stub-backed fake run with approval
+  included, every score and job carrying evidence `EXPLANATION`. It is never live data. Regenerate
+  it with `python scripts/make_sample_journal.py --out web/public/sample-run.jsonl`.
+
+---
+
 ## Testing
 
 ```bash

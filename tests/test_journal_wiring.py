@@ -252,3 +252,25 @@ async def test_journal_failure_does_not_fail_the_run(tmp_path):
         assert rep.status == "COMPLETED"
     tools = make_tools(LocalStubBackend(), s, journal=bad)
     assert "score" in tools["run_benchmark"]("base")
+
+
+def test_sample_journal_has_every_event_type_and_only_simulated_evidence(tmp_path):
+    import json
+    import sys
+    from pathlib import Path
+
+    from posttrain_agent.events import EVENT_TYPES
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_sample_journal import make_sample
+
+    out = tmp_path / "sample-run.jsonl"
+    make_sample(out)
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert {"seq", "ts", "run", "type", "data"} == set(rows[0])
+    seen = {r["type"] for r in rows}
+    assert not (EVENT_TYPES - {"job.log", "telemetry.snapshot"} - seen), EVENT_TYPES - seen
+    assert seen <= EVENT_TYPES
+    assert all(r["run"].startswith("sample") for r in rows)
+    evid = [r["data"]["evidence"] for r in rows if "evidence" in r["data"]]
+    assert evid and set(evid) == {"EXPLANATION"}
