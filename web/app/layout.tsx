@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import "../styles/terminal.css";
 
 export const metadata = {
   title: "posttrain live",

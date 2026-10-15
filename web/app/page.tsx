@@ -1,8 +1,10 @@
+import { RunList } from "../components/RunList";
+
 export default function Home() {
   return (
-    <main>
-      <h1>posttrain live</h1>
-      <p>Dashboard coming soon.</p>
+    <main className="home">
+      <h1>[ POSTTRAIN :: runs ]</h1>
+      <RunList />
     </main>
   );
 }

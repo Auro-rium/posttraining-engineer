@@ -27,6 +27,14 @@ export type Mode = "LIVE" | "REPLAY";
 export type Conn = "CONNECTING" | "LIVE" | "RECONNECTING" | "OFFLINE" | "AUTH_FAILED";
 export type Source = "api" | "sample";
 
+/**
+ * What the timeline scrubber needs: `state` equals `events` folded onto `base` with foldEvent.
+ * `base` is the empty state (sample) or the loaded snapshot (API), so history cannot reach before
+ * the snapshot's last_seq. Only events that changed the state are kept, at most HISTORY_MAX; older
+ * ones are folded into `base`.
+ */
+export type History = { base: RunState; events: readonly unknown[] };
+
 export type RunView = {
   state: RunState;
   mode: Mode;
@@ -35,7 +43,23 @@ export type RunView = {
   source: Source;
   /** Human-readable reason for a non-LIVE conn (e.g. "too many streams (429)"), else null. */
   detail: string | null;
+  history: History;
 };
+
+export const HISTORY_MAX = 2_000;
+
+/** Append an accepted event to the history, folding the oldest into `base` past HISTORY_MAX. */
+export function appendHistory(h: History, ev: unknown): History {
+  let base = h.base;
+  let events = [...h.events, ev];
+  while (events.length > HISTORY_MAX) {
+    base = foldEvent(base, events[0]);
+    events = events.slice(1);
+  }
+  return { base, events };
+}
+
+const freshHistory = (base: RunState): History => ({ base, events: [] });
 
 /** The subset of the DOM EventSource this module uses (so fakes type-check). */
 export interface EventSourceLike {
@@ -108,12 +132,14 @@ export function createConnection(opts: ConnectionOptions): Connection {
   const sampleUrl = opts.sampleUrl ?? DEFAULT_SAMPLE_URL;
   const speed = opts.replaySpeed && opts.replaySpeed > 0 ? opts.replaySpeed : 1;
 
+  const initialState = emptyState();
   const initial: RunView = {
-    state: emptyState(),
+    state: initialState,
     mode: base ? "LIVE" : "REPLAY",
     conn: "CONNECTING",
     source: base ? "api" : "sample",
     detail: null,
+    history: freshHistory(initialState),
   };
   let view = initial;
   const listeners = new Set<() => void>();
@@ -219,7 +245,8 @@ export function createConnection(opts: ConnectionOptions): Connection {
     reached = true;
     if (view.source === "sample") {
       // Only reachable when a sample load was interrupted before any sample data was shown.
-      set({ source: "api", mode: "LIVE", state: emptyState(), conn: "CONNECTING", detail: null });
+      const empty = emptyState();
+      set({ source: "api", mode: "LIVE", state: empty, history: freshHistory(empty), conn: "CONNECTING", detail: null });
     }
     let body: unknown = null;
     try {
@@ -266,7 +293,7 @@ export function createConnection(opts: ConnectionOptions): Connection {
     const state = { ...emptyState(), ...(body.state as Partial<RunState>) } as RunState;
     if (typeof state.last_seq !== "number" || !Number.isInteger(state.last_seq)) state.last_seq = 0;
     snapshotLoaded = true;
-    if (state.last_seq >= view.state.last_seq) set({ state });
+    if (state.last_seq >= view.state.last_seq) set({ state, history: freshHistory(state) });
     openStream();
   }
 
@@ -280,7 +307,7 @@ export function createConnection(opts: ConnectionOptions): Connection {
     // Dedupe by seq before folding (foldEvent also drops seq <= last_seq).
     if (isObject(ev) && typeof ev.seq === "number" && ev.seq <= view.state.last_seq) return;
     const next = foldEvent(view.state, ev);
-    if (next !== view.state) set({ state: next });
+    if (next !== view.state) set({ state: next, history: appendHistory(view.history, ev) });
   }
 
   function openStream(): void {
@@ -340,7 +367,8 @@ export function createConnection(opts: ConnectionOptions): Connection {
 
   async function startSample(reason: string): Promise<void> {
     const my = epoch;
-    set({ mode: "REPLAY", source: "sample", conn: "OFFLINE", detail: reason, state: emptyState() });
+    const empty = emptyState();
+    set({ mode: "REPLAY", source: "sample", conn: "OFFLINE", detail: reason, state: empty, history: freshHistory(empty) });
     sampleIndex = 0;
     if (sample === null) {
       const r = await request(sampleUrl);
@@ -363,7 +391,7 @@ export function createConnection(opts: ConnectionOptions): Connection {
     if (sampleIndex >= events.length) return;
     const ev = events[sampleIndex++];
     const next = foldEvent(view.state, ev);
-    if (next !== view.state) set({ state: next });
+    if (next !== view.state) set({ state: next, history: appendHistory(view.history, ev) });
     if (sampleIndex >= events.length) return;
     const gap = tsOf(events[sampleIndex]) - tsOf(ev);
     const ms = Number.isFinite(gap) ? Math.min(Math.max(gap, 0) * 1000 / speed, REPLAY_MAX_GAP_MS) : 0;

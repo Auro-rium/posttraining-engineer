@@ -2,6 +2,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  appendHistory,
+  HISTORY_MAX,
+  type History,
   backoffDelay,
   createConnection,
   type Connection,
@@ -458,6 +461,42 @@ describe("connection", () => {
     expect(v.state.last_seq).toBe(JSON.parse(lines.at(-1)!).seq);
     expect(vi.getTimerCount()).toBe(0);
     conn.stop();
+  });
+
+  it("history_refolds_to_the_current_state (sample and live)", async () => {
+    const text = readFileSync(join(__dirname, "..", "public", "sample-run.jsonl"), "utf8");
+    const routes = liveRoutes();
+    routes[SAMPLE] = () => res(200, text);
+    const sample = make(routes, { apiUrl: null }).conn;
+    sample.start();
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    const sv = view(sample);
+    expect(sv.history.base).toEqual(emptyState());
+    expect(sv.history.events.reduce(foldEvent, sv.history.base)).toEqual(sv.state);
+    sample.stop();
+
+    const { conn } = make(liveRoutes());
+    conn.start();
+    await flush();
+    const es = last();
+    es.open();
+    es.emit({ seq: 6, type: "run.status", data: { status: "COMPLETED" } });
+    es.emit({ seq: 6, type: "run.status", data: { status: "DUP" } }); // dropped: not in history
+    const v = view(conn);
+    expect(v.history.base.last_seq).toBe(5); // cannot scrub before the snapshot
+    expect(v.history.events).toHaveLength(1);
+    expect(v.history.events.reduce(foldEvent, v.history.base)).toEqual(v.state);
+    conn.stop();
+  });
+
+  it("history is capped and folds the overflow into base", () => {
+    let h: History = { base: emptyState(), events: [] };
+    for (let seq = 1; seq <= HISTORY_MAX + 5; seq++) {
+      h = appendHistory(h, { seq, ts: seq, run: RUN, type: "run.status", data: { attempt: seq } });
+    }
+    expect(h.events).toHaveLength(HISTORY_MAX);
+    expect(h.base.last_seq).toBe(5);
+    expect(h.events.reduce(foldEvent, h.base).last_seq).toBe(HISTORY_MAX + 5);
   });
 });
 
