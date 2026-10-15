@@ -92,7 +92,7 @@ async def build_agent(
 
     middleware = build_middleware(settings, **extra)
     remember, recall = memory_tools(settings, assistant_id, client_factory)
-    tools = make_tools(experiments or default_backend(settings), settings)
+    tools = make_tools(experiments or default_backend(settings), settings, journal=journal)
     tools.update(web_tools(settings, http_client_factory))
     tools.update(hf_tools(settings, http_client_factory))
     tools["read_telemetry"] = telemetry_tool(settings.state_dir / "telemetry.jsonl")

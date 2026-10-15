@@ -124,6 +124,16 @@ CREATE INDEX IF NOT EXISTS events_run_seq ON events(run, seq);
 """
 
 
+def emit(journal: Journal | None, type: str, data: dict, run: str | None = None) -> None:
+    """Best-effort append under ``run`` (default ``CURRENT_RUN``); never raises."""
+    if journal is None:
+        return
+    try:
+        journal.append(run or CURRENT_RUN.get(), type, data)
+    except Exception:  # noqa: BLE001 - emission must never fail a run or tool
+        pass
+
+
 class Journal:
     def __init__(
         self, path: Path | str, max_rows: int = 100_000, prune_every: int = 1_000

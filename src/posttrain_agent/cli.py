@@ -47,7 +47,8 @@ async def _main(args: argparse.Namespace) -> int:
     cbs: list[Any] = [JournalHandler(
         journal, primary=f"{settings.llm_provider}:{settings.model_name}",
         telemetry_path=settings.state_dir / "telemetry.jsonl")]
-    opts = {"max_attempts": settings.max_recovery_attempts, "callbacks": cbs}
+    opts = {"max_attempts": settings.max_recovery_attempts, "callbacks": cbs,
+            "journal": journal}
     async with open_runtime(settings.state_dir) as rt:
         graph = await build_agent(settings, rt, journal=journal)
         if args.cmd == "run":

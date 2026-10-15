@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,6 +21,7 @@ from langgraph.store.base import BaseStore
 from langgraph.types import Command
 
 from .backboard_model import CassetteMiss
+from .events import CURRENT_RUN, Journal, emit
 
 LEDGER_NS = ("posttrain", "runs")
 FATAL = (CassetteMiss, KeyboardInterrupt, asyncio.CancelledError)
@@ -81,7 +83,60 @@ async def _record(store: BaseStore | None, report: RunReport) -> None:
         })
 
 
+_ESTIMATE_MARK = "budget estimate: "
+
+
+def parse_estimate_usd(description: Any) -> float | None:
+    """Estimated cost from the JSON after ``budget estimate: `` in an approval description."""
+    if not isinstance(description, str) or _ESTIMATE_MARK not in description:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(description.split(_ESTIMATE_MARK, 1)[1])
+        value = obj.get("estimated_cost_usd") if isinstance(obj, dict) else None
+    except ValueError:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+def _checkpoint_of(state: Any) -> tuple[str | None, Any]:
+    cid = (getattr(state, "config", None) or {}).get("configurable", {}).get("checkpoint_id")
+    step = (getattr(state, "metadata", None) or {}).get("step")
+    return cid, step
+
+
+def _emit_pending(journal: Journal | None, thread_id: str, pending: list[dict[str, Any]]) -> None:
+    for act in pending:
+        args = act.get("args") if isinstance(act.get("args"), dict) else {}
+        emit(journal, "approval.pending", {
+            "action": act.get("name"), "base_model": args.get("base_model"),
+            "dataset_ref": args.get("dataset_ref"),
+            "hyperparameters": args.get("hyperparameters"),
+            "estimate_usd": parse_estimate_usd(act.get("description")),
+            "cli_hint": f"posttrain approve --thread {thread_id}"}, run=thread_id)
+
+
 async def run_with_recovery(
+    graph: Any,
+    goal: str,
+    thread_id: str,
+    *,
+    journal: Journal | None = None,
+    backend: str | None = None,
+    experiment_budget: int | None = None,
+    **kw: Any,
+) -> RunReport:
+    """``_run_with_recovery`` with ``CURRENT_RUN`` bound to ``thread_id`` for the call."""
+    token = CURRENT_RUN.set(thread_id)
+    try:
+        return await _run_with_recovery(graph, goal, thread_id, journal=journal, backend=backend,
+                                        experiment_budget=experiment_budget, **kw)
+    finally:
+        CURRENT_RUN.reset(token)
+
+
+async def _run_with_recovery(
     graph: Any,
     goal: str,
     thread_id: str,
@@ -91,6 +146,9 @@ async def run_with_recovery(
     base_delay: float = 2.0,
     resume: Command | None = None,
     callbacks: list[Any] | None = None,
+    journal: Journal | None = None,
+    backend: str | None = None,
+    experiment_budget: int | None = None,
 ) -> RunReport:
     """Run ``goal`` on ``thread_id``; resume from the last checkpoint after failures.
 
@@ -101,10 +159,14 @@ async def run_with_recovery(
     snapshot = await graph.aget_state(cfg)
     payload: Any = resume or (None if snapshot.values else
                               {"messages": [{"role": "user", "content": goal}]})
+    if resume is None and not snapshot.values:
+        emit(journal, "run.started", {"goal_len": len(goal), "experiment_budget": experiment_budget,
+                                      "backend": backend}, run=thread_id)
     report = RunReport(thread_id, "FAILED", 0)
     for attempt in range(1, max_attempts + 1):
         report.attempts = attempt
         await _record(store, report)
+        emit(journal, "run.status", {"status": "RUNNING", "attempt": attempt}, run=thread_id)
         try:
             result = await graph.ainvoke(payload, cfg)
         except FATAL:
@@ -113,19 +175,24 @@ async def run_with_recovery(
             report.errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
             payload = None  # every later attempt resumes the saved thread
             state = await graph.aget_state(cfg)
-            report.last_checkpoint_id = (state.config or {}).get("configurable", {}).get(
-                "checkpoint_id")
+            report.last_checkpoint_id, step = _checkpoint_of(state)
+            emit(journal, "checkpoint", {"checkpoint_id": report.last_checkpoint_id,
+                                         "step": step}, run=thread_id)
             if attempt < max_attempts:
                 await asyncio.sleep(base_delay * 2 ** (attempt - 1))
             continue
         state = await graph.aget_state(cfg)
-        report.last_checkpoint_id = (state.config or {}).get("configurable", {}).get(
-            "checkpoint_id")
+        report.last_checkpoint_id, step = _checkpoint_of(state)
+        emit(journal, "checkpoint", {"checkpoint_id": report.last_checkpoint_id, "step": step},
+             run=thread_id)
         report.pending = await pending_actions(graph, thread_id)
         report.status = "AWAITING_APPROVAL" if report.pending else "COMPLETED"
         report.result = result
+        _emit_pending(journal, thread_id, report.pending)
         break
     await _record(store, report)
+    emit(journal, "run.status", {"status": report.status, "attempt": report.attempts,
+                                 "errors": report.errors}, run=thread_id)
     return report
 
 
@@ -139,6 +206,7 @@ async def decide(
     max_attempts: int = 3,
     base_delay: float = 2.0,
     callbacks: list[Any] | None = None,
+    journal: Journal | None = None,
 ) -> RunReport:
     """Approve or reject every pending action of a paused thread, then continue the run."""
     pauses = await _pauses(graph, thread_id)
@@ -154,9 +222,11 @@ async def decide(
         resume = Command(resume=answer(pauses[0][1]))
     else:  # parallel subagents each paused: answer every interrupt by id
         resume = Command(resume={iid: answer(n) for iid, n in pauses})
+    emit(journal, "approval.resolved", {"decision": decision["type"],
+                                        "message_len": len(message or "")}, run=thread_id)
     return await run_with_recovery(
         graph, "", thread_id, store=store, max_attempts=max_attempts, base_delay=base_delay,
-        resume=resume, callbacks=callbacks)
+        resume=resume, callbacks=callbacks, journal=journal)
 
 
 async def history(graph: Any, thread_id: str) -> list[dict[str, Any]]:

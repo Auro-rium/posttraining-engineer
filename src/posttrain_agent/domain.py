@@ -17,6 +17,7 @@ from typing import Any, Literal, Protocol
 from . import budget as budget_mod
 from . import dataset as dataset_mod
 from .config import Settings
+from .events import Journal, emit
 
 Evidence = Literal["LIVE", "PRIOR_VERIFIED_RUN", "EXPLANATION"]
 VERIFIED: frozenset[str] = frozenset({"LIVE", "PRIOR_VERIFIED_RUN"})
@@ -144,15 +145,42 @@ def promotion_gate(champion: dict[str, Any], candidate: dict[str, Any]) -> dict[
 
 
 def make_tools(backend: ExperimentBackend, settings: Settings,
-               suite: str = "AgentGym/AgentEval") -> dict[str, Callable[..., Any]]:
-    """Bind the deterministic tools to a backend and settings."""
+               suite: str = "AgentGym/AgentEval",
+               journal: Journal | None = None) -> dict[str, Callable[..., Any]]:
+    """Bind the deterministic tools to a backend and settings.
+
+    With a ``journal`` the tools emit score/gate/budget/job events under ``CURRENT_RUN``;
+    emission is best-effort and never changes a tool's result.
+    """
     seed = settings.seed
+
+    def _score(res: dict[str, Any], split: str, checkpoint: str) -> None:
+        if isinstance(res, dict) and "score" in res:
+            emit(journal, "score", {
+                "split": res.get("split", split), "checkpoint": res.get("checkpoint", checkpoint),
+                "value": res.get("score"), "n": res.get("n"), "evidence": res.get("evidence")})
+
+    def _budget(est: Any) -> None:
+        if isinstance(est, dict) and "error" not in est:
+            emit(journal, "budget.update", {
+                "spent_usd": est.get("spent_usd"), "cap_usd": est.get("cap_usd"),
+                "estimate_usd": est.get("estimated_cost_usd"),
+                "price_known": est.get("price_per_mtok") is not None})
+
+    def _job(res: Any) -> None:
+        if isinstance(res, dict) and res.get("provider_job_id"):
+            emit(journal, "job.update", {
+                "job_id": res.get("provider_job_id"), "status": res.get("status"),
+                "trained_steps": res.get("trained_steps"), "total_steps": res.get("total_steps"),
+                "trained_tokens": res.get("trained_tokens"), "evidence": res.get("evidence")})
 
     def run_benchmark(checkpoint: str, split: str = "train") -> dict[str, Any]:
         """Benchmark a checkpoint ('base' = the base model) on the TRAIN split; returns score + failures."""
         if split != "train":
             return {"error": "benchmark may only use the train split; held-out data is sealed"}
-        return backend.benchmark(checkpoint, suite, seed)
+        res = backend.benchmark(checkpoint, suite, seed)
+        _score(res, "train", checkpoint)
+        return res
 
     def validate_hparams_tool(config: dict[str, Any]) -> dict[str, Any]:
         """Check LoRA hyperparameters against the fixed search space. Returns {valid, errors}."""
@@ -170,7 +198,9 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
 
     def estimate_budget(dataset_ref: str, hyperparameters: dict[str, Any]) -> dict[str, Any]:
         """Estimate trained tokens and cost of a job against the remaining budget."""
-        return budget_mod.estimate(settings, dataset_ref, hyperparameters)
+        est = budget_mod.estimate(settings, dataset_ref, hyperparameters)
+        _budget(est)
+        return est
 
     def launch_training(hyperparameters: dict[str, Any], dataset_ref: str,
                         base_model: str | None = None) -> dict[str, Any]:
@@ -188,25 +218,39 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         if result.get("provider_job_id"):
             budget_mod.record_spend(settings, result["provider_job_id"],
                                     est["estimated_cost_usd"], dataset_ref)
+            _budget({**est, "spent_usd": round(budget_mod.spent_usd(settings), 4)})
+        _job(result)
         return {**result, "dataset_sha256": report["sha256"], "estimate": est}
 
     def get_training_status(job_id: str) -> dict[str, Any]:
         """Poll a training job: status, steps, trained tokens and (when done) the checkpoint name."""
-        return backend.job_status(job_id)
+        res = backend.job_status(job_id)
+        _job(res)
+        return res
 
     def read_training_logs(job_id: str, limit: int = 50) -> dict[str, Any]:
         """Read the provider's event log for a training job (most useful after failures)."""
-        return backend.job_events(job_id, max(1, min(limit, 200)))
+        res = backend.job_events(job_id, max(1, min(limit, 200)))
+        if isinstance(res, dict):
+            for ev in res.get("events") or []:
+                if isinstance(ev, dict):
+                    emit(journal, "job.log", {"level": ev.get("level"),
+                                              "message": ev.get("message")})
+        return res
 
     def evaluate_checkpoint(checkpoint: str, split: str = "heldout") -> dict[str, Any]:
         """Evaluate a checkpoint on a sealed split ('heldout' or 'regression'); scores only."""
         if split not in {"heldout", "regression"}:
             return {"error": "split must be 'heldout' or 'regression'"}
-        return backend.evaluate(checkpoint, suite, split, seed)
+        res = backend.evaluate(checkpoint, suite, split, seed)
+        _score(res, split, checkpoint)
+        return res
 
     def decide_promotion(champion: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
         """Run the deterministic promotion gate over two evaluate_checkpoint results."""
-        return promotion_gate(champion, candidate)
+        verdict = promotion_gate(champion, candidate)
+        emit(journal, "gate.verdict", verdict)
+        return verdict
 
     validate_hparams_tool.__name__ = "validate_hparams"
     return {"run_benchmark": run_benchmark, "validate_hparams": validate_hparams_tool,

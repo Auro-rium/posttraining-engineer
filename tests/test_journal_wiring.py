@@ -146,3 +146,109 @@ def test_sync_path_journals_and_non_task_calls_do_not(tmp_path):
     assert j.read("r1") == []
     mw.wrap_tool_call(req("evaluator"), lambda r: 1)
     assert [e.type for e in j.read("r1")] == ["agent.start", "agent.end"]
+
+
+# --- Task 4: run-controller and domain-tool events ---------------------------------------
+
+from fakes import text  # noqa: E402
+from test_approval import LAUNCH, factory  # noqa: E402
+from test_approval import settings as approval_settings  # noqa: E402
+
+from posttrain_agent.agent import build_agent  # noqa: E402
+from posttrain_agent.domain import LocalStubBackend, make_tools  # noqa: E402
+from posttrain_agent.persistence import open_runtime  # noqa: E402
+from posttrain_agent.replay import decide, parse_estimate_usd, run_with_recovery  # noqa: E402
+
+
+def _is_subsequence(want, got):
+    it = iter(got)
+    return all(any(w == g for g in it) for w in want)
+
+
+async def test_full_fake_run_emits_expected_event_sequence(tmp_path):
+    s = approval_settings(tmp_path)
+    j = Journal(tmp_path / "e.sqlite")
+    async with open_runtime(s.state_dir) as rt:
+        graph = await build_agent(s, rt, client_factory=factory(list(LAUNCH), []), journal=j)
+        rep = await run_with_recovery(graph, "go", "t", store=rt.store, max_attempts=1,
+                                      journal=j, backend="stub", experiment_budget=3)
+        assert rep.status == "AWAITING_APPROVAL"
+    seq = [text('{"status": "SUCCEEDED"}'), text("all done")]
+    async with open_runtime(s.state_dir) as rt:
+        graph = await build_agent(s, rt, client_factory=factory(seq, []), journal=j)
+        rep = await decide(graph, "t", False, message="SECRET REASON", store=rt.store,
+                           max_attempts=1, journal=j)
+        assert rep.status == "COMPLETED"
+    ev = j.read("t")
+    marks = [("run.status", e.data.get("status")) if e.type == "run.status" else e.type
+             for e in ev]
+    assert _is_subsequence(
+        ["run.started", ("run.status", "RUNNING"), "agent.start", "approval.pending",
+         ("run.status", "AWAITING_APPROVAL"), "approval.resolved", ("run.status", "RUNNING"),
+         ("run.status", "COMPLETED")], marks), marks
+    assert "checkpoint" in marks
+    started = next(e for e in ev if e.type == "run.started").data
+    assert started == {"goal_len": 2, "experiment_budget": 3, "backend": "stub"}
+    pend = next(e for e in ev if e.type == "approval.pending").data
+    assert pend["action"] == "launch_training"
+    assert pend["cli_hint"] == "posttrain approve --thread t"
+    assert pend["dataset_ref"] == "d.jsonl" and isinstance(pend["estimate_usd"], float)
+    res = next(e for e in ev if e.type == "approval.resolved").data
+    assert res == {"decision": "reject", "message_len": len("SECRET REASON")}
+    assert "SECRET REASON" not in repr([e.data for e in ev])
+
+
+def test_estimate_parse_is_pinned():
+    desc = ('Approve?\ndataset: d\nbudget estimate: {"estimated_cost_usd": 1.25, '
+            '"within_budget": true}')
+    assert parse_estimate_usd(desc) == 1.25
+    assert parse_estimate_usd('budget estimate: {"estimated_cost_usd": null}') is None
+    assert parse_estimate_usd('budget estimate: {"error": "cannot read dataset"}') is None
+    assert parse_estimate_usd("budget estimate: not json") is None
+    assert parse_estimate_usd("no estimate here") is None
+    assert parse_estimate_usd(None) is None
+
+
+def test_score_event_carries_evidence_label(tmp_path):
+    j = Journal(tmp_path / "e.sqlite")
+    s = approval_settings(tmp_path)
+    tools = make_tools(LocalStubBackend(), s, journal=j)
+    tools["run_benchmark"]("base")
+    tools["evaluate_checkpoint"]("stub-ckpt-1", "heldout")
+    sc = [e.data for e in j.read("r1") if e.type == "score"]
+    assert [d["split"] for d in sc] == ["train", "heldout"]
+    assert all(d["evidence"] == "EXPLANATION" and isinstance(d["value"], float) for d in sc)
+    assert sc[1]["checkpoint"] == "stub-ckpt-1"
+
+
+def test_domain_tools_emit_budget_job_gate_and_log_events(tmp_path):
+    from test_domain import GOOD
+
+    j = Journal(tmp_path / "e.sqlite")
+    s = approval_settings(tmp_path)
+    tools = make_tools(LocalStubBackend(), s, journal=j)
+    tools["estimate_budget"]("d.jsonl", GOOD)
+    out = tools["launch_training"](GOOD, "d.jsonl")
+    tools["get_training_status"](out["provider_job_id"])
+    tools["read_training_logs"](out["provider_job_id"])
+    tools["decide_promotion"]({"score": 0.3}, {"score": 0.5})
+    ev = j.read("r1")
+    assert [e.type for e in ev] == ["budget.update", "budget.update", "job.update", "job.update",
+                                    "job.log", "gate.verdict"]
+    assert ev[0].data["price_known"] is True and ev[0].data["cap_usd"] == s.max_cost_usd
+    assert ev[3].data["status"] == "succeeded"
+    assert ev[4].data["message"] == "simulated job; no real logs exist"
+
+
+async def test_journal_failure_does_not_fail_the_run(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    bad = Journal(blocker / "sub" / "e.sqlite")  # parent is a file: unwritable
+    s = approval_settings(tmp_path, require_approval=False)
+    seq = [*LAUNCH, text('{"status":"SUCCEEDED"}'), text("done")]
+    async with open_runtime(s.state_dir) as rt:
+        graph = await build_agent(s, rt, client_factory=factory(seq, []), journal=bad)
+        rep = await run_with_recovery(graph, "go", "t", max_attempts=1, journal=bad)
+        assert rep.status == "COMPLETED"
+    tools = make_tools(LocalStubBackend(), s, journal=bad)
+    assert "score" in tools["run_benchmark"]("base")
