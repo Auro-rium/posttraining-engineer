@@ -1,5 +1,0 @@
-pydantic>=2.12,<3
-torch>=2.3,<3
-transformers>=4.45,<5
-peft>=0.13,<1
-accelerate>=0.34,<2

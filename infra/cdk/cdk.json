@@ -1,9 +1,0 @@
-{
-  "app": "../../backend/.venv/bin/python app.py",
-  "context": {
-    "region": "us-east-1",
-    "deployment_id": "demo",
-    "artifact_prefix": "post-training",
-    "config_note": "bootstrap-only; does not read runtime image, model, checkpoint, evaluation, DNS, or certificate configuration"
-  }
-}
