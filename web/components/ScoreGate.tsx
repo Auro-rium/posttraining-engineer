@@ -1,5 +1,6 @@
 import type { Json, RunState, Score } from "../lib/events";
 import { EvidenceBadge, fixed, num, pct, str } from "./format";
+import { CountUp } from "./motion";
 
 /** How many earlier scores are listed under the headline one. */
 export const SCORE_ROWS = 5;
@@ -8,7 +9,7 @@ function scoreLabel(s: Score): string {
   return [str(s.checkpoint as Json), str(s.split as Json)].filter(Boolean).join(" ") || "score";
 }
 
-function Scores({ scores }: { scores: Score[] }) {
+function Scores({ scores, live }: { scores: Score[]; live: boolean }) {
   const latest = scores.at(-1);
   const earlier = scores.slice(0, -1).slice(-SCORE_ROWS).reverse();
   return (
@@ -17,7 +18,8 @@ function Scores({ scores }: { scores: Score[] }) {
       {latest ? (
         <>
           <div className="score-big">
-            {fixed(latest.value as Json)} <EvidenceBadge evidence={latest.evidence as Json} />
+            <CountUp value={num(latest.value as Json)} animate={live} className="score-value" />{" "}
+            <EvidenceBadge evidence={latest.evidence as Json} />
           </div>
           <div className="dim">
             {scoreLabel(latest)}
@@ -66,7 +68,10 @@ function Gate({ state }: { state: RunState }) {
       <h2 className="panel-title">GATE</h2>
       {g ? (
         <>
-          <div className={`gate-decision gate-${(decision ?? "none").toLowerCase()}`}>{decision ?? "NO DECISION"}</div>
+          {/* keyed by decision: the PROMOTE pulse / REJECT shake replays only when the verdict changes */}
+          <div key={decision ?? "none"} className={`gate-decision gate-${(decision ?? "none").toLowerCase()}`}>
+            {decision ?? "NO DECISION"}
+          </div>
           {measured ? null : (
             <div>
               <span className="badge badge-sim" title="gate inherits the run's score evidence: simulated or undetermined">
@@ -95,10 +100,11 @@ function Gate({ state }: { state: RunState }) {
   );
 }
 
-export function ScoreGate({ state }: { state: RunState }) {
+/** `live` is false while the timeline is scrubbed: the headline score jumps instead of counting. */
+export function ScoreGate({ state, live = true }: { state: RunState; live?: boolean }) {
   return (
     <div className="scoregate">
-      <Scores scores={state.scores} />
+      <Scores scores={state.scores} live={live} />
       <Gate state={state} />
     </div>
   );

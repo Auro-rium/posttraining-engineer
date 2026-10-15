@@ -38,17 +38,20 @@ export function StatusBar({ view, state, runId, scrubSeq = null }: Props) {
         </span>
         {state.backend ? <span className="dim"> · backend {state.backend}</span> : null}
       </span>
-      <span className="statusbar-conn" role="status" aria-live="polite">
-        {scrubSeq !== null ? <span className="label label-amber">HISTORICAL · seq {scrubSeq}</span> : null}
-        {view.mode === "REPLAY" ? (
-          <span className="label label-amber">{sample ? "REPLAY · SAMPLE DATA" : "REPLAY"}</span>
-        ) : null}
-        <span className={`label conn conn-${view.conn.toLowerCase()}`}>{connLabel(view)}</span>
-        {view.detail ? <span className="dim">({view.detail})</span> : null}
-        {view.conn === "RECONNECTING" && view.state.last_seq > 0 ? (
-          <span className="dim">last received state shown</span>
-        ) : null}
-        <span className="dim">seq {view.state.last_seq}</span>
+      <span className="statusbar-right">
+        {/* role=status is atomic: the per-event seq counter sits outside it so it is not re-read on every event */}
+        <span className="statusbar-conn" role="status" aria-live="polite">
+          {scrubSeq !== null ? <span className="label label-amber">HISTORICAL · seq {scrubSeq}</span> : null}
+          {view.mode === "REPLAY" ? (
+            <span className="label label-amber">{sample ? "REPLAY · SAMPLE DATA" : "REPLAY"}</span>
+          ) : null}
+          <span className={`label conn conn-${view.conn.toLowerCase()}`}>{connLabel(view)}</span>
+          {view.detail ? <span className="dim">({view.detail})</span> : null}
+          {view.conn === "RECONNECTING" && view.state.last_seq > 0 ? (
+            <span className="dim">last received state shown</span>
+          ) : null}
+        </span>
+        <span className="dim statusbar-seq">seq {view.state.last_seq}</span>
       </span>
     </header>
   );

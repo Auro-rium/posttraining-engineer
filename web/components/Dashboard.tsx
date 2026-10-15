@@ -1,11 +1,14 @@
 "use client";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { History, RunView } from "../lib/connection";
+import type { RunState } from "../lib/events";
 import { foldEvent } from "../lib/reducer";
 import { AgentBoard } from "./AgentBoard";
 import { ApprovalBanner } from "./ApprovalBanner";
+import { type BlipKind, SoundToggle, useBlips } from "./Blips";
+import { Boot } from "./Boot";
 import { Budget } from "./Budget";
-import { EventStream } from "./EventStream";
+import { EventStream, isErrorEntry } from "./EventStream";
 import { JobLog, JobPanel } from "./JobPanel";
 import { ScoreGate } from "./ScoreGate";
 import { StatusBar, connLabel } from "./StatusBar";
@@ -18,6 +21,15 @@ const seqOf = (ev: unknown): number =>
 /** The history cut at `seq` (inclusive). */
 export function historyUpTo(h: History, seq: number): History {
   return { base: h.base, events: h.events.filter((e) => seqOf(e) <= seq) };
+}
+
+/** Which blip the newest log entry deserves. */
+function blipFor(state: RunState): BlipKind {
+  const e = state.log.at(-1);
+  if (!e) return "tick";
+  if (isErrorEntry(e) || e.type === "approval.pending") return "alert";
+  if (e.type === "gate.verdict") return /\bREJECT\b/.test(e.summary) ? "alert" : "good";
+  return "tick";
 }
 
 /**
@@ -39,9 +51,23 @@ export function DashboardView({ view, runId }: { view: RunView; runId?: string }
     [view.state, shownHistory, target],
   );
 
+  const live = target === null;
+  const sound = useBlips();
+  const blipSeq = useRef(liveSeq);
+  const { blip } = sound;
+  useEffect(() => {
+    // Only new events while following the latest state make a sound; scrubbing never does.
+    if (liveSeq > blipSeq.current && live) blip(blipFor(view.state));
+    blipSeq.current = liveSeq;
+  }, [liveSeq, live, blip, view.state]);
+
   const empty = view.state.last_seq === 0;
   return (
     <div className="dashboard" data-conn={view.conn} data-mode={view.mode} data-historical={target !== null}>
+      <div className="topline">
+        <Boot text={`> mission control :: thread ${runId ?? "?"} :: panels online`} />
+        <SoundToggle on={sound.on} onToggle={sound.toggle} supported={sound.supported} />
+      </div>
       <StatusBar view={view} state={state} runId={runId} scrubSeq={target} />
       <ApprovalBanner state={state} historical={target !== null} />
       {empty ? (
@@ -51,9 +77,9 @@ export function DashboardView({ view, runId }: { view: RunView; runId?: string }
       ) : null}
       <main className="grid-main">
         <AgentBoard state={state} />
-        <EventStream state={state} />
+        <EventStream state={state} live={live} />
         <aside className="panel rightcol" aria-label="Score, gate, budget and job">
-          <ScoreGate state={state} />
+          <ScoreGate state={state} live={live} />
           <Budget state={state} />
           <JobPanel state={state} />
         </aside>
