@@ -11,18 +11,20 @@ import asyncio
 import hmac
 import json
 import os
+import sqlite3
 import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import fold
-from .events import Event, Journal
+from .events import Event
 
 MAX_REPLAY_SLEEP_S = 2.0
 BATCH = 500
@@ -59,7 +61,84 @@ def _runs_of(events: list[Event]) -> list[dict]:
 
 
 def _frame(e: Event) -> str:
-    return f"id: {e.seq}\nevent: {e.type}\ndata: {json.dumps(e.data, separators=(',', ':'))}\n\n"
+    return f"id: {e.seq}\nevent: {e.type}\ndata: {json.dumps(asdict(e), separators=(',', ':'))}\n\n"
+
+
+class ReadOnlyJournal:
+    """Reads the SQLite journal with ``mode=ro``: never creates files and never runs DDL."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=1)
+
+    def probe(self) -> bool:
+        try:
+            conn = self._connect()
+            try:
+                conn.execute("SELECT 1 FROM events LIMIT 1").fetchall()
+            finally:
+                conn.close()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def read(self, run: str | None, since: int, limit: int) -> list[Event]:
+        sql = "SELECT seq, ts, run, type, data FROM events WHERE seq > ?"
+        args: list = [since]
+        if run is not None:
+            sql += " AND run = ?"
+            args.append(run)
+        sql += " ORDER BY seq ASC LIMIT ?"
+        args.append(limit)
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(sql, args).fetchall()
+            finally:
+                conn.close()
+            return [Event(s, t, r, ty, json.loads(d)) for s, t, r, ty, d in rows]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def runs(self) -> list[dict]:
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT run, MIN(ts), MAX(seq) FROM events GROUP BY run ORDER BY MAX(seq)"
+                ).fetchall()
+                out = []
+                for run, started, last_seq in rows:
+                    row = conn.execute(
+                        "SELECT data FROM events WHERE run = ? AND type = 'run.status' "
+                        "ORDER BY seq DESC LIMIT 1",
+                        (run,),
+                    ).fetchone()
+                    status = json.loads(row[0]).get("status") if row else None
+                    out.append(
+                        {"run": run, "started": started, "last_seq": last_seq, "status": status}
+                    )
+                return out
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            return []
+
+
+class _SlotResponse(StreamingResponse):
+    """StreamingResponse that always releases its stream slot, even if never started."""
+
+    def __init__(self, *args, release: Callable[[], None], **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
 
 
 def create_app(
@@ -79,8 +158,16 @@ def create_app(
         allow_headers=["Last-Event-ID", "Content-Type"],
     )
     replay: list[Event] | None = _load_replay(Path(replay_file)) if replay_file else None
-    journal = None if replay is not None else Journal(Path(state_dir) / "events.db")
+    journal = None if replay is not None else ReadOnlyJournal(Path(state_dir) / "events.db")
     active = {"n": 0}
+    app.state.active = active
+
+    def journal_ok() -> bool:
+        return replay is not None or journal.probe()  # type: ignore[union-attr]
+
+    def require_journal() -> None:
+        if not journal_ok():
+            raise HTTPException(status_code=503, detail="journal unavailable")
 
     def auth(token: str = Query(default="")) -> None:
         if not read_token or not hmac.compare_digest(token.encode(), read_token.encode()):
@@ -138,16 +225,23 @@ def create_app(
         assert replay is not None
         return [e for e in replay if e.seq > since and (run is None or e.run == run)]
 
-    @app.get("/v1/health", dependencies=[Depends(auth)])
-    def health() -> dict[str, Any]:
-        return {"ok": True, "mode": "replay" if replay is not None else "live"}
+    @app.get("/v1/health")
+    def health() -> JSONResponse:
+        mode = "replay" if replay is not None else "live"
+        if journal_ok():
+            return JSONResponse({"ok": True, "mode": mode, "journal": True})
+        return JSONResponse(
+            {"ok": False, "status": "degraded", "mode": mode, "journal": False}, status_code=503
+        )
 
     @app.get("/v1/runs", dependencies=[Depends(auth)])
     def runs() -> dict[str, Any]:
+        require_journal()
         return {"runs": _runs_of(replay) if replay is not None else journal.runs()}  # type: ignore[union-attr]
 
     @app.get("/v1/runs/{run_id}/snapshot", dependencies=[Depends(auth)])
     def snapshot(run_id: str) -> dict[str, Any]:
+        require_journal()
         events: list[Event] = []
         since = 0
         while True:
@@ -180,6 +274,7 @@ def create_app(
                 since = max(int(header), 0)
             except ValueError:
                 pass
+        require_journal()
         if active["n"] >= max_streams:
             raise HTTPException(status_code=429, detail="too many streams")
         active["n"] += 1
@@ -189,15 +284,17 @@ def create_app(
             else live_events(request, run, since)
         )
 
-        async def body() -> AsyncIterator[str]:
-            try:
-                async for chunk in inner:
-                    yield chunk
-            finally:
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
                 active["n"] -= 1
 
-        return StreamingResponse(
-            body(),
+        return _SlotResponse(
+            inner,
+            release=release,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -221,7 +318,7 @@ def main() -> None:
     )
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT") or 8787))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT") or 8787), access_log=False)
 
 
 if __name__ == "__main__":

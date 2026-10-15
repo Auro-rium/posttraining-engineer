@@ -84,6 +84,7 @@ def ids(text: str) -> list[int]:
 
 
 async def test_missing_or_wrong_token_is_401(tmp_path):
+    seed(tmp_path, 1)
     app = make_app(tmp_path)
     async with client(app) as c:
         assert (await c.get("/v1/runs")).status_code == 401
@@ -97,9 +98,9 @@ async def test_missing_or_wrong_token_is_401(tmp_path):
 async def test_cors_only_allows_configured_origin(tmp_path):
     app = make_app(tmp_path)
     async with client(app) as c:
-        ok = await c.get(f"/v1/health?token={TOKEN}", headers={"Origin": ORIGIN})
+        ok = await c.get("/v1/health", headers={"Origin": ORIGIN})
         assert ok.headers["access-control-allow-origin"] == ORIGIN
-        bad = await c.get(f"/v1/health?token={TOKEN}", headers={"Origin": "https://evil.example"})
+        bad = await c.get("/v1/health", headers={"Origin": "https://evil.example"})
         assert "access-control-allow-origin" not in bad.headers
         pre = await c.options(
             "/v1/runs",
@@ -126,7 +127,7 @@ async def test_stream_emits_frames_with_seq_ids_and_event_names(tmp_path):
     assert st["text"].startswith("id: 1\nevent: run.status\ndata: ")
     frames = parse_frames(st["text"])
     assert [f["id"] for f in frames] == ["1", "2", "3"]
-    assert json.loads(frames[1]["data"]) == {"status": "running", "attempt": 1}
+    assert json.loads(frames[1]["data"])["data"] == {"status": "running", "attempt": 1}
 
 
 async def test_resume_with_last_event_id_has_no_gaps_or_duplicates(tmp_path):
@@ -166,6 +167,7 @@ async def test_last_event_id_beats_since_param(tmp_path):
 
 
 async def test_heartbeat_comment_sent_when_idle(tmp_path):
+    seed(tmp_path, 0)
     app = make_app(tmp_path, heartbeat_s=0.05)
     st = await raw_stream(app, f"/v1/stream?token={TOKEN}", stop=lambda t: ": hb\n\n" in t)
     assert ": hb\n\n" in st["text"]
@@ -198,16 +200,10 @@ async def test_snapshot_equals_fold_of_stream(tmp_path):
     st = await raw_stream(
         app, f"/v1/stream?token={TOKEN}&run=r", stop=lambda t: t.count("\n\n") >= 3
     )
-    evs = [
-        Event(int(f["id"]), 0.0, "r", f["event"], json.loads(f["data"]))
-        for f in parse_frames(st["text"])
-    ]
+    evs = [Event(**json.loads(f["data"])) for f in parse_frames(st["text"])]
     async with client(app) as c:
         body = (await c.get(f"/v1/runs/r/snapshot?token={TOKEN}")).json()
-    # SSE frames carry only `data`, not ts, so compare with log timestamps normalised.
-    got = body["state"]
-    got["log"] = [{**x, "ts": 0.0} for x in got["log"]]
-    assert got == fold.snapshot(evs)
+    assert body["state"] == fold.snapshot(evs)
     assert body["last_seq"] == 4
 
 
@@ -293,3 +289,74 @@ async def test_replay_mode_serves_recorded_journal(tmp_path):
     assert ids(st["text"]) == [1, 2, 3]
     assert time.monotonic() - t0 < 2.5
     assert not (tmp_path / "state" / "events.db").exists()
+
+
+async def test_stream_data_is_full_envelope(tmp_path):
+    j = seed(tmp_path, 1)
+    app = make_app(tmp_path)
+    st = await raw_stream(app, f"/v1/stream?token={TOKEN}", stop=lambda t: "\n\n" in t)
+    env = json.loads(parse_frames(st["text"])[0]["data"])
+    assert set(env) == {"seq", "ts", "run", "type", "data"}
+    assert env["ts"] == j.read()[0].ts and env["run"] == "r1"
+
+
+async def test_health_is_unauthenticated_and_minimal(tmp_path):
+    seed(tmp_path, 1)
+    async with client(make_app(tmp_path)) as c:
+        r = await c.get("/v1/health")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "mode": "live", "journal": True}
+
+
+async def test_missing_db_is_503_and_creates_nothing(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    app = make_app(state)
+    async with client(app) as c:
+        h = await c.get("/v1/health")
+    assert h.status_code == 503
+    assert h.json()["ok"] is False and h.json()["status"] == "degraded"
+    st = await raw_stream(app, f"/v1/stream?token={TOKEN}")
+    assert st["status"] == 503
+    assert app.state.active["n"] == 0
+    assert list(state.iterdir()) == []
+
+
+async def test_unopenable_state_dir_is_503(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    app = make_app(blocker / "sub")
+    st = await raw_stream(app, f"/v1/stream?token={TOKEN}")
+    assert st["status"] == 503
+    async with client(app) as c:
+        assert (await c.get("/v1/health")).status_code == 503
+    assert not (blocker / "sub").exists()
+
+
+async def test_slot_released_when_response_never_starts(tmp_path):
+    seed(tmp_path, 1)
+    app = make_app(tmp_path)
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(msg):
+        raise OSError("client gone")
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+        "scheme": "http", "path": "/v1/stream", "raw_path": b"/v1/stream",
+        "query_string": f"token={TOKEN}".encode(), "headers": [(b"host", b"t")],
+        "server": ("t", 80), "client": ("c", 1),
+    }  # fmt: skip
+    with pytest.raises(BaseException):  # noqa: B017
+        await asyncio.wait_for(app(scope, receive, send), 5)
+    assert app.state.active["n"] == 0
+
+
+async def test_since_beyond_max_seq_keeps_streaming(tmp_path):
+    j = seed(tmp_path, 2)
+    app = make_app(tmp_path, heartbeat_s=0.05)
+    st = await raw_stream(app, f"/v1/stream?token={TOKEN}&since=99", stop=lambda t: ": hb" in t)
+    assert st["status"] == 200 and ids(st["text"]) == []
+    del j
