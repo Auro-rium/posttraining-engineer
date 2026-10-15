@@ -14,9 +14,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.1,<2", "ruff>=0.12,<1"]
+api = ["fastapi>=0.115", "uvicorn>=0.30"]
 
 [project.scripts]
 posttrain = "posttrain_agent.cli:main"
+posttrain-api = "posttrain_agent.api:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]

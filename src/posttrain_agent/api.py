@@ -1,0 +1,228 @@
+"""Read-only FastAPI service streaming the event journal to the live dashboard over SSE.
+
+The API never appends to the journal. With ``replay_file`` it serves a recorded ``.jsonl``
+journal (one event per line: seq, ts, run, type, data) through the same routes, paced by the
+original timestamps divided by ``?speed=``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import json
+import os
+import sys
+import time
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from . import fold
+from .events import Event, Journal
+
+MAX_REPLAY_SLEEP_S = 2.0
+BATCH = 500
+
+
+def _load_replay(path: Path) -> list[Event]:
+    events: list[Event] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+            events.append(
+                Event(int(d["seq"]), float(d["ts"]), str(d["run"]), str(d["type"]), dict(d["data"]))
+            )
+        except (ValueError, KeyError, TypeError):
+            continue
+    events.sort(key=lambda e: e.seq)
+    return events
+
+
+def _runs_of(events: list[Event]) -> list[dict]:
+    by_run: dict[str, dict] = {}
+    for e in events:
+        r = by_run.setdefault(
+            e.run, {"run": e.run, "started": e.ts, "last_seq": e.seq, "status": None}
+        )
+        r["started"] = min(r["started"], e.ts)
+        r["last_seq"] = max(r["last_seq"], e.seq)
+        if e.type == "run.status":
+            r["status"] = e.data.get("status")
+    return sorted(by_run.values(), key=lambda r: r["last_seq"])
+
+
+def _frame(e: Event) -> str:
+    return f"id: {e.seq}\nevent: {e.type}\ndata: {json.dumps(e.data, separators=(',', ':'))}\n\n"
+
+
+def create_app(
+    state_dir: Path,
+    read_token: str,
+    allowed_origin: str,
+    replay_file: Path | None = None,
+    max_streams: int = 20,
+    poll_s: float = 0.25,
+    heartbeat_s: float = 15.0,
+) -> FastAPI:
+    app = FastAPI(title="posttrain live API", docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[allowed_origin],
+        allow_methods=["GET"],
+        allow_headers=["Last-Event-ID", "Content-Type"],
+    )
+    replay: list[Event] | None = _load_replay(Path(replay_file)) if replay_file else None
+    journal = None if replay is not None else Journal(Path(state_dir) / "events.db")
+    active = {"n": 0}
+
+    def auth(token: str = Query(default="")) -> None:
+        if not read_token or not hmac.compare_digest(token.encode(), read_token.encode()):
+            raise HTTPException(status_code=401, detail="invalid token")
+
+    def read(run: str | None, since: int) -> list[Event]:
+        if replay is not None:
+            out = [e for e in replay if e.seq > since and (run is None or e.run == run)]
+            return out[:BATCH]
+        assert journal is not None
+        return journal.read(run=run, since=since, limit=BATCH)
+
+    async def idle_tail(request: Request, last_sent: list[float]) -> AsyncIterator[str]:
+        while not await request.is_disconnected():
+            await asyncio.sleep(min(poll_s, 0.5))
+            if time.monotonic() - last_sent[0] >= heartbeat_s:
+                last_sent[0] = time.monotonic()
+                yield ": hb\n\n"
+
+    async def live_events(request: Request, run: str | None, since: int) -> AsyncIterator[str]:
+        last = since
+        last_sent = [time.monotonic()]
+        while not await request.is_disconnected():
+            events = await asyncio.to_thread(read, run, last)
+            for e in events:
+                last = e.seq
+                last_sent[0] = time.monotonic()
+                yield _frame(e)
+            if events:
+                continue
+            await asyncio.sleep(poll_s)
+            if time.monotonic() - last_sent[0] >= heartbeat_s:
+                last_sent[0] = time.monotonic()
+                yield ": hb\n\n"
+
+    async def replay_events(
+        request: Request, run: str | None, since: int, speed: float
+    ) -> AsyncIterator[str]:
+        last_sent = [time.monotonic()]
+        prev_ts: float | None = None
+        for e in await asyncio.to_thread(read_all, run, since):
+            if await request.is_disconnected():
+                return
+            if prev_ts is not None:
+                wait = min(max(e.ts - prev_ts, 0.0) / speed, MAX_REPLAY_SLEEP_S)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            prev_ts = e.ts
+            last_sent[0] = time.monotonic()
+            yield _frame(e)
+        async for hb in idle_tail(request, last_sent):
+            yield hb
+
+    def read_all(run: str | None, since: int) -> list[Event]:
+        assert replay is not None
+        return [e for e in replay if e.seq > since and (run is None or e.run == run)]
+
+    @app.get("/v1/health", dependencies=[Depends(auth)])
+    def health() -> dict[str, Any]:
+        return {"ok": True, "mode": "replay" if replay is not None else "live"}
+
+    @app.get("/v1/runs", dependencies=[Depends(auth)])
+    def runs() -> dict[str, Any]:
+        return {"runs": _runs_of(replay) if replay is not None else journal.runs()}  # type: ignore[union-attr]
+
+    @app.get("/v1/runs/{run_id}/snapshot", dependencies=[Depends(auth)])
+    def snapshot(run_id: str) -> dict[str, Any]:
+        events: list[Event] = []
+        since = 0
+        while True:
+            batch = (
+                [e for e in replay if e.seq > since and e.run == run_id][:BATCH]
+                if replay is not None
+                else journal.read(run=run_id, since=since, limit=BATCH)  # type: ignore[union-attr]
+            )
+            if not batch:
+                break
+            events.extend(batch)
+            since = batch[-1].seq
+        state = fold.snapshot(events)
+        return {"state": state, "last_seq": state.get("last_seq", 0)}
+
+    @app.post("/v1/runs/{run_id}/decision", dependencies=[Depends(auth)])
+    def decision(run_id: str) -> None:
+        raise HTTPException(status_code=501, detail="not implemented")
+
+    @app.get("/v1/stream", dependencies=[Depends(auth)])
+    async def stream(
+        request: Request,
+        run: str | None = None,
+        since: int = 0,
+        speed: float = Query(default=1.0, gt=0),
+    ) -> StreamingResponse:
+        header = request.headers.get("last-event-id")
+        if header is not None:
+            try:
+                since = max(int(header), 0)
+            except ValueError:
+                pass
+        if active["n"] >= max_streams:
+            raise HTTPException(status_code=429, detail="too many streams")
+        active["n"] += 1
+        inner = (
+            replay_events(request, run, since, speed)
+            if replay is not None
+            else live_events(request, run, since)
+        )
+
+        async def body() -> AsyncIterator[str]:
+            try:
+                async for chunk in inner:
+                    yield chunk
+            finally:
+                active["n"] -= 1
+
+        return StreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    return app
+
+
+def main() -> None:
+    token = os.environ.get("READ_TOKEN", "")
+    if not token:
+        print(
+            "READ_TOKEN is empty; refusing to start the API without a read token.", file=sys.stderr
+        )
+        raise SystemExit(2)
+    replay = os.environ.get("REPLAY_FILE") or None
+    app = create_app(
+        Path(os.environ.get("STATE_DIR") or "state"),
+        token,
+        os.environ.get("ALLOWED_ORIGIN", ""),
+        replay_file=Path(replay) if replay else None,
+    )
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT") or 8787))
+
+
+if __name__ == "__main__":
+    main()
