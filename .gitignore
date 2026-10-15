@@ -1,34 +1,8 @@
-.env
-.env.*
-!.env.example
 .venv/
-venv/
 __pycache__/
-*.py[cod]
+*.pyc
 .pytest_cache/
-.mypy_cache/
 .ruff_cache/
-.coverage
-htmlcov/
-dist/
-build/
+.env
+state/
 *.egg-info/
-.DS_Store
-.idea/
-.vscode/
-.terraform/
-*.tfstate
-*.tfstate.*
-*.tfplan
-crash.log
-artifacts/
-backend/artifacts/
-
-# Frontend dependencies and generated build metadata.
-frontend/node_modules/
-frontend/dist/
-frontend/tsconfig.tsbuildinfo
-
-# Generated/live documentation snapshots; canonical living docs stay tracked.
-live-docs/
-live_docs/

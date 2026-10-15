@@ -1,265 +1,139 @@
-# Autonomous Post-Training Engineer for AWS Agents for Humans Hackathon
+# posttrain-agent
 
-**Professional Agents Track** - An autonomous agent system that performs end-to-end post-training optimization for Gemma models using AWS Strands Agents (mandatory) with optional Amazon AgentCore integration for enhanced Technical Implementation scoring.
+An autonomous post-training engineer. It is a LangChain `deepagents` harness whose
+LLM calls and long-term memory go through [Backboard](https://app.backboard.io). A
+coordinator agent delegates each experiment step to eight specialist subagents, and
+deterministic Python code (not the LLM) validates training configs and decides
+promotion. Specialists can also use optional Tavily web search.
 
-This system transforms the manual post-training experimentation loop that AI/ML engineers perform into an autonomous workflow:
+The project is an early-stage harness. Its experiment backend is a simulation; see
+the [Evidence boundary](#evidence-boundary) section before reading any result.
 
-**Manual Process:**
-```
-Run model → Inspect failures → Figure out why it sucks → Collect/repair data →
-Choose training recipe → Fine-tune → Run evals → Discover regression →
-Change experiment → Train again
-```
+## Install
 
-**Autonomous Process:**
-```
-Gemma + Environment + Evals
-             ↓
-          OPTIMIZE (via 8 specialized Strands agents)
-             ↓
-      Better Gemma Adapter with verified improvement
+Requires Python 3.12 or 3.13.
+
+```bash
+uv sync --extra dev
 ```
 
-The system implements eight specialized Strands agents that work together to:
-1. Benchmark Gemma performance in AgentGym service recovery environment
-2. Analyze failure patterns
-3. Generate research hypotheses
-4. Curate verified post-training datasets
-5. Design optimal QLoRA configurations
-6. Execute training jobs
-7. Evaluate checkpoints for improvement/regression
-8. Make deterministic promotion decisions
+This creates `.venv/` and installs the `posttrain` console script
+(`.venv/bin/posttrain`).
 
-Built for the AWS Agents for Humans Hackathon (deadline: September 14, 2026, 5:00 PM PDT).
+## Configuration
 
-## What is implemented
+Settings are read from environment variables by `Settings.from_env()`
+(`src/posttrain_agent/config.py`).
 
-The Python backend provides eight logical roles behind three service modes:
-
-| Service mode | Logical roles | Responsibility |
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| `coordinator` | Workflow coordinator (not counted as a specialist) | Owns run state, public API, sequencing, budget limits, and events. |
-| `research` | Failure Analyst, Research Agent, Data Curator, Training Designer | Grounds a hypothesis with RAG, proposes replay-verifiable data, and selects a bounded QLoRA configuration. |
-| `execution` | Benchmark Runner, Training Executor, Evaluation Agent, Champion Manager | Produces trajectories, launches training, evaluates identical task sets, and applies deterministic gates. |
+| `BACKBOARD_API_KEY` | none | Backboard API key. Required, except when `POSTTRAIN_CASSETTE_MODE=replay`. The CLI exits with status 2 if it is missing. |
+| `BACKBOARD_BASE_URL` | `https://app.backboard.io/api` | Backboard API base URL. |
+| `BACKBOARD_ASSISTANT_ID` | unset | Use this existing Backboard assistant. If unset, the id is read from `<state>/backboard.json`, or a new assistant is created and written there. |
+| `POSTTRAIN_LLM_PROVIDER` | `anthropic` | Provider name passed to Backboard with each call. |
+| `POSTTRAIN_MODEL` | `claude-sonnet-4-5` | Model name passed to Backboard. |
+| `POSTTRAIN_FALLBACK_MODELS` | empty | Comma-separated `provider:model` pairs tried in order when the primary model fails, e.g. `openai:gpt-4o,anthropic:claude-haiku-4-5`. A malformed entry raises `ValueError`. |
+| `POSTTRAIN_MEMORY_MODE` | `Readonly` | Value passed as the `memory` argument of Backboard's `send_message` (the code's comment lists `Auto`, `Readonly`, `off`). |
+| `POSTTRAIN_STATE_DIR` | `state` | Directory for SQLite files and `backboard.json`. |
+| `POSTTRAIN_CASSETTE` | unset | Path to a JSONL cassette file for record/replay of model responses. |
+| `POSTTRAIN_CASSETTE_MODE` | `auto` | `auto` (replay hits, record misses), `record` (always call live), or `replay` (fail on a miss). The cassette is only attached when `POSTTRAIN_CASSETTE` is set. |
+| `POSTTRAIN_MAX_RECOVERY` | `3` | Attempts per `run`/`resume` before the run is marked `FAILED`. |
+| `POSTTRAIN_MODEL_RETRIES` | `2` | Retries per model on transient errors. |
+| `TAVILY_API_KEY` | empty | Optional. Enables the `web_search` and `web_extract` tools. Without it, both tools return an "unavailable" error instead of failing the run. |
 
-The same immutable container runs all modes through `SERVICE_ROLE`. The AWS submission path is Strands-first and is designed to use Amazon Bedrock, S3, DynamoDB, SageMaker, and optional AgentCore/CloudWatch integrations. The repository includes a bounded five-run history/graph contract, a separate guarded `/api/live` control plane, an objective-worker boundary, and metadata-only telemetry. The ordinary `/api/runs` demo remains process-local and emits `EXPLANATION` outputs; it is not a live post-training result. The isolated objective worker has a FunctionGemma checkpoint-backed train/replay adapter, but no successful real-checkpoint benchmark result is recorded here.
+`max_input_tokens` (128000) and `request_timeout` (120 seconds) have no environment
+variable; they use the defaults in `Settings`.
 
-Any AWS deployment or live run described here is scoped exclusively to this AWS
-Agents for Humans hackathon project. It does not authorize changes to unrelated
-resources in the AWS account.
+## Web tools
 
-### Reasoning model and post-training target
+`src/posttrain_agent/web.py` provides two async tools that call the Tavily HTTP API
+directly with `httpx`:
 
-Every working agent uses the single pinned Bedrock reasoning model
-`nvidia.nemotron-super-3-120b` (NVIDIA Nemotron Super 3 120B). This is the
-agent brain for planning, analysis, data selection, training dispatch,
-evaluation interpretation, and gate explanation. It is not the model being
-improved. The post-training target remains the user-supplied
-`google/functiongemma-270m-it` checkpoint, pinned by an immutable Hugging Face
-revision before a live run.
+- `web_search(query, max_results=5, topic="general")`: returns an answer and up to
+  10 results (title, URL, 600-character snippet). Queries containing `heldout://` or
+  `sealed://` are rejected.
+- `web_extract(urls)`: fetches cleaned text for up to 5 URLs, truncated to 4000
+  characters per page.
 
-Each role uses a versioned `AgentPromptContract`. Prompts state the mission,
-typed inputs and outputs, preconditions, stop conditions, evidence labels,
-sealed-evaluation rules, and forbidden actions. Nemotron may be inventive when
-forming hypotheses, experiment choices, or repair strategies, but it cannot
-invent trajectories, metrics, provider IDs, artifacts, approvals, or promotion
-decisions. Prompt version and SHA-256 are recorded as safe metadata in the run
-manifest and telemetry so a comparison can be reproduced without logging raw
-prompts or completions.
+Both return `evidence: EXPLANATION`, since web content is not a measurement. Which
+agents get them:
 
-Each specialist has an explicit safety contract: Benchmark Runner accepts train-side evidence only; Failure Analyst must ground clusters in trajectory IDs; Research Agent must return a falsifiable hypothesis; Data Curator may propose but never verify repairs; Training Designer must stay inside the QLoRA whitelist; Training Executor may report only provider-backed artifacts; Evaluation Agent returns objective evidence without deciding promotion; and Champion Manager explains but cannot override the deterministic gate.
+- coordinator: `web_search`
+- `researcher`: `web_search` and `web_extract`
+- `training_designer`: `web_search`
 
-In a live AWS deployment, the coordinator must fail fast unless its authenticated service and artifact destinations are configured. The local path is intentionally a credential-free demonstration and does not silently promote simulated evidence.
+Other roles get no web tools.
 
-The API is intentionally small:
+## CLI usage
 
-- `POST /api/runs`
-- `GET /api/runs/{run_id}`
-- `GET /api/runs/{run_id}/experiments`
-- `POST /api/runs/{run_id}/step`
-- `POST /api/runs/{run_id}/auto`
-- `POST /api/runs/{run_id}/cancel`
-- `GET /api/runs/compare`
-- `GET /api/runs/graph`
-- `GET /api/live/readiness`
-- `POST /api/live/runs/prepare`
-- `POST /api/live/runs/{run_id}/start`
-- `POST /api/live/runs/{run_id}/cancel`
-- `POST /api/live/runs/{run_id}/safe-stop`
-- `GET /api/live/runs/{run_id}`
-- `GET /api/live/runs/{run_id}/events`
-- `GET /api/live/runs/{run_id}/experiments`
-- `GET /api/live/runs/{run_id}/artifacts`
-- `GET /api/traces`
-- `GET /api/cycles`
-- `POST /api/demo/reset-environment`
-- `GET /health`
+```bash
+posttrain run "<goal>" [--thread NAME]      # start, or continue, a run on a thread
+posttrain resume [--thread NAME]            # resume an existing thread from its last checkpoint
+posttrain history [--thread NAME]           # list checkpoints of a thread, newest first (JSON)
+posttrain fork CHECKPOINT_ID [--thread NAME]  # re-execute from a past checkpoint
+posttrain runs                              # print the run ledger (JSON)
+```
 
-`POST /api/runs/{run_id}/auto` runs the bounded local workflow in the current process. The comparison endpoints accept one to five run IDs and render only records with measured baseline/candidate metrics. This legacy demo surface uses process-local state. The separate `/api/live` surface is the guarded AWS path: prepare requires a passing preflight and creates a durable run plus a bounded approval packet; start rechecks preflight, consumes the one-run signed approval, and dispatches the run. Every mutating command requires an `Idempotency-Key`. The local `/api/runs` walkthrough is not an AWS run.
+`--thread` defaults to `default`. `run` and `resume` print a JSON report (or the
+status for `resume`) and exit 0 only when the status is `COMPLETED`. Application state
+is stored under `POSTTRAIN_STATE_DIR`:
 
-See [Flow.md](Flow.md) for control flow and [Decisions.md](Decisions.md) for the reasons behind the architecture.
+- `checkpoints.sqlite`: LangGraph checkpoints
+- `store.sqlite`: the `/memories/` file store and the run ledger
+- `backboard.json`: the assistant id, if the assistant was created by this tool
 
-## Capability and evidence matrix
+## Running tests
 
-The labels below are deliberate submission boundaries. `LOCAL_DEMO` describes
-what this checkout can run without live model/training infrastructure.
-`LIVE_AWS` describes capability that must be connected and artifact-verified
-before it can be claimed. No end-to-end live post-training run is recorded in
-this checkout. The changelog does record narrower historical Bedrock/S3 smoke
-checks; those do not establish a current deployment or a training/evaluation
-result.
+```bash
+.venv/bin/python -m pytest
+```
 
-| Capability | `LOCAL_DEMO` (current checkout) | `LIVE_AWS` (claim requires evidence) |
-| --- | --- | --- |
-| Strands specialist workflow | Eight role contracts initialize and execute a bounded local workflow. | Bedrock-backed agent decisions and authenticated service boundaries. |
-| Run control | In-memory `OptimizationRun` plus a process-local bounded history registry; `/step` advances one phase and `/auto` runs the remaining phases in-process. | Durable run ownership, idempotent commands, and restart-safe orchestration through DynamoDB. |
-| Benchmark and trajectories | The ordinary coordinator demo uses explanatory fixtures. A separate objective-worker adapter can load a full digest-pinned local FunctionGemma snapshot and verify train/replay trajectories, but no real-checkpoint result is recorded here. | The authenticated worker must execute the real target model, deterministically replay each trajectory, and persist verified versioned S3 artifacts with hashes and run/provider provenance. |
-| Curation and QLoRA design | Agents return structured demonstration outputs and bounded configurations. | Replay-verified training rows and a recorded, budget-compliant training specification. |
-| Training execution | Missing objective/training adapters fail closed; no checkpoint or job is fabricated. | SageMaker job submission, bounded polling, logs, and an immutable checkpoint manifest. |
-| Evaluation and promotion | Deterministic gate code is exercised locally, but local metrics are simulated and cannot prove improvement. | Independent evaluation on identical sealed inputs, with artifact-backed metrics and a deterministic promotion decision. |
-| Continuous trigger and event ingestion | `TraceEvent` validation, duplicate suppression, ordered in-memory storage, and deterministic per-run threshold triggering are covered locally; they are not wired to the FastAPI run routes. | EventBridge/SQS delivery into durable event storage, idempotent cycle creation, and a worker that starts the post-training run. |
-| State, artifacts, and run API | Process memory plus JSON/SVG comparison responses; no durable local run/event log. | DynamoDB run history/events, S3 artifacts, and a resumable ordered event stream. |
-| Agent reasoning and prompt provenance | Nemotron prompt contracts can be inspected and tested without exposing task contents. | Bedrock-backed Nemotron decisions with prompt hashes, model ID, run manifest, and provider-backed evidence. |
-| Execution view | Browser demo shows phase progression and explanatory agent activity; it never presents simulated metrics as live improvement. | Browser view consumes authenticated lifecycle events and displays only safe metadata, real job states, and retained artifact references. |
-
-Telemetry/observation is emitted at run, phase, job, and promotion transitions.
-Events correlate `run_id`, run number, experiment, phase, and provider job while
-redacting prompts, outputs, trajectories, held-out data, credentials, and
-unknown free-form strings. Logging is the default sink; OTLP/OpenTelemetry is
-optional and sink failures never change run outcomes.
-
-The evidence labels used in outputs are `LIVE` (verified by the current AWS
-request), `PRIOR_VERIFIED_RUN` (a prior run with provider IDs and hashes), and
-`EXPLANATION` (fixture or simulation). The ordinary `/api/runs` coordinator
-demo emits `EXPLANATION`; a checkpoint-backed objective-worker response is not
-evidence of SageMaker training, held-out evaluation, improvement, or promotion.
+Run from the repository root. The suite has 29 tests in `tests/`. They use
+`tests/fakes.py`, a scripted stand-in for `BackboardClient`, together with a real
+deepagents graph and SQLite persistence. The web tool tests use an `httpx`
+`MockTransport`. No test calls the live Backboard or Tavily APIs.
 
 ## Evidence boundary
 
-Every externally shown artifact has one of three labels:
+- **The default experiment backend is `LocalStubBackend`.** `build_agent` uses it
+  whenever no backend is passed, and the CLI never passes one. Benchmarks, training
+  jobs and evaluations are therefore deterministic simulations computed from hashes
+  (`src/posttrain_agent/domain.py`).
+- **Every stub result is labelled `EXPLANATION`.** Stub checkpoints also receive a
+  fixed +0.08 score bonus in `evaluate`, so a stub candidate can look like an
+  improvement.
+- **The promotion gate fails closed.** `promotion_gate` rejects any result whose
+  evidence is not `LIVE` or `PRIOR_VERIFIED_RUN`. Stub runs therefore can never
+  return `PROMOTE`. The gate also requires matching suite, split and seed, a relative
+  improvement of at least 10%, and an absolute regression no greater than 0.05. It
+  only returns a decision; nothing in this codebase persists or applies a champion.
+- **Web results are not verified evidence.** They are labelled `EXPLANATION` and
+  cannot feed the promotion gate.
+- **No real training adapter exists.** There is no SageMaker or GPU implementation.
+  To add one, implement the `ExperimentBackend` protocol in `domain.py`
+  (`benchmark`, `train`, `evaluate`), returning provider-measured numbers labelled
+  `LIVE`, and pass it to `build_agent(..., experiments=...)`.
+- **Live Backboard behaviour has not been exercised.** The tests use a fake Backboard
+  client. Request and response shapes, memory semantics and error codes are
+  unverified against the real service. The Tavily integration is likewise
+  unverified against the live API.
 
-- `LIVE`: produced by the request currently executing.
-- `PRIOR_VERIFIED_RUN`: produced by a real earlier run with hashes and provider job identifiers.
-- `EXPLANATION`: fixture or explanatory content that is never presented as measured output.
+## Layout
 
-Strands model calls may analyze failures and propose hypotheses, repairs, and configurations. They may not grade their own repairs or candidates. Deterministic code enforces replay admission, the five-run budget, identical evaluation inputs, verified evidence provenance, and checkpoint promotion. Held-out tasks are excluded from prompts, repairs, training data, and telemetry.
-
-## Credential-free contract verification
-
-Requirements: Python 3.12 and [uv](https://docs.astral.sh/uv/).
-
-```bash
-cp .env.example .env
-cd backend
-uv sync --frozen --extra cloud --extra dev
-uv run pytest tests -q
-uv run ruff check app tests scripts
-uv run mypy app
 ```
-
-These tests validate schemas, leakage barriers, deterministic orchestration, promotion gates, and API contracts without calling Bedrock, SageMaker, AgentCore, or AWS. Passing them is not evidence that a live AWS run occurred.
-
-For a non-destructive live smoke test against an existing AWS account and S3 bucket:
-
-```bash
-cd backend
-uv run --extra cloud python scripts/live_smoke.py \\
-  --bucket YOUR_EXISTING_BUCKET \\
-  --region us-east-1
+src/posttrain_agent/
+  agent.py           deep-agent assembly (coordinator prompt, tools, subagents)
+  backboard_model.py ChatBackboard chat model and Cassette record/replay
+  cli.py             `posttrain` command
+  config.py          Settings from environment variables
+  domain.py          deterministic QLoRA validation, promotion gate, stub backend, tools
+  memory.py          assistant bootstrap and remember/recall tools
+  persistence.py     SQLite checkpointer, store and CompositeBackend
+  replay.py          run_with_recovery, history, fork, ledger
+  resilience.py      retry/fallback middleware and transient-error classification
+  subagents.py       eight specialist roles
+  web.py             Tavily web_search / web_extract tools
+  prompts/*.md       subagent system prompts
+tests/               pytest suite
+docs/architecture.md component and data-flow description
 ```
-
-The smoke test verifies STS identity, one Strands/Bedrock response, and one
-S3 put/get/delete round trip. It creates no tables, instances, training jobs,
-or persistent infrastructure. To exercise all eight specialist prompts live
-without creating resources:
-
-```bash
-uv run --extra cloud python scripts/live_agentic_test.py
-```
-
-For the guarded live path, run the read-only preflight before approving any
-compute. Then authorize one run at a time; the batch command pauses for a new
-approval token before each subsequent run and never exceeds five runs or the
-$25 budget:
-
-```bash
-uv run --extra cloud python scripts/live_preflight.py
-uv run --extra cloud python scripts/live_run.py --approval-token TOKEN
-uv run --extra cloud python scripts/live_batch.py
-```
-
-The browser execution view renders the same lifecycle metadata as the API:
-animated role bots move through launcher, benchmark, failure analysis, data
-curation, training, evaluation, and promotion. It must show a blocked or
-failed phase plainly and never substitute an animation for a provider job,
-metric, or artifact.
-
-Docker Compose is retained only as a three-role image and healthcheck smoke harness:
-
-```bash
-docker compose up --build
-curl --fail http://localhost:8000/health
-curl --fail http://localhost:8001/health
-curl --fail http://localhost:8002/health
-```
-
-Coordinator, research, and execution listen on ports 8000, 8001, and 8002 respectively. Responses from this harness use local `EXPLANATION` fixtures and must never be shown as model improvement, A2A, or training evidence.
-
-Run repository and infrastructure checks from the repository root:
-
-```bash
-cd backend
-uv run pytest tests -q
-cd ..
-backend/.venv/bin/python backend/scripts/check_docs_sync.py
-docker compose config --quiet
-```
-
-## AWS deployment status
-
-The public `/api/runs` workflow still uses process-local state and
-`EXPLANATION` fixtures. A separate `/api/live` path is wired for AWS mode with
-DynamoDB-backed run/event state, a dispatcher/supervisor, Bedrock reasoning,
-S3 artifact verification, an authenticated objective-worker boundary, and
-SageMaker adapters. Source code and CDK synthesis do not prove those resources
-are deployed or reachable. The changelog's 2026-09-06 live records cover a
-Bedrock/S3 connectivity smoke using `amazon.nova-pro-v1:0` and eight bounded
-agent calls using that model; they do not verify the currently pinned
-`nvidia.nemotron-super-3-120b`, a deployed application, FunctionGemma
-inference, SageMaker training, held-out evaluation, or model improvement.
-
-Current live checkpoint (operator-reported 2026-09-12): AWS deployment and
-live-run scope is this hackathon only. SageMaker GPU quota request
-`9a3453884e2c4230a6e8bb0004c8cca57FuK8VC5` is `PENDING`; quota approval,
-placement capacity, deployment, and a live post-training result are not
-claimed. Recheck AWS state and the read-only preflight before any run.
-
-The repository includes a CDK foundation in [infra/cdk](infra/cdk). It can
-provision the retained storage, ECR, VPC, ECS/Fargate, CloudWatch, IAM, and
-SageMaker role boundary described in [infra/cdk/README.md](infra/cdk/README.md).
-It does not provision the objective worker, trainer/evaluator images,
-FunctionGemma checkpoint or AgentEval data, Bedrock model entitlement, approval
-secret, GPU placement capacity, or public ingress/authentication. Those are
-deployment prerequisites and must be configured before the read-only
-`/api/live/readiness` or `scripts/live_preflight.py` can report `READY`.
-
-The live controller reuses configured resources and never deletes persistent
-S3, DynamoDB, IAM, ECR, VPC, or ECS infrastructure. It only stops the current
-run's in-progress SageMaker jobs during cleanup. A real run is claimable only
-after a successful fresh preflight, an explicit signed approval, provider job
-IDs, immutable artifact hashes, held-out evidence, and a deterministic
-promotion decision have been retained. The quota request above remains
-pending as of its recorded date; it is not proof of granted quota or capacity.
-
-## Living documentation
-
-All contributors and agents must follow [AGENTS.md](AGENTS.md): read the living documents before work, update `Flow.md` and `Decisions.md` when behavior or choices change, run checks, and append an accurate `ChangeLog.md` entry after verification. Pull-request CI rejects implementation changes without a changelog update.
-
-## Current limitations
-
-- No live Gemma inference, SageMaker training job, held-out evaluation, checkpoint improvement, or model metric is claimed until its real artifact, provider job IDs, and manifest digest are recorded.
-- Evaluation is explicitly requested as AgentGym AgentEval (`agent-eval-v1`); live reports must include the immutable AgentEval manifest SHA-256 and are accepted only when champion and candidate use the same suite/version.
-- Credential-free adapters execute only the local service-recovery explanation fixture; live environments require configured AWS workers and model access.
-- S3/DynamoDB/SageMaker/AgentCore resources and the sandboxed objective worker are deployment prerequisites and are not provisioned by this repository.
-- A process restart currently loses in-memory runs; durable AWS persistence and provider job reconciliation remain required before claiming recoverability.
-- Authentication, multi-tenancy, billing, and multiple target models are out of scope. The hackathon execution view is a safe observer only; it does not grant approval or mutate AWS resources.
