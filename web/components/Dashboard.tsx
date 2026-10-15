@@ -67,6 +67,7 @@ export function DashboardView({ view, runId }: { view: RunView; runId?: string }
         liveSeq={liveSeq}
         value={target}
         onScrub={(seq) => setScrub(seq >= liveSeq ? null : seq)}
+        mode={view.mode}
         onLive={() => setScrub(null)}
       />
     </div>

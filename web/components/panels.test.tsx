@@ -113,6 +113,48 @@ describe("panels", () => {
     within(gate).getByText("candidate evidence None is not verified");
   });
 
+  it("gate_inherits_simulated_evidence_from_the_run", () => {
+    // Sample: scores are EXPLANATION, so the gate readout is simulated.
+    render(<ScoreGate state={foldUpTo(SAMPLE.length)} />);
+    within(screen.getByRole("region", { name: /gate/i })).getByText("SIMULATED");
+    cleanup();
+
+    // A gate with no scores at all: evidence undetermined, still badged.
+    const verdict = ev("gate.verdict", { decision: "PROMOTE", reasons: [], champion_score: 0.5, candidate_score: 0.62, relative_improvement: 0.24 });
+    render(<ScoreGate state={foldEvent(emptyState(), verdict)} />);
+    within(screen.getByRole("region", { name: /gate/i })).getByText("SIMULATED");
+    cleanup();
+
+    // One measured and one simulated score: still simulated.
+    const mixed = foldAll([
+      ev("score", { split: "heldout", checkpoint: "base", value: 0.5, n: 50, evidence: "LIVE" }),
+      ev("score", { split: "heldout", checkpoint: "ft:m", value: 0.62, n: 50, evidence: "EXPLANATION" }),
+      ev("gate.verdict", { decision: "PROMOTE", reasons: [] }),
+    ]);
+    render(<ScoreGate state={mixed} />);
+    within(screen.getByRole("region", { name: /gate/i })).getByText("SIMULATED");
+  });
+
+  it("gate_with_all_measured_scores_has_no_simulated_badge", () => {
+    const measured = foldAll([
+      ev("score", { split: "heldout", checkpoint: "base", value: 0.5, n: 50, evidence: "PRIOR_VERIFIED_RUN" }),
+      ev("score", { split: "heldout", checkpoint: "ft:m", value: 0.62, n: 50, evidence: "LIVE" }),
+      ev("gate.verdict", { decision: "PROMOTE", reasons: ["candidate beats champion"], champion_score: 0.5, candidate_score: 0.62, relative_improvement: 0.24 }),
+    ]);
+    render(<ScoreGate state={measured} />);
+    const gate = screen.getByRole("region", { name: /gate/i });
+    within(gate).getByText("PROMOTE");
+    expect(within(gate).queryByText("SIMULATED")).toBeNull();
+  });
+
+  it("long_gate_reasons_are_clipped", () => {
+    const long = "x".repeat(1000);
+    render(<ScoreGate state={foldEvent(emptyState(), ev("gate.verdict", { decision: "REJECT", reasons: [long] }))} />);
+    const li = within(screen.getByRole("list", { name: /gate reasons/i })).getByRole("listitem");
+    expect(li.textContent!.length).toBeLessThanOrEqual(200);
+    expect(li.getAttribute("title")).toBe(long);
+  });
+
   it("scrubbing_shows_historical_state_and_live_button_returns", () => {
     render(<DashboardView view={viewOf()} />);
     screen.getByText("REJECT"); // live: the gate verdict (seq 29) is shown
@@ -125,7 +167,10 @@ describe("panels", () => {
     screen.getByText("posttrain approve --thread sample-simulated-run");
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: /return to live/i }));
+      // REPLAY: nothing is live, so the return button says LATEST
+      const back = screen.getByRole("button", { name: /return to latest/i });
+      expect(back.textContent).toBe("LATEST ▸");
+      fireEvent.click(back);
     });
     expect(screen.queryByText(/HISTORICAL/)).toBeNull();
     screen.getByText("REJECT");
@@ -148,6 +193,7 @@ describe("panels", () => {
     screen.getByText(/connection lost/);
     screen.getByText("REJECT"); // last state stays on screen
     expect(screen.queryByText(/SAMPLE DATA/)).toBeNull();
+    expect(screen.getByRole("button", { name: /return to live/i }).textContent).toBe("LIVE ▸");
   });
 
   it("auth_failed_and_offline_are_distinct_and_empty_state_is_never_shown_as_live", () => {

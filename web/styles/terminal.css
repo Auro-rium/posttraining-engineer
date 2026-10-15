@@ -79,6 +79,8 @@ button { font: inherit; }
 .gate-decision { margin: 6px 0; padding: 4px; border: 1px solid var(--green); text-align: center; }
 .gate-reject { color: var(--red); border-color: var(--red); }
 .gate-reasons li::before { content: "- "; }
+/* long untrusted text (reasons, summaries, log lines, ids) wraps instead of widening columns */
+.gate-reasons li, .stream-summary, .joblog-list li, .score-list li, .approval, .statusbar-run { overflow-wrap: anywhere; }
 
 .bar { height: 8px; background: var(--track); margin: 6px 0; }
 .bar-thin { height: 6px; }

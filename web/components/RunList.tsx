@@ -6,9 +6,15 @@ import { useEffect, useState } from "react";
 export const SAMPLE_RUN_ID = "sample-simulated-run";
 
 type Run = { run: string; started: number | null; last_seq: number | null; status: string | null };
+type RunsMode = "LIVE" | "REPLAY" | "UNKNOWN";
+const MODE_LABEL: Record<RunsMode, { text: string; cls: string }> = {
+  LIVE: { text: "● LIVE", cls: "label conn-live" },
+  REPLAY: { text: "REPLAY", cls: "label label-amber" },
+  UNKNOWN: { text: "unknown mode", cls: "label dim" },
+};
 type ListState =
   | { kind: "loading" }
-  | { kind: "ok"; mode: "LIVE" | "REPLAY"; runs: Run[] }
+  | { kind: "ok"; mode: RunsMode; runs: Run[] }
   | { kind: "error"; label: "AUTH FAILED" | "OFFLINE"; detail: string };
 
 const API = (process.env.NEXT_PUBLIC_API_URL ?? "").trim().replace(/\/+$/, "");
@@ -34,7 +40,9 @@ export function RunList() {
       try {
         const h = await fetch(`${API}/v1/health`, { signal: ctl.signal });
         const health: unknown = await h.json().catch(() => null);
-        const mode = (health as { mode?: unknown } | null)?.mode === "replay" ? "REPLAY" : "LIVE";
+        // Never assume LIVE: a failed or unparseable health answer leaves the mode unknown.
+        const reported = h.ok ? (health as { mode?: unknown } | null)?.mode : undefined;
+        const mode: RunsMode = reported === "replay" ? "REPLAY" : reported === "live" ? "LIVE" : "UNKNOWN";
         const r = await fetch(`${API}/v1/runs?token=${encodeURIComponent(TOKEN)}`, { signal: ctl.signal });
         if (r.status === 401) return setList({ kind: "error", label: "AUTH FAILED", detail: "invalid read token (401)" });
         if (!r.ok) return setList({ kind: "error", label: "OFFLINE", detail: `HTTP ${r.status}` });
@@ -71,9 +79,7 @@ export function RunList() {
       {list.kind === "ok" ? (
         <>
           <p>
-            <span className={list.mode === "REPLAY" ? "label label-amber" : "label conn-live"}>
-              {list.mode === "REPLAY" ? "REPLAY" : "● LIVE"}
-            </span>
+            <span className={MODE_LABEL[list.mode].cls}>{MODE_LABEL[list.mode].text}</span>
           </p>
           {list.runs.length === 0 ? (
             <p className="dim">no runs in the journal yet</p>

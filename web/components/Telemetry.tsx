@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { History } from "../lib/connection";
 import type { Json, JsonObject, RunState } from "../lib/events";
 import { ms, num } from "./format";
@@ -69,7 +69,8 @@ export function Sparkline({ values, label, color = "#7dff9b" }: { values: number
 
 export function Telemetry({ state, history }: { state: RunState; history: History }) {
   const t = state.telemetry;
-  const series = telemetrySeries(history);
+  // Memoized so the arrays keep their identity and the sparkline effects only redraw on change.
+  const series = useMemo(() => telemetrySeries(history), [history]);
   const err = num(t.error_rate);
   const tin = num(t.input_tokens);
   const tout = num(t.output_tokens);

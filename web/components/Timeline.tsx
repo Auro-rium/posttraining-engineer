@@ -1,4 +1,4 @@
-import type { History } from "../lib/connection";
+import type { History, Mode } from "../lib/connection";
 
 type Marker = { seq: number; kind: "checkpoint" | "gate" | "approval"; label: string };
 
@@ -27,6 +27,8 @@ type Props = {
   liveSeq: number;
   /** The scrubbed seq, or null when following live. */
   value: number | null;
+  /** In REPLAY nothing is live: the return button says LATEST. */
+  mode: Mode;
   onScrub(seq: number): void;
   onLive(): void;
 };
@@ -35,7 +37,7 @@ type Props = {
  * Scrubber over the history. Its range starts at the history base (the snapshot's last_seq, or 0
  * for the sample): earlier events were never received, so they cannot be shown.
  */
-export function Timeline({ history, liveSeq, value, onScrub, onLive }: Props) {
+export function Timeline({ history, liveSeq, value, mode, onScrub, onLive }: Props) {
   const min = history.base.last_seq;
   const max = Math.max(liveSeq, min);
   const span = max - min;
@@ -81,8 +83,14 @@ export function Timeline({ history, liveSeq, value, onScrub, onLive }: Props) {
       <span className="dim timeline-pos">
         seq {value ?? max} / {max}
       </span>
-      <button type="button" className="live-btn" aria-label="Return to live (latest state)" disabled={value === null} onClick={onLive}>
-        LIVE ▸
+      <button
+        type="button"
+        className="live-btn"
+        aria-label={mode === "REPLAY" ? "Return to latest state" : "Return to live (latest state)"}
+        disabled={value === null}
+        onClick={onLive}
+      >
+        {mode === "REPLAY" ? "LATEST ▸" : "LIVE ▸"}
       </button>
     </section>
   );

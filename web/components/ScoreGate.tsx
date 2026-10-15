@@ -40,8 +40,24 @@ function Scores({ scores }: { scores: Score[] }) {
   );
 }
 
+/** Evidence values that count as measured (spec 4.3); anything else is simulated or unknown. */
+export const MEASURED_EVIDENCE: ReadonlySet<string> = new Set(["LIVE", "PRIOR_VERIFIED_RUN"]);
+
+/**
+ * gate.verdict carries no evidence, so the gate inherits the run's: it is measured only when the
+ * run has scores and every one of them has measured evidence.
+ */
+export function gateIsMeasured(scores: Score[]): boolean {
+  return scores.length > 0 && scores.every((s) => typeof s.evidence === "string" && MEASURED_EVIDENCE.has(s.evidence));
+}
+
+/** Longest gate reason rendered; the full text stays in the title tooltip. */
+export const REASON_MAX = 200;
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
 function Gate({ state }: { state: RunState }) {
   const g = state.gate;
+  const measured = gateIsMeasured(state.scores);
   const decision = g ? str(g.decision as Json) : null;
   const reasons = g && Array.isArray(g.reasons) ? g.reasons.filter((r): r is string => typeof r === "string") : [];
   const rel = g ? pct(g.relative_improvement as Json) : null;
@@ -51,6 +67,13 @@ function Gate({ state }: { state: RunState }) {
       {g ? (
         <>
           <div className={`gate-decision gate-${(decision ?? "none").toLowerCase()}`}>{decision ?? "NO DECISION"}</div>
+          {measured ? null : (
+            <div>
+              <span className="badge badge-sim" title="gate inherits the run's score evidence: simulated or undetermined">
+                SIMULATED
+              </span>
+            </div>
+          )}
           <div className="dim">
             champion {fixed(g.champion_score as Json)} · candidate {fixed(g.candidate_score as Json)}
             {rel ? ` · rel ${rel}` : ""}
@@ -58,7 +81,9 @@ function Gate({ state }: { state: RunState }) {
           {reasons.length > 0 ? (
             <ul className="gate-reasons" aria-label="Gate reasons">
               {reasons.map((r, i) => (
-                <li key={i}>{r}</li>
+                <li key={i} title={r.length > REASON_MAX ? r : undefined}>
+                  {clip(r, REASON_MAX)}
+                </li>
               ))}
             </ul>
           ) : null}
