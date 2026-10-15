@@ -163,16 +163,20 @@ async def _run_with_recovery(
         emit(journal, "run.started", {"goal_len": len(goal), "experiment_budget": experiment_budget,
                                       "backend": backend}, run=thread_id)
     report = RunReport(thread_id, "FAILED", 0)
+    error_types: list[str] = []  # journal gets type names only; full text stays in report.errors
     for attempt in range(1, max_attempts + 1):
         report.attempts = attempt
         await _record(store, report)
         emit(journal, "run.status", {"status": "RUNNING", "attempt": attempt}, run=thread_id)
         try:
             result = await graph.ainvoke(payload, cfg)
-        except FATAL:
+        except FATAL as exc:
+            emit(journal, "run.status", {"status": "FAILED", "attempt": attempt,
+                                         "errors": [type(exc).__name__]}, run=thread_id)
             raise
         except Exception as exc:  # noqa: BLE001 - recorded, then retried from checkpoint
             report.errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+            error_types.append(type(exc).__name__)
             payload = None  # every later attempt resumes the saved thread
             state = await graph.aget_state(cfg)
             report.last_checkpoint_id, step = _checkpoint_of(state)
@@ -192,7 +196,7 @@ async def _run_with_recovery(
         break
     await _record(store, report)
     emit(journal, "run.status", {"status": report.status, "attempt": report.attempts,
-                                 "errors": report.errors}, run=thread_id)
+                                 "errors": error_types}, run=thread_id)
     return report
 
 

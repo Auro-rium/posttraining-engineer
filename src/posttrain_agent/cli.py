@@ -10,7 +10,7 @@ from typing import Any
 
 from .agent import build_agent
 from .config import Settings
-from .events import Journal
+from .events import CURRENT_RUN, Journal
 from .journal_handler import JournalHandler
 from .persistence import open_runtime
 from .replay import RunReport, decide, fork, history, ledger, pending_actions, run_with_recovery
@@ -49,12 +49,15 @@ async def _main(args: argparse.Namespace) -> int:
         telemetry_path=settings.state_dir / "telemetry.jsonl")]
     opts = {"max_attempts": settings.max_recovery_attempts, "callbacks": cbs,
             "journal": journal}
+    backend = "nebius" if settings.nebius_api_key else "stub"  # mirrors agent.default_backend
     async with open_runtime(settings.state_dir) as rt:
         graph = await build_agent(settings, rt, journal=journal)
         if args.cmd == "run":
-            return _show(await run_with_recovery(graph, args.goal, args.thread, store=rt.store, **opts))
+            return _show(await run_with_recovery(graph, args.goal, args.thread, store=rt.store,
+                                                 backend=backend, **opts))
         if args.cmd == "resume":
-            return _show(await run_with_recovery(graph, "", args.thread, store=rt.store, **opts))
+            return _show(await run_with_recovery(graph, "", args.thread, store=rt.store,
+                                                 backend=backend, **opts))
         if args.cmd == "pending":
             print(json.dumps(await pending_actions(graph, args.thread), indent=2, default=str))
         elif args.cmd in {"approve", "reject"}:
@@ -64,7 +67,11 @@ async def _main(args: argparse.Namespace) -> int:
         elif args.cmd == "history":
             print(json.dumps(await history(graph, args.thread), indent=2))
         elif args.cmd == "fork":
-            out = await fork(graph, args.thread, args.checkpoint, cbs)
+            token = CURRENT_RUN.set(args.thread)
+            try:
+                out = await fork(graph, args.thread, args.checkpoint, cbs)
+            finally:
+                CURRENT_RUN.reset(token)
             print(out["messages"][-1].content)
         elif args.cmd == "runs":
             print(json.dumps(await ledger(rt.store), indent=2))

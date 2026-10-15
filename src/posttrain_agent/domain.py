@@ -218,7 +218,8 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         if result.get("provider_job_id"):
             budget_mod.record_spend(settings, result["provider_job_id"],
                                     est["estimated_cost_usd"], dataset_ref)
-            _budget({**est, "spent_usd": round(budget_mod.spent_usd(settings), 4)})
+            # no re-read: nothing may raise after a paid launch
+            _budget({**est, "spent_usd": round(est["spent_usd"] + est["estimated_cost_usd"], 4)})
         _job(result)
         return {**result, "dataset_sha256": report["sha256"], "estimate": est}
 
