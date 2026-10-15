@@ -60,6 +60,18 @@ async def pending_actions(graph: Any, thread_id: str) -> list[dict[str, Any]]:
     return actions
 
 
+async def _pauses(graph: Any, thread_id: str) -> list[tuple[str, int]]:
+    """(interrupt id, number of actions) for every paused subagent on the thread."""
+    state = await graph.aget_state(_cfg(thread_id))
+    out: list[tuple[str, int]] = []
+    for task in getattr(state, "tasks", ()) or ():
+        for intr in getattr(task, "interrupts", ()) or ():
+            value = getattr(intr, "value", None)
+            if isinstance(value, dict) and value.get("action_requests"):
+                out.append((intr.id, len(value["action_requests"])))
+    return out
+
+
 async def _record(store: BaseStore | None, report: RunReport) -> None:
     if store is not None:
         await store.aput(LEDGER_NS, report.thread_id, {
@@ -129,15 +141,22 @@ async def decide(
     callbacks: list[Any] | None = None,
 ) -> RunReport:
     """Approve or reject every pending action of a paused thread, then continue the run."""
-    actions = await pending_actions(graph, thread_id)
-    if not actions:
+    pauses = await _pauses(graph, thread_id)
+    if not pauses:
         raise ValueError(f"thread {thread_id!r} has nothing awaiting approval")
     decision: dict[str, Any] = {"type": "approve"} if approve else {
         "type": "reject", **({"message": message} if message else {})}
+
+    def answer(n: int) -> dict[str, Any]:
+        return {"decisions": [dict(decision) for _ in range(n)]}
+
+    if len(pauses) == 1:  # the common case: a single paused action set
+        resume = Command(resume=answer(pauses[0][1]))
+    else:  # parallel subagents each paused: answer every interrupt by id
+        resume = Command(resume={iid: answer(n) for iid, n in pauses})
     return await run_with_recovery(
         graph, "", thread_id, store=store, max_attempts=max_attempts, base_delay=base_delay,
-        resume=Command(resume={"decisions": [dict(decision) for _ in actions]}),
-        callbacks=callbacks)
+        resume=resume, callbacks=callbacks)
 
 
 async def history(graph: Any, thread_id: str) -> list[dict[str, Any]]:

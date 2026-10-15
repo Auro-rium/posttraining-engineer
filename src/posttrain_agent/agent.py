@@ -11,6 +11,7 @@ from deepagents import create_deep_agent
 
 from . import budget
 from .backboard_model import Cassette
+from .concurrency import SubagentConcurrencyMiddleware
 from .config import Settings
 from .domain import ExperimentBackend, LocalStubBackend, make_tools
 from .hf import hf_tools
@@ -32,6 +33,12 @@ Loop per experiment (delegate each step with the `task` tool, one specialist at 
 5. training_designer (must call estimate_budget) -> 6. training_executor (a human approves the
 job before it launches; if rejected, revise the plan, do not retry unchanged) ->
 7. evaluator (champion AND candidate on the same split) -> 8. champion_manager.
+
+Parallelism: at most 2 subagents run at once. Issue independent `task` calls together in ONE
+message so they run concurrently: (a) in step 3, a researcher literature/prior-art scan alongside
+the failure_analyst; (b) in step 7, one evaluator task for the champion and one for the candidate.
+Everything else is sequential because each step needs the previous result. Never run two
+training_executor tasks at once; one job per experiment.
 Plan with write_todos first. Keep specialists' JSON results in files under /work/ so later steps
 can read them. Use `recall` before planning and `remember` for durable lessons. Use
 `read_telemetry` when calls are slow or failing. Never fabricate numbers: if a tool result is
@@ -70,6 +77,7 @@ async def build_agent(
     experiments: ExperimentBackend | None = None,
     client_factory: Callable[[], Any] | None = None,
     http_client_factory: Callable[[], Any] | None = None,
+    limiter: SubagentConcurrencyMiddleware | None = None,
 ):
     """Return a compiled deep-agent graph wired to ``runtime``'s checkpointer and store."""
     assistant_id = await ensure_assistant(settings, client_factory)
@@ -98,7 +106,8 @@ async def build_agent(
         tools=[remember, recall, tools["web_search"], tools["read_telemetry"]],
         system_prompt=ORCHESTRATOR_PROMPT,
         subagents=build_subagents(tools, (remember, recall), middleware),
-        middleware=middleware,
+        middleware=[limiter or SubagentConcurrencyMiddleware(settings.max_parallel_subagents),
+                    *middleware],
         backend=runtime.backend,
         memory=[SEED_MEMORY],
         interrupt_on=interrupt_on,

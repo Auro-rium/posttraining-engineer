@@ -45,6 +45,7 @@ class Settings:
     suite_dir: Path = Path("state/suite")  # <split>.jsonl task files (train/heldout/regression)
     require_approval: bool = True  # human approval before every training job
     seed: int = 7
+    max_parallel_subagents: int = 2
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -74,4 +75,5 @@ class Settings:
             suite_dir=Path(e("POSTTRAIN_SUITE_DIR", str(Path(e("POSTTRAIN_STATE_DIR", "state")) / "suite"))),
             require_approval=e("POSTTRAIN_REQUIRE_APPROVAL", "1").lower() not in {"0", "false", "no"},
             seed=int(e("POSTTRAIN_SEED", "7")),
+            max_parallel_subagents=max(1, int(e("POSTTRAIN_MAX_PARALLEL", "2"))),
         )

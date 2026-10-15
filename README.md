@@ -39,7 +39,8 @@ runs survive crashes and can be resumed, forked, or replayed offline from a reco
 
 The coordinator prompt (`ORCHESTRATOR_PROMPT` in `src/posttrain_agent/agent.py`) asks it to run one
 experiment as the sequence below, delegating each step with the `task` tool. The order is an
-instruction in the prompt; the code does not enforce it.
+instruction in the prompt; the code does not enforce it. Some steps may run side by side; see
+[Parallel subagents](#parallel-subagents).
 
 ```
 goal
@@ -76,6 +77,26 @@ PROMOTE or REJECT, with an evidence label on every number (LIVE | PRIOR_VERIFIED
 Each role's system prompt is a file in `src/posttrain_agent/prompts/`, prefixed by a shared
 preamble in `subagents.py`. Most tools are deterministic Python (`domain.py`, `dataset.py`,
 `budget.py`, `nebius.py`). `web_*` and `hf_*` are read-only lookups against external services.
+
+### Parallel subagents
+
+The coordinator can run up to `POSTTRAIN_MAX_PARALLEL` subagents at once (default `2`). When it
+issues several independent `task` calls in one message, they run concurrently. A semaphore
+middleware (`SubagentConcurrencyMiddleware`, attached to the coordinator only) queues the extra
+calls until a slot is free. Queued calls are not dropped.
+
+The prompt names the steps that may overlap:
+
+- Step 3, a researcher literature and prior-art scan, alongside the `failure_analyst` (step 2).
+- Step 7, one `evaluator` task for the champion and one for the candidate.
+
+The prompt forbids parallel `training_executor` tasks: one training job per experiment. The code
+enforces only the concurrency cap, not which steps are grouped together.
+
+If several subagents pause for approval at the same time, `posttrain pending` lists all of them,
+and one `posttrain approve` or `posttrain reject` answers every pending interrupt.
+
+The cap counts subagents only. Ordinary tool calls such as `recall` or `web_search` are not limited.
 
 ### Components
 
@@ -273,9 +294,9 @@ Entry point: `posttrain` (`posttrain_agent.cli:main`). Every command except `tel
 |---------|-----------|--------------|
 | `run` | `GOAL` `--thread ID` (default `default`) | Starts the run on the thread, or resumes it if the thread already has state. |
 | `resume` | `--thread ID` | Continues a thread from its last checkpoint. |
-| `pending` | `--thread ID` | Prints the actions waiting for a human decision. |
-| `approve` | `--thread ID` | Approves every pending action and continues. Errors if nothing is pending. |
-| `reject` | `--thread ID` `-m/--message TEXT` | Rejects every pending action. The message is shown to the agent. |
+| `pending` | `--thread ID` | Prints the actions waiting for a human decision, from every paused subagent. |
+| `approve` | `--thread ID` | Approves every pending action, across all paused subagents, and continues. Errors if nothing is pending. |
+| `reject` | `--thread ID` `-m/--message TEXT` | Rejects every pending action, across all paused subagents. The message is shown to the agent. |
 | `history` | `--thread ID` | Lists checkpoints, newest first: id, step, source, next node, message count. |
 | `fork` | `--thread ID` `CHECKPOINT_ID` | Re-executes from a past checkpoint. Original history is kept. Prints the final message. |
 | `runs` | none | Prints the run ledger across threads (up to 100 entries). |
@@ -309,6 +330,7 @@ template.
 | `POSTTRAIN_MEMORY_MODE` | `Readonly` | Backboard memory mode sent with each LLM call. The config comment lists `Auto`, `Readonly`, `off`. |
 | `POSTTRAIN_MODEL_RETRIES` | `2` | Retries of a transient model error on the same model before falling back. |
 | `POSTTRAIN_MAX_RECOVERY` | `3` | Attempts per run in `run_with_recovery`. |
+| `POSTTRAIN_MAX_PARALLEL` | `2` | Maximum subagents running at once. Extra `task` calls queue. Values below 1 are read as 1. |
 | `POSTTRAIN_STATE_DIR` | `state` | Root of all durable state. |
 | `POSTTRAIN_CASSETTE` | unset | Path to a cassette JSONL file. Enables recording or replay. |
 | `POSTTRAIN_CASSETTE_MODE` | `auto` | `auto` replays hits and records misses; `record` always calls live; `replay` never calls and fails on a miss. |
@@ -605,6 +627,7 @@ the path. Lint with `.venv/bin/ruff check src tests` (line length 100).
 | `test_domain.py` | Hyperparameter validation, promotion gate, sealed split, launch gating, stub promotion refusal |
 | `test_e2e.py` | Full graph with SQLite persistence: assistant reuse, memory tool, crash then resume, history and fork, file memory across threads |
 | `test_hf_nebius_telemetry.py` | Hugging Face tools, Nebius upload, job create, status, events, scoring, telemetry redaction |
+| `test_parallel.py` | The `task` concurrency cap (queued, not dropped, `task` only), three subagents run two at a time, two paused launches answered by one decision |
 | `test_resilience.py` | Transient classification, retry on the same model, fallback order, non-transient fall-through |
 | `test_web.py` | Tavily search and extract, missing key, sealed query refusal, which roles get web tools |
 

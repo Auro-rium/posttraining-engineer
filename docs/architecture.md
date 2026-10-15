@@ -10,6 +10,7 @@ the code as it is; see the README "Status and limitations" section for what is u
 | Module | Responsibility |
 |--------|----------------|
 | `agent.py` | `build_agent` assembles the deep agent: model, middleware, tools, subagents, memory, checkpointer, store, and the approval interrupt. Holds `ORCHESTRATOR_PROMPT` and `default_backend`. |
+| `concurrency.py` | `SubagentConcurrencyMiddleware`: semaphore capping concurrent `task` calls at `POSTTRAIN_MAX_PARALLEL`. Attached to the coordinator only. |
 | `cli.py` | `posttrain` command. Opens the runtime, builds the agent, and dispatches to `replay.py` and `telemetry.py`. |
 | `config.py` | `Settings` dataclass and `Settings.from_env()`. The only place environment variables are read. |
 | `backboard_model.py` | `ChatBackboard` (LangChain chat model over the Backboard API), `Cassette` (record/replay store), and transcript rendering. |
@@ -165,7 +166,10 @@ Mechanics:
    estimate is shown inline and does not block the prompt.
 4. **Decision.** `replay.decide` sends one decision per pending action:
    `{"type": "approve"}`, or `{"type": "reject", "message": ...}`, using
-   `Command(resume={"decisions": [...]})`. It then calls `run_with_recovery` with that resume payload.
+   `Command(resume={"decisions": [...]})`. When one subagent is paused, that is the whole payload.
+   When several are paused (see [Parallel subagents](#parallel-subagents)), the payload is
+   `Command(resume={interrupt_id: {"decisions": [...]}, ...})`, one entry per interrupt, so a single
+   decision answers them all. It then calls `run_with_recovery` with that resume payload.
 5. **Reject.** The tool does not run. The rejection message reaches the subagent, which is told to
    return `REJECTED` and not retry the same launch.
 6. **Process independence.** A decision can come from a new process, because the graph is rebuilt
@@ -184,7 +188,7 @@ successful submission, `record_spend` appends to `spend.jsonl`.
 |----------|-----------|
 | `run_with_recovery(graph, goal, thread_id, ...)` | If the thread has state, resumes with no new input; otherwise starts from the goal. On an exception, saves the checkpoint id and retries with `base_delay * 2**(attempt-1)` seconds of backoff, up to `max_attempts`. `FATAL = (CassetteMiss, KeyboardInterrupt, CancelledError)` is re-raised immediately. Records the run ledger before and after each attempt. |
 | `pending_actions(graph, thread_id)` | Reads the thread state and returns `action_requests` from pending interrupts. |
-| `decide(graph, thread_id, approve, message=...)` | Raises `ValueError` if nothing is pending. Otherwise resumes with a decision for each pending action. |
+| `decide(graph, thread_id, approve, message=...)` | Raises `ValueError` if nothing is pending. Otherwise resumes with a decision for each pending action. If several subagents are paused, every interrupt is answered in the same resume, keyed by interrupt id. |
 | `history(graph, thread_id)` | Lists checkpoints newest first, with checkpoint id, step, source, next nodes, creation time, message count. |
 | `fork(graph, thread_id, checkpoint_id, callbacks)` | Invokes the graph with `input=None` at a given checkpoint id. The original history stays. |
 | `ledger(store)` | Returns up to 100 items in the `posttrain/runs` namespace. Each has `thread_id`, status, attempts, errors, last checkpoint id, update time, and pending actions. |
@@ -255,6 +259,25 @@ copied exactly. Some prompt text refers to inputs that no tool provides (for exa
 `manifest_hash`, and an "objective worker"). The code does not validate subagent output against these
 contracts. The enforced rules are the ones in the deterministic tools: the sealed split restriction,
 hyperparameter and dataset validation, the approval gate, the budget, and the promotion gate.
+
+## Parallel subagents
+
+`SubagentConcurrencyMiddleware` (`concurrency.py`) is attached to the coordinator only. Each `task`
+tool call acquires a slot from a semaphore sized by `POSTTRAIN_MAX_PARALLEL` (default `2`, values
+below 1 read as 1). When the coordinator emits several `task` calls in one message, LangGraph runs
+them concurrently. Calls beyond the limit wait for a slot; none are dropped.
+
+- **Two semaphores.** The async path uses an `asyncio.Semaphore`, created on first use so it binds to
+  the running loop. The sync path uses a `threading.Semaphore`. `peak` records the highest number of
+  `task` calls observed at once.
+- **Scope.** Only `task` calls are limited. Other tool calls, such as `recall` or `web_search`, are
+  not queued.
+- **Which steps overlap.** `ORCHESTRATOR_PROMPT` asks the coordinator to issue together (a) the
+  researcher prior-art scan (step 3) with the `failure_analyst` (step 2), and (b) one `evaluator`
+  task for the champion and one for the candidate (step 7). It forbids parallel `training_executor`
+  tasks. The grouping is a prompt instruction. The code enforces only the cap.
+- **Several approvals at once.** Each paused subagent contributes one interrupt. `pending_actions`
+  and `_pauses` collect them. `decide` answers all of them in one resume, keyed by interrupt id.
 
 ## Sealed-data boundaries, in code
 
