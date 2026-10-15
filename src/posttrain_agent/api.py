@@ -158,7 +158,7 @@ def create_app(
         allow_headers=["Last-Event-ID", "Content-Type"],
     )
     replay: list[Event] | None = _load_replay(Path(replay_file)) if replay_file else None
-    journal = None if replay is not None else ReadOnlyJournal(Path(state_dir) / "events.db")
+    journal = None if replay is not None else ReadOnlyJournal(Path(state_dir) / "events.sqlite")
     active = {"n": 0}
     app.state.active = active
 

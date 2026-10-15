@@ -23,7 +23,7 @@ def make_app(tmp_path: Path, **kw):
 
 
 def seed(tmp_path: Path, n: int = 5, run: str = "r1") -> Journal:
-    j = Journal(tmp_path / "events.db")
+    j = Journal(tmp_path / "events.sqlite")
     for i in range(n):
         j.append(run, "run.status", {"status": "running", "attempt": i})
     return j
@@ -174,7 +174,7 @@ async def test_heartbeat_comment_sent_when_idle(tmp_path):
 
 
 async def test_run_filter_isolates_interleaved_runs(tmp_path):
-    j = Journal(tmp_path / "events.db")
+    j = Journal(tmp_path / "events.sqlite")
     for i in range(3):
         j.append("a", "run.status", {"status": "running", "attempt": i})
         j.append("b", "checkpoint", {"checkpoint_id": f"c{i}", "step": i})
@@ -191,7 +191,7 @@ async def test_run_filter_isolates_interleaved_runs(tmp_path):
 
 
 async def test_snapshot_equals_fold_of_stream(tmp_path):
-    j = Journal(tmp_path / "events.db")
+    j = Journal(tmp_path / "events.sqlite")
     j.append("r", "run.started", {"backend": "x", "goal_len": 3, "experiment_budget": 2})
     j.append("other", "run.status", {"status": "noise"})
     j.append("r", "run.status", {"status": "running", "attempt": 1})
@@ -208,7 +208,7 @@ async def test_snapshot_equals_fold_of_stream(tmp_path):
 
 
 async def test_reader_survives_concurrent_writer(tmp_path):
-    j = Journal(tmp_path / "events.db")
+    j = Journal(tmp_path / "events.sqlite")
     n = 40
 
     def writer():
@@ -243,7 +243,7 @@ async def test_21st_stream_gets_429(tmp_path):
     assert st["status"] == 429
     gate.set()
     # Third stream's frame arrival makes the held ones stop on their next body message.
-    j = Journal(tmp_path / "events.db")
+    j = Journal(tmp_path / "events.sqlite")
     j.append("r1", "run.status", {"status": "x"})
     await asyncio.wait_for(asyncio.gather(*tasks), 5)
     again = await raw_stream(app, f"/v1/stream?token={TOKEN}", stop=lambda t: "\n\n" in t)
@@ -288,7 +288,7 @@ async def test_replay_mode_serves_recorded_journal(tmp_path):
     )
     assert ids(st["text"]) == [1, 2, 3]
     assert time.monotonic() - t0 < 2.5
-    assert not (tmp_path / "state" / "events.db").exists()
+    assert not (tmp_path / "state" / "events.sqlite").exists()
 
 
 async def test_stream_data_is_full_envelope(tmp_path):
@@ -360,3 +360,12 @@ async def test_since_beyond_max_seq_keeps_streaming(tmp_path):
     st = await raw_stream(app, f"/v1/stream?token={TOKEN}&since=99", stop=lambda t: ": hb" in t)
     assert st["status"] == 200 and ids(st["text"]) == []
     del j
+
+
+async def test_api_reads_the_journal_the_cli_writes(tmp_path):
+    j = Journal(tmp_path / "events.sqlite")
+    j.append("cli-run", "run.status", {"status": "running"})
+    app = make_app(tmp_path)
+    async with client(app) as c:
+        runs = (await c.get(f"/v1/runs?token={TOKEN}")).json()["runs"]
+    assert [r["run"] for r in runs] == ["cli-run"]
