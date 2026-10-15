@@ -1,0 +1,192 @@
+[
+  {
+    "name": "full_promote_run",
+    "events": [
+      {"seq": 1, "ts": 100, "run": "r1", "type": "run.started", "data": {"goal_len": 40, "experiment_budget": 3, "backend": "stub"}},
+      {"seq": 2, "ts": 101, "run": "r1", "type": "run.status", "data": {"status": "RUNNING", "attempt": 1}},
+      {"seq": 3, "ts": 102, "run": "r1", "type": "agent.start", "data": {"role": "planner", "slot": 1}},
+      {"seq": 4, "ts": 103, "run": "r1", "type": "agent.end", "data": {"role": "planner", "slot": 1, "ok": true}},
+      {"seq": 5, "ts": 104, "run": "r1", "type": "score", "data": {"split": "heldout", "checkpoint": "base", "value": 0.5, "n": 20, "evidence": "LIVE"}},
+      {"seq": 6, "ts": 105, "run": "r1", "type": "budget.update", "data": {"spent_usd": 1.5, "cap_usd": 10, "estimate_usd": 4, "price_known": true}},
+      {"seq": 7, "ts": 106, "run": "r1", "type": "job.update", "data": {"job_id": "j1", "status": "running", "trained_steps": 5, "total_steps": 10}},
+      {"seq": 8, "ts": 107, "run": "r1", "type": "job.log", "data": {"level": "info", "message": "step 5"}},
+      {"seq": 9, "ts": 108, "run": "r1", "type": "job.update", "data": {"job_id": "j1", "status": "succeeded", "trained_steps": 10}},
+      {"seq": 10, "ts": 109, "run": "r1", "type": "checkpoint", "data": {"checkpoint_id": "ck1", "step": 10}},
+      {"seq": 11, "ts": 110, "run": "r1", "type": "score", "data": {"split": "heldout", "checkpoint": "ck1", "value": 0.75, "n": 20, "evidence": "LIVE"}},
+      {"seq": 12, "ts": 111, "run": "r1", "type": "gate.verdict", "data": {"decision": "PROMOTE", "reasons": ["improved"], "champion_score": 0.5, "candidate_score": 0.75, "relative_improvement": 0.5}},
+      {"seq": 13, "ts": 112, "run": "r1", "type": "telemetry.snapshot", "data": {"p50_ms": 120, "p95_ms": 400, "error_rate": 0, "input_tokens": 1000, "output_tokens": 200}},
+      {"seq": 14, "ts": 113, "run": "r1", "type": "run.status", "data": {"status": "COMPLETED", "attempt": 1}}
+    ],
+    "expected": {
+      "status": "COMPLETED",
+      "attempt": 1,
+      "backend": "stub",
+      "experiment": {"goal_len": 40, "experiment_budget": 3},
+      "agents": {"planner": {"active": false, "slot": 1, "ok": true}},
+      "active_slots": [],
+      "scores": [
+        {"split": "heldout", "checkpoint": "base", "value": 0.5, "n": 20, "evidence": "LIVE"},
+        {"split": "heldout", "checkpoint": "ck1", "value": 0.75, "n": 20, "evidence": "LIVE"}
+      ],
+      "gate": {"decision": "PROMOTE", "reasons": ["improved"], "champion_score": 0.5, "candidate_score": 0.75, "relative_improvement": 0.5},
+      "budget": {"spent_usd": 1.5, "cap_usd": 10, "estimate_usd": 4, "price_known": true},
+      "job": {"job_id": "j1", "status": "succeeded", "trained_steps": 10, "total_steps": 10},
+      "job_log": [{"level": "info", "message": "step 5"}],
+      "approval": null,
+      "telemetry": {"p50_ms": 120, "p95_ms": 400, "error_rate": 0, "input_tokens": 1000, "output_tokens": 200},
+      "checkpoints": [{"checkpoint_id": "ck1", "step": 10}],
+      "last_seq": 14,
+      "log": [
+        {"seq": 1, "ts": 100, "type": "run.started", "summary": "backend=stub"},
+        {"seq": 2, "ts": 101, "type": "run.status", "summary": "status=RUNNING attempt=1"},
+        {"seq": 3, "ts": 102, "type": "agent.start", "summary": "role=planner slot=1"},
+        {"seq": 4, "ts": 103, "type": "agent.end", "summary": "role=planner slot=1 ok=true"},
+        {"seq": 5, "ts": 104, "type": "score", "summary": "split=heldout checkpoint=base evidence=LIVE"},
+        {"seq": 6, "ts": 105, "type": "budget.update", "summary": "price_known=true"},
+        {"seq": 7, "ts": 106, "type": "job.update", "summary": "job_id=j1 status=running"},
+        {"seq": 8, "ts": 107, "type": "job.log", "summary": "level=info message=step 5"},
+        {"seq": 9, "ts": 108, "type": "job.update", "summary": "job_id=j1 status=succeeded"},
+        {"seq": 10, "ts": 109, "type": "checkpoint", "summary": "checkpoint_id=ck1 step=10"},
+        {"seq": 11, "ts": 110, "type": "score", "summary": "split=heldout checkpoint=ck1 evidence=LIVE"},
+        {"seq": 12, "ts": 111, "type": "gate.verdict", "summary": "decision=PROMOTE"},
+        {"seq": 13, "ts": 112, "type": "telemetry.snapshot", "summary": ""},
+        {"seq": 14, "ts": 113, "type": "run.status", "summary": "status=COMPLETED attempt=1"}
+      ]
+    }
+  },
+  {
+    "name": "reject_run",
+    "events": [
+      {"seq": 1, "ts": 1, "run": "r2", "type": "run.started", "data": {"backend": "nebius", "goal_len": 5, "experiment_budget": 1}},
+      {"seq": 2, "ts": 2, "run": "r2", "type": "score", "data": {"split": "heldout", "checkpoint": "ck1", "value": 0.4, "n": 10, "evidence": "PRIOR_VERIFIED_RUN"}},
+      {"seq": 3, "ts": 3, "run": "r2", "type": "gate.verdict", "data": {"decision": "REJECT", "reasons": ["no_improvement", "regression"], "champion_score": 0.5, "candidate_score": 0.4, "relative_improvement": -0.2}},
+      {"seq": 4, "ts": 4, "run": "r2", "type": "run.status", "data": {"status": "FAILED", "attempt": 2, "errors": ["GateRejected"]}}
+    ],
+    "expected": {
+      "status": "FAILED",
+      "attempt": 2,
+      "backend": "nebius",
+      "gate": {"decision": "REJECT", "reasons": ["no_improvement", "regression"], "champion_score": 0.5, "candidate_score": 0.4, "relative_improvement": -0.2},
+      "scores": [{"split": "heldout", "checkpoint": "ck1", "value": 0.4, "n": 10, "evidence": "PRIOR_VERIFIED_RUN"}],
+      "last_seq": 4
+    }
+  },
+  {
+    "name": "two_parallel_agents_then_one_ends_and_slot_reused",
+    "events": [
+      {"seq": 1, "ts": 1, "run": "r", "type": "agent.start", "data": {"role": "trainer", "slot": 1}},
+      {"seq": 2, "ts": 2, "run": "r", "type": "agent.start", "data": {"role": "evaluator", "slot": 2}},
+      {"seq": 3, "ts": 3, "run": "r", "type": "agent.end", "data": {"role": "trainer", "slot": 1, "ok": false}},
+      {"seq": 4, "ts": 4, "run": "r", "type": "agent.start", "data": {"role": "reporter", "slot": 1}}
+    ],
+    "expected": {
+      "agents": {
+        "trainer": {"active": false, "slot": 1, "ok": false},
+        "evaluator": {"active": true, "slot": 2, "ok": null},
+        "reporter": {"active": true, "slot": 1, "ok": null}
+      },
+      "active_slots": [1, 2],
+      "last_seq": 4
+    }
+  },
+  {
+    "name": "one_agent_ends_leaves_other_slot",
+    "events": [
+      {"seq": 1, "ts": 1, "run": "r", "type": "agent.start", "data": {"role": "trainer", "slot": 1}},
+      {"seq": 2, "ts": 2, "run": "r", "type": "agent.start", "data": {"role": "evaluator", "slot": 2}},
+      {"seq": 3, "ts": 3, "run": "r", "type": "agent.end", "data": {"role": "trainer", "slot": 1, "ok": true}}
+    ],
+    "expected": {
+      "agents": {
+        "trainer": {"active": false, "slot": 1, "ok": true},
+        "evaluator": {"active": true, "slot": 2, "ok": null}
+      },
+      "active_slots": [2]
+    }
+  },
+  {
+    "name": "approval_pending_then_resolved",
+    "events": [
+      {"seq": 1, "ts": 1, "run": "r", "type": "run.status", "data": {"status": "RUNNING", "attempt": 1}},
+      {"seq": 2, "ts": 2, "run": "r", "type": "approval.pending", "data": {"action": "launch_training", "base_model": "m", "dataset_ref": "d", "hyperparameters": {"lr": 0.001}, "estimate_usd": 3, "cli_hint": "approve"}},
+      {"seq": 3, "ts": 3, "run": "r", "type": "run.status", "data": {"status": "AWAITING_APPROVAL", "attempt": 1}}
+    ],
+    "expected": {
+      "status": "AWAITING_APPROVAL",
+      "approval": {"action": "launch_training", "base_model": "m", "dataset_ref": "d", "hyperparameters": {"lr": 0.001}, "estimate_usd": 3, "cli_hint": "approve"},
+      "log": [
+        {"seq": 1, "ts": 1, "type": "run.status", "summary": "status=RUNNING attempt=1"},
+        {"seq": 2, "ts": 2, "type": "approval.pending", "summary": "action=launch_training"},
+        {"seq": 3, "ts": 3, "type": "run.status", "summary": "status=AWAITING_APPROVAL attempt=1"}
+      ]
+    }
+  },
+  {
+    "name": "approval_resolved_clears_pending",
+    "events": [
+      {"seq": 1, "ts": 1, "run": "r", "type": "approval.pending", "data": {"action": "launch_training", "base_model": "m"}},
+      {"seq": 2, "ts": 2, "run": "r", "type": "approval.resolved", "data": {"decision": "approve", "message_len": 0}},
+      {"seq": 3, "ts": 3, "run": "r", "type": "run.status", "data": {"status": "RUNNING", "attempt": 1}}
+    ],
+    "expected": {
+      "approval": null,
+      "status": "RUNNING",
+      "log": [
+        {"seq": 1, "ts": 1, "type": "approval.pending", "summary": "action=launch_training"},
+        {"seq": 2, "ts": 2, "type": "approval.resolved", "summary": "decision=approve"},
+        {"seq": 3, "ts": 3, "type": "run.status", "summary": "status=RUNNING attempt=1"}
+      ]
+    }
+  },
+  {
+    "name": "model_call_with_fallback",
+    "events": [
+      {"seq": 1, "ts": 1, "run": "r", "type": "model.call", "data": {"name": "nebius:big", "ms": 900, "input_tokens": 10, "output_tokens": 0, "ok": false, "error": "Timeout", "fallback": false}},
+      {"seq": 2, "ts": 2, "run": "r", "type": "model.call", "data": {"name": "anthropic:small", "ms": 300, "input_tokens": 10, "output_tokens": 5, "ok": true, "fallback": true}}
+    ],
+    "expected": {
+      "log": [
+        {"seq": 1, "ts": 1, "type": "model.call", "summary": "name=nebius:big ok=false fallback=false"},
+        {"seq": 2, "ts": 2, "type": "model.call", "summary": "name=anthropic:small ok=true fallback=true"}
+      ],
+      "last_seq": 2
+    }
+  },
+  {
+    "name": "unknown_event_type_ignored",
+    "events": [
+      {"seq": 1, "ts": 1, "run": "r", "type": "run.status", "data": {"status": "RUNNING", "attempt": 1}},
+      {"seq": 2, "ts": 2, "run": "r", "type": "future.thing", "data": {"x": 1}}
+    ],
+    "expected": {
+      "status": "RUNNING",
+      "last_seq": 1,
+      "log": [{"seq": 1, "ts": 1, "type": "run.status", "summary": "status=RUNNING attempt=1"}]
+    }
+  },
+  {
+    "name": "malformed_event_ignored",
+    "events": [
+      {"seq": 1, "ts": 1, "run": "r", "type": "run.status", "data": {"status": "RUNNING", "attempt": 1}},
+      {"seq": "2", "ts": 2, "run": "r", "type": "run.status", "data": {"status": "FAILED"}},
+      {"seq": 3, "ts": 3, "run": "r", "type": "run.status", "data": "not-an-object"},
+      {"ts": 4, "run": "r", "type": "run.status", "data": {"status": "FAILED"}},
+      {"seq": 5, "ts": 5, "run": "r", "type": 9, "data": {}}
+    ],
+    "expected": {
+      "status": "RUNNING",
+      "attempt": 1,
+      "last_seq": 1,
+      "log": [{"seq": 1, "ts": 1, "type": "run.status", "summary": "status=RUNNING attempt=1"}]
+    }
+  },
+  {
+    "name": "duplicate_or_stale_seq_ignored",
+    "events": [
+      {"seq": 5, "ts": 5, "run": "r", "type": "run.status", "data": {"status": "RUNNING", "attempt": 1}},
+      {"seq": 5, "ts": 5, "run": "r", "type": "run.status", "data": {"status": "FAILED", "attempt": 9}},
+      {"seq": 3, "ts": 3, "run": "r", "type": "run.status", "data": {"status": "FAILED", "attempt": 9}}
+    ],
+    "expected": {"status": "RUNNING", "attempt": 1, "last_seq": 5}
+  }
+]
