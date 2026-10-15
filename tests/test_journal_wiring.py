@@ -274,3 +274,8 @@ def test_sample_journal_has_every_event_type_and_only_simulated_evidence(tmp_pat
     assert all(r["run"].startswith("sample") for r in rows)
     evid = [r["data"]["evidence"] for r in rows if "evidence" in r["data"]]
     assert evid and set(evid) == {"EXPLANATION"}
+    assert {r["data"]["name"] for r in rows if r["type"] == "model.call"} == {
+        "sample:simulated-model"}
+    again = tmp_path / "again.jsonl"
+    make_sample(again)
+    assert again.read_text() == out.read_text()  # deterministic
