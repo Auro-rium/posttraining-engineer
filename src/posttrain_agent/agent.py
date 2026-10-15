@@ -14,6 +14,7 @@ from .backboard_model import Cassette
 from .concurrency import SubagentConcurrencyMiddleware
 from .config import Settings
 from .domain import ExperimentBackend, LocalStubBackend, make_tools
+from .events import Journal
 from .hf import hf_tools
 from .memory import ensure_assistant, memory_tools
 from .nebius import NebiusBackend
@@ -78,6 +79,7 @@ async def build_agent(
     client_factory: Callable[[], Any] | None = None,
     http_client_factory: Callable[[], Any] | None = None,
     limiter: SubagentConcurrencyMiddleware | None = None,
+    journal: Journal | None = None,
 ):
     """Return a compiled deep-agent graph wired to ``runtime``'s checkpointer and store."""
     assistant_id = await ensure_assistant(settings, client_factory)
@@ -106,7 +108,7 @@ async def build_agent(
         tools=[remember, recall, tools["web_search"], tools["read_telemetry"]],
         system_prompt=ORCHESTRATOR_PROMPT,
         subagents=build_subagents(tools, (remember, recall), middleware),
-        middleware=[limiter or SubagentConcurrencyMiddleware(settings.max_parallel_subagents),
+        middleware=[limiter or SubagentConcurrencyMiddleware(settings.max_parallel_subagents, journal=journal),
                     *middleware],
         backend=runtime.backend,
         memory=[SEED_MEMORY],

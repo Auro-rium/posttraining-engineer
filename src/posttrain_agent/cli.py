@@ -10,9 +10,11 @@ from typing import Any
 
 from .agent import build_agent
 from .config import Settings
+from .events import Journal
+from .journal_handler import JournalHandler
 from .persistence import open_runtime
 from .replay import RunReport, decide, fork, history, ledger, pending_actions, run_with_recovery
-from .telemetry import TelemetryHandler, summarize
+from .telemetry import summarize
 
 
 def _show(report: RunReport) -> int:
@@ -41,10 +43,13 @@ async def _main(args: argparse.Namespace) -> int:
     if not settings.backboard_api_key and settings.cassette_mode != "replay":
         print("BACKBOARD_API_KEY is not set", file=sys.stderr)
         return 2
-    cbs: list[Any] = [TelemetryHandler(settings.state_dir / "telemetry.jsonl")]
+    journal = Journal(settings.state_dir / "events.sqlite")
+    cbs: list[Any] = [JournalHandler(
+        journal, primary=f"{settings.llm_provider}:{settings.model_name}",
+        telemetry_path=settings.state_dir / "telemetry.jsonl")]
     opts = {"max_attempts": settings.max_recovery_attempts, "callbacks": cbs}
     async with open_runtime(settings.state_dir) as rt:
-        graph = await build_agent(settings, rt)
+        graph = await build_agent(settings, rt, journal=journal)
         if args.cmd == "run":
             return _show(await run_with_recovery(graph, args.goal, args.thread, store=rt.store, **opts))
         if args.cmd == "resume":
