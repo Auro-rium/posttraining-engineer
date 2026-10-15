@@ -1,26 +1,38 @@
-from posttrain_agent.domain import (
-    LocalStubBackend,
-    make_tools,
-    promotion_gate,
-    validate_qlora,
-)
+import json
 
-GOOD = {"rank": 16, "alpha": 32, "dropout": 0.05, "learning_rate": 2e-4, "epochs": 3,
-        "sequence_length": 1024, "batch_size": 4, "gradient_accumulation_steps": 4,
-        "target_modules": ["q_proj", "v_proj"]}
+from posttrain_agent.config import Settings
+from posttrain_agent.domain import LocalStubBackend, make_tools, promotion_gate, validate_hparams
+
+GOOD = {"lora_r": 16, "lora_alpha": 32, "lora_dropout": 0.05, "learning_rate": 2e-4,
+        "n_epochs": 3, "batch_size": 8, "context_length": 8192}
+
+ROW = {"messages": [
+    {"role": "user", "content": "api is down"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "get_logs", "arguments": json.dumps({"service": "api"})}}]}],
+    "metadata": {"evidence": "LIVE"}}
 
 
 def ev(score, evidence="LIVE", split="heldout"):
     return {"score": score, "evidence": evidence, "suite": "s", "split": split, "seed": 7}
 
 
-def test_qlora_accepts_valid_and_rejects_out_of_space():
-    assert validate_qlora(GOOD) == []
-    assert validate_qlora({**GOOD, "rank": 3})
-    assert validate_qlora({**GOOD, "learning_rate": 1.0})
-    assert validate_qlora({**GOOD, "target_modules": ["lm_head"]})
-    assert validate_qlora({**GOOD, "evil": 1})
-    assert validate_qlora({**GOOD, "epochs": True})
+def tools(tmp_path, **kw):
+    s = Settings(state_dir=tmp_path, data_dir=tmp_path / "data", price_per_mtok=1.0, **kw)
+    return make_tools(LocalStubBackend(), s), s
+
+
+def test_hparams_accept_valid_and_reject_out_of_space():
+    assert validate_hparams(GOOD) == []
+    assert validate_hparams({**GOOD, "lora_r": 4})
+    assert validate_hparams({**GOOD, "learning_rate": 1.0})
+    assert validate_hparams({**GOOD, "n_epochs": 2.5})
+    assert validate_hparams({**GOOD, "n_epochs": True})
+    assert validate_hparams({**GOOD, "evil": 1})
+    assert validate_hparams({**GOOD, "lora_alpha": 200})  # > 4 * lora_r
+    assert validate_hparams({k: v for k, v in GOOD.items() if k != "batch_size"})
+    assert validate_hparams({**GOOD, "lora": False})  # LoRA is not optional
 
 
 def test_gate_promotes_clear_verified_improvement():
@@ -40,18 +52,32 @@ def test_gate_rejects_small_gain_mismatched_inputs_and_regression():
     assert promotion_gate(ev(float("nan")), ev(0.4))["decision"] == "REJECT"
 
 
-def test_tools_enforce_sealed_split_and_stub_is_labelled():
-    t = make_tools(LocalStubBackend())
+def test_sealed_split_enforced_and_stub_labelled(tmp_path):
+    t, _ = tools(tmp_path)
     assert "error" in t["run_benchmark"]("base", split="heldout")
     assert t["run_benchmark"]("base")["evidence"] == "EXPLANATION"
     assert "error" in t["evaluate_checkpoint"]("base", split="train")
-    assert t["launch_training"]({"rank": 3}, "d", "base")["status"] == "BLOCKED"
-    trained = t["launch_training"](GOOD, "d", "base")
-    assert trained["checkpoint"].startswith("stub-ckpt-") and trained["provider_job_id"] is None
 
 
-def test_stub_results_can_never_be_promoted():
-    t = make_tools(LocalStubBackend())
-    champ = t["evaluate_checkpoint"]("base")
-    cand = t["evaluate_checkpoint"](t["launch_training"](GOOD, "d", "base")["checkpoint"])
-    assert t["decide_promotion"](champ, cand)["decision"] == "REJECT"
+def test_launch_is_gated_on_hparams_dataset_and_budget(tmp_path):
+    t, s = tools(tmp_path)
+    assert t["launch_training"]({"lora_r": 3}, "d.jsonl")["stage"] == "hyperparameters"
+    assert t["launch_training"](GOOD, "missing.jsonl")["stage"] == "dataset"
+    assert t["save_dataset"]("d", [ROW])["ok"]
+    ok = t["launch_training"](GOOD, "d.jsonl")
+    assert ok["checkpoint"].startswith("stub-ckpt-") and ok["dataset_sha256"]
+    # no price configured -> fail closed
+    t2 = make_tools(LocalStubBackend(), Settings(state_dir=tmp_path, data_dir=s.data_dir))
+    assert t2["launch_training"](GOOD, "d.jsonl")["stage"] == "budget"
+    # cumulative cap: the first launch recorded spend
+    t3 = make_tools(LocalStubBackend(), Settings(state_dir=tmp_path, data_dir=s.data_dir,
+                                                 price_per_mtok=1.0, max_cost_usd=1e-9))
+    assert t3["launch_training"](GOOD, "d.jsonl")["stage"] == "budget"
+
+
+def test_stub_results_can_never_be_promoted(tmp_path):
+    t, _ = tools(tmp_path)
+    t["save_dataset"]("d", [ROW])
+    ckpt = t["launch_training"](GOOD, "d.jsonl")["checkpoint"]
+    out = t["decide_promotion"](t["evaluate_checkpoint"]("base"), t["evaluate_checkpoint"](ckpt))
+    assert out["decision"] == "REJECT"

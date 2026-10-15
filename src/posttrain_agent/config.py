@@ -35,6 +35,16 @@ class Settings:
     model_retries: int = 2
     assistant_id: str | None = None
     tavily_api_key: str = ""
+    hf_token: str = ""
+    nebius_api_key: str = ""
+    nebius_base_url: str = "https://api.tokenfactory.nebius.com/v1"
+    base_model: str = "meta-llama/Llama-3.1-8B-Instruct"
+    max_cost_usd: float = 25.0  # total estimated spend across all launched jobs
+    price_per_mtok: float | None = None  # USD per 1M trained tokens; Nebius publishes none
+    data_dir: Path = Path("state/data")
+    suite_dir: Path = Path("state/suite")  # <split>.jsonl task files (train/heldout/regression)
+    require_approval: bool = True  # human approval before every training job
+    seed: int = 7
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -54,4 +64,14 @@ class Settings:
             model_retries=int(e("POSTTRAIN_MODEL_RETRIES", "2")),
             assistant_id=e("BACKBOARD_ASSISTANT_ID") or None,
             tavily_api_key=e("TAVILY_API_KEY", ""),
+            hf_token=e("HF_TOKEN", ""),
+            nebius_api_key=e("NEBIUS_API_KEY", ""),
+            nebius_base_url=e("NEBIUS_BASE_URL", cls.nebius_base_url),
+            base_model=e("POSTTRAIN_BASE_MODEL", cls.base_model),
+            max_cost_usd=float(e("POSTTRAIN_MAX_COST_USD", "25")),
+            price_per_mtok=float(e("POSTTRAIN_PRICE_PER_MTOK")) if e("POSTTRAIN_PRICE_PER_MTOK") else None,
+            data_dir=Path(e("POSTTRAIN_DATA_DIR", str(Path(e("POSTTRAIN_STATE_DIR", "state")) / "data"))),
+            suite_dir=Path(e("POSTTRAIN_SUITE_DIR", str(Path(e("POSTTRAIN_STATE_DIR", "state")) / "suite"))),
+            require_approval=e("POSTTRAIN_REQUIRE_APPROVAL", "1").lower() not in {"0", "false", "no"},
+            seed=int(e("POSTTRAIN_SEED", "7")),
         )
