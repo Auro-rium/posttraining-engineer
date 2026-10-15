@@ -498,6 +498,21 @@ describe("connection", () => {
     expect(h.base.last_seq).toBe(5);
     expect(h.events.reduce(foldEvent, h.base).last_seq).toBe(HISTORY_MAX + 5);
   });
+
+  it.each(["api.example.com", "ftp://api.example.com", "http://"])(
+    "an invalid API URL (%s) shows 'invalid API URL', not CONNECTING, and makes no requests",
+    async (apiUrl) => {
+      const { conn, f } = make(liveRoutes(), { apiUrl });
+      expect(() => conn.start()).not.toThrow();
+      await vi.advanceTimersByTimeAsync(30_000);
+      // A configured-but-broken API is never replaced by sample data.
+      expect(view(conn)).toMatchObject({ conn: "OFFLINE", mode: "LIVE", source: "api" });
+      expect(view(conn).detail).toMatch(/^invalid API URL/);
+      expect(f.calls).toHaveLength(0);
+      expect(FakeES.instances).toHaveLength(0);
+      conn.stop();
+    },
+  );
 });
 
 describe("unmount cleanup", () => {

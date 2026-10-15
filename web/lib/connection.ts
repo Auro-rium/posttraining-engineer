@@ -120,6 +120,16 @@ export function backoffDelay(attempt: number): number {
 const isObject = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === "object" && !Array.isArray(v);
 
+/** True when `base` (already trimmed, no trailing slash) is an absolute http(s) URL with a host. */
+function isValidApiBase(base: string): boolean {
+  try {
+    const u = new URL(base);
+    return (u.protocol === "http:" || u.protocol === "https:") && u.host !== "";
+  } catch {
+    return false;
+  }
+}
+
 function statusDetail(status: number): string {
   if (status === 429) return "too many streams (429)";
   if (status === 503) return "journal unavailable (503)";
@@ -402,6 +412,11 @@ export function createConnection(opts: ConnectionOptions): Connection {
 
   function start(): void {
     if (running || authFailed) return;
+    if (base && !isValidApiBase(base)) {
+      // A misconfigured NEXT_PUBLIC_API_URL: say so, request nothing, and never show sample data.
+      set({ conn: "OFFLINE", detail: "invalid API URL (NEXT_PUBLIC_API_URL needs http:// or https://)" });
+      return;
+    }
     const g = globalThis as unknown as Record<string, unknown>;
     const injected = opts.deps ?? {};
     const ES = "EventSource" in injected ? injected.EventSource : (g.EventSource as EventSourceCtor | undefined);

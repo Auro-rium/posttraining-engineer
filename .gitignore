@@ -7,3 +7,4 @@ __pycache__/
 .superpowers/
 state/
 *.egg-info/
+node_modules/
