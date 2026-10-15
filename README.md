@@ -616,15 +616,22 @@ completions or secrets) to a SQLite journal under the state directory. A read-on
 to the dashboard over Server-Sent Events.
 
 ```bash
-cp .env.example .env            # set READ_TOKEN (required), ALLOWED_ORIGIN, TUNNEL_TOKEN
-docker compose up --build api   # API on 127.0.0.1:8787, state in ./state
-docker compose up --build       # also starts the Cloudflare tunnel (needs TUNNEL_TOKEN)
-docker compose --profile quick up api tunnel-quick   # no token: temporary trycloudflare.com URL
+cp .env.example .env                  # set READ_TOKEN (required), ALLOWED_ORIGIN, UID/GID
+docker compose up --build             # api only: 127.0.0.1:8787, state in ./state
+docker compose --profile tunnel up    # also the named Cloudflare tunnel (needs TUNNEL_TOKEN)
+docker compose --profile quick up     # or a temporary trycloudflare.com URL, no token
 ```
 
+- The api runs as `${UID}:${GID}` so it can open the host-owned `./state` files. bash does not
+  export `UID`, so either set `UID`/`GID` in `.env` or run `export UID GID=$(id -g)` first.
+- `./state` is mounted read-write on purpose: a WAL reader needs a writable `-shm` file. The API
+  opens the journal read-only and never writes events.
 - `GET /v1/health` needs no token (used by the Docker healthcheck); it returns 503 when the journal
   cannot be read. Every other route needs `?token=<READ_TOKEN>`.
-- `REPLAY_FILE=web/public/sample-run.jsonl` serves a recorded journal instead of the live one.
+- `READ_TOKEN` is required even in replay mode. Set `REPLAY_FILE=/replay/sample-run.jsonl` in
+  `.env` to serve a recorded journal instead of the live one (`./web/public` is mounted at
+  `/replay`, read-only). Outside compose, use the file's own path.
+- cloudflared runs on the `latest` tag; pin a version for production.
 - `web/public/sample-run.jsonl` is a **simulated sample**: a stub-backed fake run with approval
   included, every score and job carrying evidence `EXPLANATION`. It is never live data. Regenerate
   it with `python scripts/make_sample_journal.py --out web/public/sample-run.jsonl`.

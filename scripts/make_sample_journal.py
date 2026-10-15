@@ -34,6 +34,7 @@ from posttrain_agent.persistence import open_runtime  # noqa: E402
 from posttrain_agent.replay import decide, run_with_recovery  # noqa: E402
 
 RUN = "sample-simulated-run"
+SAMPLE_T0 = 1_760_000_000.0  # fixed start time (2025-10-09) so output is deterministic
 LAUNCH = [
     call("task", {"description": "launch the job", "subagent_type": "training_executor"}),
     call("launch_training", {"hyperparameters": GOOD, "dataset_ref": "d.jsonl"}, id="call_2"),
@@ -82,8 +83,21 @@ def make_sample(out: Path) -> None:
         journal = Journal(tmp / "events.sqlite")
         asyncio.run(_run(tmp, journal))
         events = journal.read(RUN, limit=10_000)
-    lines = [json.dumps({"seq": e.seq, "ts": e.ts, "run": e.run, "type": e.type, "data": e.data},
-                        separators=(",", ":")) for e in events]
+    lines = []
+    for e in events:
+        data = dict(e.data)
+        if "ms" in data:  # normalise timings so regeneration is byte-stable
+            data["ms"] = round(5.0 + (e.seq % 7) * 3.5, 1)
+        if e.type == "model.call":  # never name a real provider or model in a sample
+            data["name"] = "sample:simulated-model"
+        for k, v in data.items():  # random stub job ids -> fixed
+            if isinstance(v, str) and v.startswith("stub-job-"):
+                data[k] = "stub-job-sample"
+        if e.type == "checkpoint":
+            data["checkpoint_id"] = f"sample-checkpoint-{data.get('step')}"
+        ts = round(SAMPLE_T0 + (e.seq - 1) * 0.8, 3)  # fixed clock
+        lines.append(json.dumps({"seq": e.seq, "ts": ts, "run": e.run, "type": e.type,
+                                 "data": data}, separators=(",", ":")))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

@@ -1,16 +1,24 @@
-# Live dashboard backend: read-only API over the run journal, published through a Cloudflare tunnel.
-# Set READ_TOKEN (and optionally ALLOWED_ORIGIN, TUNNEL_TOKEN) in .env. See README "Live dashboard".
+# Live dashboard backend: read-only API over the run journal, optionally published through a
+# Cloudflare tunnel. `docker compose up` starts the api only. See README "Live dashboard".
+#   named tunnel:  docker compose --profile tunnel up   (needs TUNNEL_TOKEN)
+#   quick tunnel:  docker compose --profile quick up    (temporary trycloudflare.com URL)
 services:
   api:
     build: .
     command: ["posttrain-api"]  # uvicorn entry point of posttrain_agent.api
+    # Run as the host user so the API can open the host-owned state files. bash's UID is not
+    # exported: `export UID GID=$(id -g)` first, or set them in .env (defaults to 1000:1000).
+    user: "${UID:-1000}:${GID:-1000}"
     environment:
-      READ_TOKEN: ${READ_TOKEN:?set READ_TOKEN in .env}
+      READ_TOKEN: ${READ_TOKEN:?set READ_TOKEN in .env}  # required, also in replay mode
       ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-}
       STATE_DIR: /state
-      REPLAY_FILE: ${REPLAY_FILE:-}
+      REPLAY_FILE: ${REPLAY_FILE:-}  # e.g. /replay/sample-run.jsonl
     volumes:
+      # Read-write on purpose: a WAL reader needs a writable -shm file. The API opens the journal
+      # read-only and never writes events.
       - ./state:/state
+      - ./web/public:/replay:ro
     ports:
       - "127.0.0.1:8787:8787"
     restart: unless-stopped
@@ -25,12 +33,14 @@ services:
       start_period: 10s
       retries: 3
 
-  # Named tunnel: set TUNNEL_TOKEN. Without a token, use the quick-tunnel fallback:
-  #   docker compose --profile quick up
+  # cloudflared is left on `latest` (no tag pinned that I could verify); pin it for production.
   tunnel:
+    profiles: ["tunnel"]
     image: cloudflare/cloudflared:latest
     command: tunnel --no-autoupdate run
     environment:
+      # Not `:?`-required: compose interpolates inactive profiles too, so that would break the
+      # default `docker compose up`. cloudflared exits with an error if this is empty.
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
     depends_on:
       api:
