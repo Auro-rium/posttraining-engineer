@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import math
+import re
 import sqlite3
 import threading
 import time
@@ -24,6 +26,8 @@ CURRENT_RUN: contextvars.ContextVar[str] = ContextVar("CURRENT_RUN", default="")
 
 MAX_STR = 300
 MAX_DEPTH = 2
+MAX_ITEMS = 32
+_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,48}$")
 
 _ALLOWED: dict[str, frozenset[str]] = {
     "run.started": frozenset({"goal_len", "experiment_budget", "backend"}),
@@ -59,6 +63,8 @@ _DROP = object()
 
 def _clean(value: Any, depth: int) -> Any:
     """Keep JSON scalars and lists/dicts of them up to MAX_DEPTH container levels."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
@@ -66,16 +72,18 @@ def _clean(value: Any, depth: int) -> Any:
     if isinstance(value, (list, tuple)):
         if depth > MAX_DEPTH:
             return _DROP
-        items = (_clean(v, depth + 1) for v in value)
+        items = (_clean(v, depth + 1) for v in list(value)[:MAX_ITEMS])
         return [v for v in items if v is not _DROP]
     if isinstance(value, dict):
         if depth > MAX_DEPTH:
             return _DROP
         out: dict[str, Any] = {}
-        for k, v in value.items():
+        for k, v in list(value.items())[:MAX_ITEMS]:
+            if not isinstance(k, str) or not _KEY_RE.match(k):
+                continue
             cleaned = _clean(v, depth + 1)
             if cleaned is not _DROP:
-                out[str(k)[:MAX_STR]] = cleaned
+                out[k] = cleaned
         return out
     return _DROP
 

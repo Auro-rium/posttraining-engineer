@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 
@@ -49,7 +50,37 @@ def test_sanitize_depth_limit():
     )
     assert out["estimate_usd"] == 1.5
     assert out["hyperparameters"]["lr"] == 1
-    assert "x" not in out["hyperparameters"].get("deep", {})
+    assert out["hyperparameters"] == {"lr": 1, "deep": {}}
+
+
+def test_bad_keys_dropped_and_collections_capped(tmp_path):
+    path = tmp_path / "events.sqlite"
+    j = Journal(path)
+    hp = {"SECRET text with spaces": 1, "k" * 49: 2, "ok-key.1_": 3}
+    j.append("r", "approval.pending", {"hyperparameters": hp})
+    big = {f"k{i}": i for i in range(100)}
+    j.append("r", "gate.verdict", {"reasons": list(range(100)), "decision": "x"})
+    j.append("r", "approval.pending", {"hyperparameters": big})
+    a, b, c = j.read()
+    assert a.data["hyperparameters"] == {"ok-key.1_": 3}
+    assert len(b.data["reasons"]) == 32
+    assert len(c.data["hyperparameters"]) == 32
+    blob = b"".join(p.read_bytes() for p in tmp_path.iterdir())
+    assert b"SECRET" not in blob
+
+
+def test_non_finite_floats_become_null(tmp_path):
+    j = Journal(tmp_path / "events.sqlite")
+    j.append("r", "score", {"value": float("nan"), "n": float("inf"), "split": "a"})
+    (ev,) = j.read()
+    assert ev.data == {"value": None, "n": None, "split": "a"}
+    import sqlite3
+
+    def boom(c):
+        raise ValueError(c)
+
+    raw = sqlite3.connect(tmp_path / "events.sqlite").execute("SELECT data FROM events").fetchone()
+    assert json.loads(raw[0], parse_constant=boom) == ev.data
 
 
 def test_sentinel_strings_in_every_field_never_reach_the_journal(tmp_path):
@@ -67,12 +98,13 @@ def test_sentinel_strings_in_every_field_never_reach_the_journal(tmp_path):
     assert b"SECRET" not in blob
 
 
-def test_prune_keeps_latest_rows(tmp_path):
+def test_prune_keeps_latest_100000_rows(tmp_path):
     j = Journal(tmp_path / "events.sqlite", max_rows=10, prune_every=5)
     for i in range(23):
         j.append("r", "checkpoint", {"step": i})
     events = j.read(limit=1000)
-    assert 10 <= len(events) <= 15
+    # prunes at writes 5,10,15,20: after write 20 rows 11..20 remain, then 21..23 added
+    assert [e.data["step"] for e in events] == list(range(10, 23))
     assert events[-1].data["step"] == 22
     assert Journal(tmp_path / "x.sqlite").max_rows == 100_000
 
