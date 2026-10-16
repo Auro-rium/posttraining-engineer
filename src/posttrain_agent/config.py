@@ -7,6 +7,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def load_dotenv(path: Path | str = ".env") -> int:
+    """Load ``KEY=value`` lines into ``os.environ`` without overriding variables already set.
+
+    Blank values, comments and malformed lines are skipped. Returns how many were set.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return 0
+    n = 0
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+            n += 1
+    return n
+
+
 def _split_models(raw: str) -> tuple[tuple[str, str], ...]:
     """Parse ``provider:model,provider:model`` into (provider, model) pairs."""
     pairs = []

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent import build_agent
-from .config import Settings
+from .config import Settings, load_dotenv
 from .observability.events import CURRENT_RUN, Journal
 from .observability.fold import a2a_conversation
 from .observability.journal_handler import JournalHandler
@@ -120,4 +120,6 @@ def main() -> None:
     t = sub.add_parser("telemetry", help="summarise model/tool telemetry")
     t.add_argument("--last", type=int, default=500)
     t.add_argument("--errors", action="store_true", help="only errors")
-    raise SystemExit(asyncio.run(_main(p.parse_args())))
+    args = p.parse_args()
+    load_dotenv()  # ./.env fills in anything not already exported (entry point only)
+    raise SystemExit(asyncio.run(_main(args)))
