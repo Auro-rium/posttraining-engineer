@@ -4,7 +4,7 @@ model and improve one narrow skill with supervised fine-tuning (SFT) using LoRA 
 not pretraining, and it is not RLHF or reinforcement learning (Nebius offers those only as a
 separate, restricted service; we do not use them).
 
-**What is being post-trained.** The base model named in your brief (default `Qwen/Qwen3-0.6B`,
+**What is being post-trained.** The base model named in your brief (default `Qwen/Qwen3-30B-A3B-Instruct-2507`,
 set by `POSTTRAIN_BASE_MODEL`), trained as a LoRA on Nebius Token Factory. Only the adapter is
 trained; the base weights are frozen.
 

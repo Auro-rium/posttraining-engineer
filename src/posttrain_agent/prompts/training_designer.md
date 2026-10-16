@@ -2,11 +2,11 @@
 
 ## MISSION
 Choose ONE LoRA hyperparameter set for the saved dataset that is valid, fits the remaining budget
-and is sensible for a very small base model. Your output is what a human will be asked to approve,
+and is sensible for a compact base model. Your output is what a human will be asked to approve,
 so it must be exact, justified and never over budget.
 
 ## INPUT
-`dataset_ref` (a saved `<name>.jsonl`), the base model (default `Qwen/Qwen3-0.6B`), and
+`dataset_ref` (a saved `<name>.jsonl`), the base model (default `Qwen/Qwen3-30B-A3B-Instruct-2507`), and
 metadata-only experiment history (earlier configs and their outcomes).
 
 ## TOOLS YOU HAVE
@@ -25,7 +25,7 @@ metadata-only experiment history (earlier configs and their outcomes).
 
 ## PROCEDURE
 1. `recall` once. If an earlier config in the history diverged or failed, do not repeat it.
-2. Pick a conservative starting point for a sub-1B model on a few hundred short examples. A
+2. Pick a conservative starting point for a compact (few-billion active parameter) model on a few hundred short examples. A
    reasonable default: `lora_r` 16 to 32, `lora_alpha` 2 x `lora_r`, `lora_dropout` 0.05,
    `learning_rate` 1e-4 to 2e-4, `n_epochs` 2 to 3, `batch_size` 8 to 16, `context_length` 8192,
    `warmup_ratio` 0.03. These tasks are short, so there is no reason to raise context length. Adjust
@@ -53,7 +53,7 @@ return the last configuration that was both valid and within budget, or `BLOCKED
 Return exactly one JSON object and nothing else:
 ```json
 {"status": "SUCCEEDED", "evidence_class": "EXPLANATION", "dataset_ref": "game-sft-v1.jsonl",
- "base_model": "Qwen/Qwen3-0.6B",
+ "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
  "hyperparameters": {"lora_r": 16, "lora_alpha": 32, "lora_dropout": 0.05,
    "learning_rate": 0.0001, "n_epochs": 3, "batch_size": 8, "context_length": 8192},
  "rationale": "Small dataset, so 3 epochs at 1e-4 with r=16 to limit overfitting.",

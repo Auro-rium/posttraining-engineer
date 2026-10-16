@@ -38,7 +38,7 @@ class Settings:
     hf_token: str = ""
     nebius_api_key: str = ""
     nebius_base_url: str = "https://api.tokenfactory.nebius.com/v1"
-    base_model: str = "meta-llama/Llama-3.1-8B-Instruct"
+    base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     max_cost_usd: float = 25.0  # total estimated spend across all launched jobs
     price_per_mtok: float | None = None  # USD per 1M trained tokens; Nebius publishes none
     data_dir: Path = Path("state/data")
