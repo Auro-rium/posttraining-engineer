@@ -20,7 +20,7 @@ from .memory import ensure_assistant, memory_tools
 from .nebius import NebiusBackend
 from .persistence import SEED_MEMORY, Runtime
 from .resilience import build_middleware, build_model
-from .subagents import build_subagents
+from .subagents import ROLES, build_subagents
 from .telemetry import telemetry_tool
 from .web import web_tools
 
@@ -107,7 +107,10 @@ async def build_agent(
         model=build_model(settings, **extra),
         tools=[remember, recall, tools["web_search"], tools["read_telemetry"]],
         system_prompt=ORCHESTRATOR_PROMPT,
-        subagents=build_subagents(tools, (remember, recall), middleware),
+        subagents=build_subagents(
+            tools, (remember, recall), middleware,
+            {r: build_model(settings, provider=p, model=m, **extra)
+             for r, (p, m) in settings.role_models.items() if r in ROLES}),
         middleware=[limiter or SubagentConcurrencyMiddleware(settings.max_parallel_subagents, journal=journal),
                     *middleware],
         backend=runtime.backend,

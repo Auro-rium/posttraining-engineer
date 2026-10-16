@@ -45,6 +45,7 @@ def build_subagents(
     tools: dict[str, Callable[..., Any]],
     memory: Sequence[Any] = (),
     middleware: Sequence[Any] = (),
+    models: dict[str, Any] | None = None,
 ) -> list[SubAgent]:
     """``memory`` is (remember, recall); researchers get both, everyone else just recall."""
     remember, recall = memory if memory else (None, None)
@@ -55,11 +56,14 @@ def build_subagents(
             role_tools.append(recall)
             if wants_memory:
                 role_tools.append(remember)
-        specs.append(SubAgent(
+        spec = SubAgent(
             name=name,
             description=description,
             system_prompt=PREAMBLE + load_prompt(file),
             tools=role_tools,
             middleware=list(middleware),
-        ))
+        )
+        if models and name in models:  # else the subagent inherits the coordinator's model
+            spec["model"] = models[name]
+        specs.append(spec)
     return specs
