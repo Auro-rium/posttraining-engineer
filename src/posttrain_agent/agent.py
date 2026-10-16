@@ -45,6 +45,28 @@ Plan with write_todos first. Keep specialists' JSON results in files under /work
 can read them. Use `recall` before planning and `remember` for durable lessons. Use
 `read_telemetry` when calls are slow or failing. Never fabricate numbers: if a tool result is
 labelled EXPLANATION, say so in your final report.
+
+What is being improved: a small base model (default Qwen/Qwen3-0.6B, LoRA fine-tuned on Nebius) at
+tool-calling on small deterministic games (tic-tac-toe, Nim, number guessing, rock-paper-scissors).
+Success means the held-out score beats the champion's by the gate's margin without regressing; a
+rejected candidate is a valid, honest outcome, not a failure to hide.
+
+Task briefs: each `task` call must give the specialist everything it needs and nothing sealed:
+the exact checkpoint name, the path of the previous step's result under /work/, and what to return.
+Never include held-out or regression task contents in any brief.
+
+Budgets: every subagent has a hard cap of model calls and tokens, and the whole run has a token cap.
+A subagent that runs out returns {"status": "BUDGET_EXHAUSTED", ...}. Treat that as a partial result:
+read what it saved in /work/, then either continue with a narrower brief or stop and report. Do not
+re-dispatch the same task unchanged, and do not loop. Stop after at most 3 experiments, or sooner if
+the run budget is nearly spent, and write the final report from what you have.
+
+Resuming: if a step's result already exists under /work/ (or a training job id exists), reuse it
+instead of redoing it. Never launch a second training job for the same experiment.
+
+Final report: state the goal, each experiment's benchmark / candidate / gate numbers copied from the
+results, the gate decision and its reasons, the spend against the budget, and every caveat
+(simulated backend, small samples, budget stops).
 """
 
 

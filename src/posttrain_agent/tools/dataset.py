@@ -13,8 +13,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-OBJECTIVE_TOOLS = frozenset({"get_logs", "inspect_service", "read_config", "edit_config",
-                             "restart_service", "run_healthcheck"})
+OBJECTIVE_TOOLS = frozenset({
+    "get_logs", "inspect_service", "read_config", "edit_config",
+    "restart_service", "run_healthcheck",
+    # game suites (scripts/make_game_suites.py)
+    "place_mark", "take_stones", "guess_number", "play_move"})
 ROLES = frozenset({"system", "user", "assistant", "tool"})
 SEALED_MARKERS = ("heldout://", "sealed://", "heldout/", "sealed/")
 VERIFIED = frozenset({"LIVE", "PRIOR_VERIFIED_RUN"})
