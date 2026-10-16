@@ -20,6 +20,15 @@ from ..observability.events import CURRENT_RUN, Journal
 TASK_TOOL = "task"
 
 
+def _reply_text(result: Any) -> str:
+    """Text of a ``task`` tool result: a ToolMessage, or a Command carrying one."""
+    messages = getattr(result, "update", None)
+    messages = messages.get("messages") if isinstance(messages, dict) else None
+    last = messages[-1] if messages else result
+    content = getattr(last, "content", "")
+    return content if isinstance(content, str) else str(content)
+
+
 class SubagentConcurrencyMiddleware(AgentMiddleware):
     """Attach to the coordinator only; subagents never spawn subagents."""
 
@@ -50,6 +59,11 @@ class SubagentConcurrencyMiddleware(AgentMiddleware):
         with contextlib.suppress(Exception):
             role = str((request.tool_call.get("args") or {}).get("subagent_type", ""))
         self._emit("agent.start", {"role": role, "slot": slot})
+        brief = ""
+        with contextlib.suppress(Exception):
+            brief = str((request.tool_call.get("args") or {}).get("description", ""))
+        self._emit("a2a.message", {"from": "coordinator", "to": role, "kind": "brief",
+                                   "text": brief})
         return role, slot
 
     def _stop(self, role: str, slot: int, result: Any, failed: bool) -> None:
@@ -57,6 +71,9 @@ class SubagentConcurrencyMiddleware(AgentMiddleware):
             self._slots.discard(slot)
         ok = not failed and getattr(result, "status", None) != "error"
         self._emit("agent.end", {"role": role, "slot": slot, "ok": ok})
+        self._emit("a2a.message", {"from": role, "to": "coordinator", "kind": "result", "ok": ok,
+                                   "text": _reply_text(result) if not failed else
+                                   "subagent failed before returning a result"})
 
     def _emit(self, type: str, data: dict) -> None:
         if self.journal is None:

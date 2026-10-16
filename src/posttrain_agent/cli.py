@@ -6,11 +6,13 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from .agent import build_agent
 from .config import Settings
 from .observability.events import CURRENT_RUN, Journal
+from .observability.fold import a2a_conversation
 from .observability.journal_handler import JournalHandler
 from .observability.telemetry import summarize
 from .runtime.persistence import open_runtime
@@ -44,6 +46,17 @@ def _show(report: RunReport) -> int:
 
 async def _main(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
+    if args.cmd == "a2a":  # reads only the journal: no model or network
+        journal, events, since = Journal(settings.state_dir / "events.sqlite"), [], 0
+        while batch := journal.read(run=args.thread, since=since, limit=500):
+            events.extend(batch)
+            since = batch[-1].seq
+        out = json.dumps({"run": args.thread, "messages": a2a_conversation(events)}, indent=2)
+        if args.out:
+            Path(args.out).write_text(out + "\n")
+        else:
+            print(out)
+        return 0
     if args.cmd == "telemetry":  # needs no model or network
         print(json.dumps(summarize(settings.state_dir / "telemetry.jsonl", args.last,
                                    args.errors), indent=2))
@@ -101,6 +114,9 @@ def main() -> None:
     f.add_argument("--thread", default="default")
     f.add_argument("checkpoint")
     sub.add_parser("runs", help="show the run ledger")
+    a = sub.add_parser("a2a", help="export the agent-to-agent conversation of a run as JSON")
+    a.add_argument("--thread", default="default")
+    a.add_argument("--out", help="write to this file instead of stdout")
     t = sub.add_parser("telemetry", help="summarise model/tool telemetry")
     t.add_argument("--last", type=int, default=500)
     t.add_argument("--errors", action="store_true", help="only errors")

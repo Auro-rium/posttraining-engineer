@@ -136,7 +136,8 @@ async def test_two_parallel_subagents_get_slots_1_and_2_then_reuse(tmp_path):
     ends = [d for t, d in ev if t == "agent.end"]
     assert len(ends) == 4 and all(d["ok"] for d in ends[:3])
     assert ends[3] == {"role": "boom", "slot": 1, "ok": False}
-    assert "SECRET" not in repr(ev)
+    briefs = [d["text"] for t, d in ev if t == "a2a.message" and d["kind"] == "brief"]
+    assert briefs and set(briefs) == {"SECRET DESC"}  # A2A briefs are stored on purpose
 
 
 def test_sync_path_journals_and_non_task_calls_do_not(tmp_path):
@@ -145,7 +146,8 @@ def test_sync_path_journals_and_non_task_calls_do_not(tmp_path):
     mw.wrap_tool_call(SimpleNamespace(tool_call={"name": "recall", "args": {}}), lambda r: 1)
     assert j.read("r1") == []
     mw.wrap_tool_call(req("evaluator"), lambda r: 1)
-    assert [e.type for e in j.read("r1")] == ["agent.start", "agent.end"]
+    assert [e.type for e in j.read("r1")] == ["agent.start", "a2a.message", "agent.end",
+                                              "a2a.message"]
 
 
 # --- Task 4: run-controller and domain-tool events ---------------------------------------

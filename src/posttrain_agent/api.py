@@ -239,9 +239,7 @@ def create_app(
         require_journal()
         return {"runs": _runs_of(replay) if replay is not None else journal.runs()}  # type: ignore[union-attr]
 
-    @app.get("/v1/runs/{run_id}/snapshot", dependencies=[Depends(auth)])
-    def snapshot(run_id: str) -> dict[str, Any]:
-        require_journal()
+    def run_events(run_id: str) -> list[Event]:
         events: list[Event] = []
         since = 0
         while True:
@@ -251,11 +249,21 @@ def create_app(
                 else journal.read(run=run_id, since=since, limit=BATCH)  # type: ignore[union-attr]
             )
             if not batch:
-                break
+                return events
             events.extend(batch)
             since = batch[-1].seq
-        state = fold.snapshot(events)
+
+    @app.get("/v1/runs/{run_id}/snapshot", dependencies=[Depends(auth)])
+    def snapshot(run_id: str) -> dict[str, Any]:
+        require_journal()
+        state = fold.snapshot(run_events(run_id))
         return {"state": state, "last_seq": state.get("last_seq", 0)}
+
+    @app.get("/v1/runs/{run_id}/a2a", dependencies=[Depends(auth)])
+    def a2a(run_id: str) -> dict[str, Any]:
+        """The full agent-to-agent conversation of a run (the snapshot keeps only the last 100)."""
+        require_journal()
+        return {"run": run_id, "messages": fold.a2a_conversation(run_events(run_id))}
 
     @app.post("/v1/runs/{run_id}/decision", dependencies=[Depends(auth)])
     def decision(run_id: str) -> None:

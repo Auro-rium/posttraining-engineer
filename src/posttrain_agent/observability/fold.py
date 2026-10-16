@@ -17,6 +17,9 @@ Per-type effects:
   job.update           job merged key by key
   job.log              append {level, message} to job_log (last 50)
   approval.pending     approval = data;  approval.resolved: approval = null
+  a2a.message          append {from, to, kind, text, ok, text_len} (present keys only) to a2a
+                       (last 100). from/to/kind must be str, text str, ok bool, text_len int,
+                       otherwise the event is malformed.
   checkpoint           append {checkpoint_id, step}
   telemetry.snapshot   telemetry merged key by key
   model.call, tool.call  log only
@@ -38,6 +41,7 @@ in a summary. Fields per type:
   score: split checkpoint evidence | gate.verdict: decision | budget.update: price_known
   job.update: job_id status | job.log: level message | approval.pending: action
   approval.resolved: decision | checkpoint: checkpoint_id step | telemetry.snapshot: (empty)
+  a2a.message: from to kind
 """
 
 from __future__ import annotations
@@ -66,8 +70,11 @@ _SUMMARY_FIELDS: dict[str, tuple[str, ...]] = {
     "approval.pending": ("action",),
     "approval.resolved": ("decision",),
     "checkpoint": ("checkpoint_id", "step"),
+    "a2a.message": ("from", "to", "kind"),
     "telemetry.snapshot": (),
 }
+A2A_MAX = 100
+_A2A_KEYS = ("from", "to", "kind", "text", "ok", "text_len")
 _SCORE_KEYS = ("split", "checkpoint", "value", "n", "evidence")
 _GATE_KEYS = ("decision", "reasons", "champion_score", "candidate_score", "relative_improvement")
 
@@ -89,6 +96,7 @@ def empty_state() -> dict:
         "approval": None,
         "telemetry": {},
         "checkpoints": [],
+        "a2a": [],
         "last_seq": 0,
     }
 
@@ -189,6 +197,20 @@ def _apply(s: dict, typ: str, data: dict) -> bool:
         s["approval"] = dict(data)
     elif typ == "approval.resolved":
         s["approval"] = None
+    elif typ == "a2a.message":
+        if not all(isinstance(data.get(k), str) for k in ("from", "to", "kind")):
+            return False
+        if "text" in data and not isinstance(data["text"], str):
+            return False
+        if "ok" in data and not isinstance(data["ok"], bool):
+            return False
+        if "text_len" in data and not _is_int(data["text_len"]):
+            return False
+        msg = _pick(data, _A2A_KEYS)
+        if "text_len" in msg:
+            msg["text_len"] = int(msg["text_len"])
+        s["a2a"].append(msg)
+        del s["a2a"][:-A2A_MAX]
     elif typ == "checkpoint":
         s["checkpoints"].append(_pick(data, ("checkpoint_id", "step")))
     elif typ == "telemetry.snapshot":
@@ -221,3 +243,9 @@ def snapshot(events: list[Event]) -> dict:
     for ev in events:
         state = fold(state, ev)
     return state
+
+
+def a2a_conversation(events: list[Event]) -> list[dict]:
+    """The full (uncapped) agent-to-agent conversation of a run, as plain JSON."""
+    return [{"seq": e.seq, "ts": e.ts, **{k: e.data[k] for k in _A2A_KEYS if k in e.data}}
+            for e in events if e.type == "a2a.message"]

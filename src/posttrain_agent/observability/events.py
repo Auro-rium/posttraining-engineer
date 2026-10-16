@@ -1,8 +1,10 @@
 """Redacting append-only event journal feeding the live dashboard.
 
 Events are written to a SQLite file (WAL mode) and tailed by the read-only API. Only
-allow-listed fields per event type are stored: prompts, completions, message text, tool
-arguments and secrets never reach the journal. Writes are best-effort and never raise.
+allow-listed fields per event type are stored: prompts, completions, tool arguments and secrets
+never reach the journal. The one exception is ``a2a.message`` (the coordinator/subagent
+conversation), whose text is stored after secret scrubbing and a length cut. Writes are
+best-effort and never raise.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import contextvars
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import threading
@@ -52,13 +55,36 @@ _ALLOWED: dict[str, frozenset[str]] = {
     ),
     "approval.resolved": frozenset({"decision", "message_len"}),
     "checkpoint": frozenset({"checkpoint_id", "step"}),
+    # Agent-to-agent traffic: the coordinator's brief to a subagent and its reply. This is the one
+    # place message text is stored; it is scrubbed of secrets and cut to A2A_TEXT_MAX.
+    "a2a.message": frozenset({"from", "to", "kind", "text", "ok", "text_len"}),
     "telemetry.snapshot": frozenset(
         {"p50_ms", "p95_ms", "error_rate", "input_tokens", "output_tokens"}
     ),
 }
 EVENT_TYPES: frozenset[str] = frozenset(_ALLOWED)
 
+A2A_TEXT_MAX = 2000
+_SECRET_ENV = ("BACKBOARD_API_KEY", "NEBIUS_API_KEY", "TAVILY_API_KEY", "HF_TOKEN", "READ_TOKEN",
+               "TUNNEL_TOKEN")
+_SECRET_PATTERNS = (
+    re.compile(r"\b(?:sk|pk|hf|tvly|key)[-_][A-Za-z0-9_\-]{12,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"),
+    re.compile(r"(?i)\b(?:api[_-]?key|token|secret|password|authorization)\b\s*[=:]\s*\S+"),
+)
+
 _DROP = object()
+
+
+def scrub(text: str) -> str:
+    """Mask credentials in free text: known env secrets, key-shaped tokens, key=value pairs."""
+    for name in _SECRET_ENV:
+        value = os.environ.get(name, "")
+        if len(value) >= 8:
+            text = text.replace(value, "[redacted]")
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text
 
 
 def _clean(value: Any, depth: int) -> Any:
@@ -96,6 +122,11 @@ def sanitize(type: str, data: dict) -> dict | None:
     out: dict[str, Any] = {}
     for key, value in (data or {}).items():
         if key not in allowed:
+            continue
+        if type == "a2a.message" and key == "text":
+            if isinstance(value, str):
+                out["text_len"] = len(value)  # length before cutting, so the UI can show "cut"
+                out[key] = scrub(value)[:A2A_TEXT_MAX]
             continue
         cleaned = _clean(value, 1)
         if cleaned is not _DROP:

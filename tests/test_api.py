@@ -208,6 +208,23 @@ async def test_snapshot_equals_fold_of_stream(tmp_path):
     assert body["last_seq"] == 4
 
 
+async def test_a2a_endpoint_returns_full_uncapped_conversation_and_needs_auth(tmp_path):
+    j = Journal(tmp_path / "events.sqlite")
+    for i in range(130):  # more than the 100 the snapshot keeps
+        j.append("r", "a2a.message", {"from": "coordinator", "to": "benchmark", "kind": "brief",
+                                      "text": f"m{i}"})
+    j.append("other", "a2a.message", {"from": "x", "to": "y", "kind": "brief", "text": "no"})
+    app = make_app(tmp_path)
+    async with client(app) as c:
+        assert (await c.get("/v1/runs/r/a2a")).status_code == 401
+        body = (await c.get(f"/v1/runs/r/a2a?token={TOKEN}")).json()
+        snap = (await c.get(f"/v1/runs/r/snapshot?token={TOKEN}")).json()
+    assert body["run"] == "r" and len(body["messages"]) == 130
+    assert body["messages"][0]["text"] == "m0" and body["messages"][-1]["text"] == "m129"
+    assert {"seq", "ts", "from", "to", "kind", "text", "text_len"} <= body["messages"][0].keys()
+    assert len(snap["state"]["a2a"]) == 100
+
+
 async def test_reader_survives_concurrent_writer(tmp_path):
     j = Journal(tmp_path / "events.sqlite")
     n = 40
