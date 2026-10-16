@@ -10,11 +10,19 @@ from typing import Any
 
 from .agent import build_agent
 from .config import Settings
-from .events import CURRENT_RUN, Journal
-from .journal_handler import JournalHandler
-from .persistence import open_runtime
-from .replay import RunReport, decide, fork, history, ledger, pending_actions, run_with_recovery
-from .telemetry import summarize
+from .observability.events import CURRENT_RUN, Journal
+from .observability.journal_handler import JournalHandler
+from .observability.telemetry import summarize
+from .runtime.persistence import open_runtime
+from .runtime.replay import (
+    RunReport,
+    decide,
+    fork,
+    history,
+    ledger,
+    pending_actions,
+    run_with_recovery,
+)
 
 
 def _show(report: RunReport) -> int:

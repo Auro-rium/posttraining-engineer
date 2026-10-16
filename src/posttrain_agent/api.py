@@ -23,8 +23,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import fold
-from .events import Event
+from .observability import fold
+from .observability.events import Event
 
 MAX_REPLAY_SLEEP_S = 2.0
 BATCH = 500

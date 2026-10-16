@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from .config import Settings
+from ..config import Settings
 
 TAVILY = "https://api.tavily.com"
 _SEALED_MARKERS = ("heldout://", "sealed://")

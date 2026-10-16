@@ -46,7 +46,7 @@ import copy
 import math
 from typing import Any
 
-from posttrain_agent.events import EVENT_TYPES, Event
+from posttrain_agent.observability.events import EVENT_TYPES, Event
 
 LOG_MAX = 200
 JOB_LOG_MAX = 50

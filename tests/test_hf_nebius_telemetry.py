@@ -4,10 +4,10 @@ import httpx
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
-from posttrain_agent import telemetry
 from posttrain_agent.config import Settings
-from posttrain_agent.hf import hf_tools
-from posttrain_agent.nebius import NebiusBackend
+from posttrain_agent.experiments.nebius import NebiusBackend
+from posttrain_agent.observability import telemetry
+from posttrain_agent.tools.hf import hf_tools
 
 
 def aclient(handler):

@@ -4,8 +4,8 @@ import json
 import pytest
 from test_domain import ROW
 
-from posttrain_agent import budget, dataset
 from posttrain_agent.config import Settings
+from posttrain_agent.tools import budget, dataset
 
 
 def row(**over):

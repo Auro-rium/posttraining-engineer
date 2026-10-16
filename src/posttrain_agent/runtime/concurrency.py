@@ -15,7 +15,7 @@ from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 
-from .events import CURRENT_RUN, Journal
+from ..observability.events import CURRENT_RUN, Journal
 
 TASK_TOOL = "task"
 

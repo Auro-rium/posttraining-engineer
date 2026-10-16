@@ -75,8 +75,8 @@ PROMOTE or REJECT, with an evidence label on every number (LIVE | PRIOR_VERIFIED
 | `champion_manager` | `decide_promotion` | recall |
 
 Each role's system prompt is a file in `src/posttrain_agent/prompts/`, prefixed by a shared
-preamble in `subagents.py`. Most tools are deterministic Python (`domain.py`, `dataset.py`,
-`budget.py`, `nebius.py`). `web_*` and `hf_*` are read-only lookups against external services.
+preamble in `subagents.py`. Most tools are deterministic Python (`experiments/domain.py`, `tools/dataset.py`,
+`tools/budget.py`, `experiments/nebius.py`). `web_*` and `hf_*` are read-only lookups against external services.
 
 ### Parallel subagents
 
@@ -228,7 +228,7 @@ dataset verifier allows (`get_logs`, `inspect_service`, `read_config`, `edit_con
 are the same.
 
 The held-out and regression files are sealed. Agents receive only `{evidence, score, n}` for them.
-Task contents never leave `nebius.py`.
+Task contents never leave `experiments/nebius.py`.
 
 **4. Start a run.**
 
@@ -399,7 +399,7 @@ before submitting it, and reports its SHA-256 in the result.
 
 ## Hyperparameter search space
 
-Source: `HPARAM_SPACE` and `OPTIONAL_HPARAMS` in `src/posttrain_agent/domain.py`. Bounds are
+Source: `HPARAM_SPACE` and `OPTIONAL_HPARAMS` in `src/posttrain_agent/experiments/domain.py`. Bounds are
 inclusive. LoRA is always on.
 
 | Key | Type | Range | Required |
@@ -424,7 +424,7 @@ cannot reach Nebius.
 
 ## Budget model
 
-Source: `src/posttrain_agent/budget.py`.
+Source: `src/posttrain_agent/tools/budget.py`.
 
 1. **Tokens per row** is a heuristic: `max(1, chars // 4)`, where chars is the sum over messages of
    `len(content) + 16`, plus the tool name and arguments length for each tool call.
@@ -451,7 +451,7 @@ invoices. Reconcile against your Nebius billing before relying on the cap.
   accepts only `heldout` or `regression`, and returns only `evidence`, `score`, `n` and the seed
   (no per-task failures). Web queries containing `heldout://` or `sealed://` are refused, and
   dataset rows containing sealed markers are refused.
-- **Fail-closed promotion gate.** `decide_promotion` (`promotion_gate` in `domain.py`) returns
+- **Fail-closed promotion gate.** `decide_promotion` (`promotion_gate` in `experiments/domain.py`) returns
   `REJECT` unless all of the following hold:
   - both results have verified evidence (`LIVE` or `PRIOR_VERIFIED_RUN`);
   - suite, split and seed match between champion and candidate;
@@ -574,7 +574,7 @@ Job events come from `read_training_logs`.
 
 ### Add another training or evaluation provider
 
-Implement the `ExperimentBackend` protocol in `src/posttrain_agent/domain.py`:
+Implement the `ExperimentBackend` protocol in `src/posttrain_agent/experiments/domain.py`:
 
 ```python
 class ExperimentBackend(Protocol):
@@ -601,7 +601,7 @@ the CLI.
 
 1. Write a function with a docstring. The docstring is the tool description the model sees.
 2. Expose it. For a deterministic tool, add it to the dictionary returned by `make_tools` in
-   `domain.py`. For a web-style tool, add it to the dict returned by a factory, and merge that dict
+   `experiments/domain.py`. For a web-style tool, add it to the dict returned by a factory, and merge that dict
    into `tools` in `build_agent`.
 3. Give it to the roles that need it by adding its name to the `ROLES` tuple in `subagents.py`. Or
    add it to the coordinator's `tools` list in `build_agent`.
@@ -732,7 +732,7 @@ Read this before relying on the system.
 - [docs/architecture.md](docs/architecture.md): components, data flow, memory tiers, resilience
   middleware, the approval mechanism, replay, telemetry, and the Nebius API calls.
 - `.env.example`: every environment variable with a placeholder and a comment.
-- Source: `src/posttrain_agent/` (`agent.py` assembles the graph; `domain.py` holds the
+- Source: `src/posttrain_agent/` (`agent.py` assembles the graph; `experiments/domain.py` holds the
   deterministic rules).
 
 ## License

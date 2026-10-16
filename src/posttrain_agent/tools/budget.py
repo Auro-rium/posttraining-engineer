@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import Settings
+from ..config import Settings
 from .dataset import load_rows
 
 

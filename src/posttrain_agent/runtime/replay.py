@@ -20,8 +20,8 @@ from typing import Any
 from langgraph.store.base import BaseStore
 from langgraph.types import Command
 
-from .backboard_model import CassetteMiss
-from .events import CURRENT_RUN, Journal, emit
+from ..llm.backboard_model import CassetteMiss
+from ..observability.events import CURRENT_RUN, Journal, emit
 
 LEDGER_NS = ("posttrain", "runs")
 FATAL = (CassetteMiss, KeyboardInterrupt, asyncio.CancelledError)

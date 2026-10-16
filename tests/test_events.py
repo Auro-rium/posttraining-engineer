@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from posttrain_agent.events import CURRENT_RUN, EVENT_TYPES, Journal, sanitize
+from posttrain_agent.observability.events import CURRENT_RUN, EVENT_TYPES, Journal, sanitize
 
 
 def test_event_types_are_the_fifteen_in_the_spec():

@@ -5,9 +5,9 @@ from fakes import FakeBackboard, call, text
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 
-from posttrain_agent.budget_guard import BudgetGuard
 from posttrain_agent.config import Settings
-from posttrain_agent.resilience import build_model
+from posttrain_agent.llm.resilience import build_model
+from posttrain_agent.runtime.budget_guard import BudgetGuard
 
 
 @tool
@@ -55,7 +55,7 @@ async def test_model_is_told_to_wrap_up_near_the_cap_and_can_answer():
 
 
 async def test_run_wide_ledger_caps_all_agents_and_survives_restart(tmp_path):
-    from posttrain_agent.budget_guard import RunTokenLedger
+    from posttrain_agent.runtime.budget_guard import RunTokenLedger
     path = tmp_path / "tokens.json"
     log: list = []
     ledger = RunTokenLedger(path, max_tokens=1)

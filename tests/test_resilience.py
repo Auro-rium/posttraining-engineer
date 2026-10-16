@@ -9,7 +9,7 @@ from fakes import FakeBackboard, text
 from langchain.agents import create_agent
 
 from posttrain_agent.config import Settings
-from posttrain_agent.resilience import build_middleware, build_model, is_transient
+from posttrain_agent.llm.resilience import build_middleware, build_model, is_transient
 
 
 def test_transient_classification():

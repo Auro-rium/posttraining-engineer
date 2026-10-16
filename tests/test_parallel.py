@@ -9,11 +9,11 @@ import pytest
 from fakes import FakeBackboard, text
 
 from posttrain_agent.agent import build_agent
-from posttrain_agent.concurrency import SubagentConcurrencyMiddleware
 from posttrain_agent.config import Settings
-from posttrain_agent.domain import LocalStubBackend
-from posttrain_agent.persistence import open_runtime
-from posttrain_agent.replay import run_with_recovery
+from posttrain_agent.experiments.domain import LocalStubBackend
+from posttrain_agent.runtime.concurrency import SubagentConcurrencyMiddleware
+from posttrain_agent.runtime.persistence import open_runtime
+from posttrain_agent.runtime.replay import run_with_recovery
 
 
 def req(name):
@@ -124,8 +124,8 @@ async def test_two_paused_launches_are_both_answered_by_one_decision(tmp_path):
     from test_approval import settings as approval_settings
     from test_domain import GOOD
 
-    from posttrain_agent import budget
-    from posttrain_agent.replay import decide
+    from posttrain_agent.runtime.replay import decide
+    from posttrain_agent.tools import budget
 
     def two_executors():
         return {"content": "", "status": "REQUIRES_ACTION", "tool_calls": [

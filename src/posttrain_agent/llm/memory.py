@@ -16,7 +16,7 @@ from typing import Any
 from backboard import BackboardClient
 from langchain_core.tools import BaseTool, StructuredTool
 
-from .config import Settings
+from ..config import Settings
 
 
 def _factory(settings: Settings, client_factory: Callable[[], Any] | None) -> Callable[[], Any]:

@@ -9,8 +9,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from posttrain_agent import api, fold
-from posttrain_agent.events import Event, Journal
+from posttrain_agent import api
+from posttrain_agent.observability import fold
+from posttrain_agent.observability.events import Event, Journal
 
 TOKEN = "s3cret"
 ORIGIN = "https://dash.example.com"

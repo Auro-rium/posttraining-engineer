@@ -20,8 +20,8 @@ from langchain.agents.middleware import (
     ToolRetryMiddleware,
 )
 
+from ..config import Settings
 from .backboard_model import CassetteMiss, ChatBackboard
-from .config import Settings
 
 
 def is_transient(exc: Exception) -> bool:

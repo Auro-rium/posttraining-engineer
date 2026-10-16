@@ -5,12 +5,12 @@ import json
 from fakes import FakeBackboard, call, text
 from test_domain import GOOD, ROW
 
-from posttrain_agent import budget
 from posttrain_agent.agent import build_agent
 from posttrain_agent.config import Settings
-from posttrain_agent.dataset import save_rows
-from posttrain_agent.persistence import open_runtime
-from posttrain_agent.replay import decide, ledger, pending_actions, run_with_recovery
+from posttrain_agent.runtime.persistence import open_runtime
+from posttrain_agent.runtime.replay import decide, ledger, pending_actions, run_with_recovery
+from posttrain_agent.tools import budget
+from posttrain_agent.tools.dataset import save_rows
 
 
 def settings(tmp_path, **kw):

@@ -8,9 +8,9 @@ from uuid import uuid4
 
 import pytest
 
-from posttrain_agent.concurrency import SubagentConcurrencyMiddleware
-from posttrain_agent.events import CURRENT_RUN, Journal
-from posttrain_agent.journal_handler import JournalHandler
+from posttrain_agent.observability.events import CURRENT_RUN, Journal
+from posttrain_agent.observability.journal_handler import JournalHandler
+from posttrain_agent.runtime.concurrency import SubagentConcurrencyMiddleware
 
 
 @pytest.fixture(autouse=True)
@@ -150,14 +150,14 @@ def test_sync_path_journals_and_non_task_calls_do_not(tmp_path):
 
 # --- Task 4: run-controller and domain-tool events ---------------------------------------
 
-from fakes import text  # noqa: E402
-from test_approval import LAUNCH, factory  # noqa: E402
-from test_approval import settings as approval_settings  # noqa: E402
+from fakes import text
+from test_approval import LAUNCH, factory
+from test_approval import settings as approval_settings
 
-from posttrain_agent.agent import build_agent  # noqa: E402
-from posttrain_agent.domain import LocalStubBackend, make_tools  # noqa: E402
-from posttrain_agent.persistence import open_runtime  # noqa: E402
-from posttrain_agent.replay import decide, parse_estimate_usd, run_with_recovery  # noqa: E402
+from posttrain_agent.agent import build_agent
+from posttrain_agent.experiments.domain import LocalStubBackend, make_tools
+from posttrain_agent.runtime.persistence import open_runtime
+from posttrain_agent.runtime.replay import decide, parse_estimate_usd, run_with_recovery
 
 
 def _is_subsequence(want, got):
@@ -259,7 +259,7 @@ def test_sample_journal_has_every_event_type_and_only_simulated_evidence(tmp_pat
     import sys
     from pathlib import Path
 
-    from posttrain_agent.events import EVENT_TYPES
+    from posttrain_agent.observability.events import EVENT_TYPES
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from make_sample_journal import make_sample

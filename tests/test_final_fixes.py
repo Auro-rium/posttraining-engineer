@@ -8,12 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from posttrain_agent import budget as budget_mod
 from posttrain_agent import cli
-from posttrain_agent.backboard_model import CassetteMiss
-from posttrain_agent.domain import LocalStubBackend, make_tools
-from posttrain_agent.events import CURRENT_RUN, Journal
-from posttrain_agent.replay import run_with_recovery
+from posttrain_agent.experiments.domain import LocalStubBackend, make_tools
+from posttrain_agent.llm.backboard_model import CassetteMiss
+from posttrain_agent.observability.events import CURRENT_RUN, Journal
+from posttrain_agent.runtime.replay import run_with_recovery
+from posttrain_agent.tools import budget as budget_mod
 
 
 class _Graph:

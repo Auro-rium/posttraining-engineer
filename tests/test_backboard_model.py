@@ -4,7 +4,7 @@ from fakes import FakeBackboard, call, text
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
-from posttrain_agent.backboard_model import Cassette, CassetteMiss, ChatBackboard
+from posttrain_agent.llm.backboard_model import Cassette, CassetteMiss, ChatBackboard
 
 
 @tool
@@ -58,7 +58,7 @@ async def test_sync_invoke_inside_running_loop():
 
 
 async def test_empty_response_raises():
-    from posttrain_agent.backboard_model import EmptyResponseError
+    from posttrain_agent.llm.backboard_model import EmptyResponseError
 
     with pytest.raises(EmptyResponseError):
         await model([text("")]).ainvoke([HumanMessage("x")])
@@ -84,7 +84,7 @@ async def test_server_error_propagates():
 
 
 def test_ai_message_with_text_and_calls_renders():
-    from posttrain_agent.backboard_model import render_messages
+    from posttrain_agent.llm.backboard_model import render_messages
 
     ai = AIMessage("thinking", tool_calls=[{"name": "add", "args": {"a": 1}, "id": "c1"}])
     _, body = render_messages([HumanMessage("q"), ai])

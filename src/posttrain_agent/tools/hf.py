@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 import httpx
 
-from .config import Settings
+from ..config import Settings
 
 HUB = "https://huggingface.co/api"
 

@@ -5,8 +5,8 @@ from fakes import FakeBackboard, call, text
 
 from posttrain_agent.agent import build_agent
 from posttrain_agent.config import Settings
-from posttrain_agent.persistence import open_runtime
-from posttrain_agent.replay import fork, history, ledger, run_with_recovery
+from posttrain_agent.runtime.persistence import open_runtime
+from posttrain_agent.runtime.replay import fork, history, ledger, run_with_recovery
 
 
 def settings(tmp_path, **kw):

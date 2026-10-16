@@ -21,17 +21,17 @@ for p in (ROOT / "src", ROOT / "tests"):  # the fake model client lives with the
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from fakes import FakeBackboard, call, text  # noqa: E402
-from test_domain import GOOD, ROW  # noqa: E402
+from fakes import FakeBackboard, call, text
+from test_domain import GOOD, ROW
 
-from posttrain_agent.agent import build_agent  # noqa: E402
-from posttrain_agent.config import Settings  # noqa: E402
-from posttrain_agent.dataset import save_rows  # noqa: E402
-from posttrain_agent.domain import LocalStubBackend, make_tools  # noqa: E402
-from posttrain_agent.events import CURRENT_RUN, Journal, emit  # noqa: E402
-from posttrain_agent.journal_handler import JournalHandler  # noqa: E402
-from posttrain_agent.persistence import open_runtime  # noqa: E402
-from posttrain_agent.replay import decide, run_with_recovery  # noqa: E402
+from posttrain_agent.agent import build_agent
+from posttrain_agent.config import Settings
+from posttrain_agent.experiments.domain import LocalStubBackend, make_tools
+from posttrain_agent.observability.events import CURRENT_RUN, Journal, emit
+from posttrain_agent.observability.journal_handler import JournalHandler
+from posttrain_agent.runtime.persistence import open_runtime
+from posttrain_agent.runtime.replay import decide, run_with_recovery
+from posttrain_agent.tools.dataset import save_rows
 
 RUN = "sample-simulated-run"
 SAMPLE_T0 = 1_760_000_000.0  # fixed start time (2025-10-09) so output is deterministic

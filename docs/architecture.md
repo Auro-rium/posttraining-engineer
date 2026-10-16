@@ -10,22 +10,23 @@ the code as it is; see the README "Status and limitations" section for what is u
 | Module | Responsibility |
 |--------|----------------|
 | `agent.py` | `build_agent` assembles the deep agent: model, middleware, tools, subagents, memory, checkpointer, store, and the approval interrupt. Holds `ORCHESTRATOR_PROMPT` and `default_backend`. |
-| `concurrency.py` | `SubagentConcurrencyMiddleware`: semaphore capping concurrent `task` calls at `POSTTRAIN_MAX_PARALLEL`. Attached to the coordinator only. |
-| `cli.py` | `posttrain` command. Opens the runtime, builds the agent, and dispatches to `replay.py` and `telemetry.py`. |
+| `runtime/concurrency.py` | `SubagentConcurrencyMiddleware`: semaphore capping concurrent `task` calls at `POSTTRAIN_MAX_PARALLEL`. Attached to the coordinator only. |
+| `runtime/budget_guard.py` | `BudgetGuard` middleware (per-invocation model-call and token caps, wrap-up warning at 75%, clean `BUDGET_EXHAUSTED` stop) and `RunTokenLedger` (persisted per-run token total, default 2M). On the coordinator and every subagent. |
+| `cli.py` | `posttrain` command. Opens the runtime, builds the agent, and dispatches to `runtime/replay.py` and `observability/telemetry.py`. |
 | `config.py` | `Settings` dataclass and `Settings.from_env()`. The only place environment variables are read. |
-| `backboard_model.py` | `ChatBackboard` (LangChain chat model over the Backboard API), `Cassette` (record/replay store), and transcript rendering. |
-| `resilience.py` | `is_transient`, `build_model`, and `build_middleware` (fallback, retry, tool retry). |
-| `memory.py` | `ensure_assistant` (persistent Backboard assistant) and the `remember` / `recall` tools. |
-| `persistence.py` | `open_runtime`: LangGraph SQLite checkpointer, SQLite store, and the composite file backend with `/memories/` routed to the store. Seeds `/memories/AGENTS.md`. |
+| `llm/backboard_model.py` | `ChatBackboard` (LangChain chat model over the Backboard API), `Cassette` (record/replay store), and transcript rendering. |
+| `llm/resilience.py` | `is_transient`, `build_model`, and `build_middleware` (fallback, retry, tool retry). |
+| `llm/memory.py` | `ensure_assistant` (persistent Backboard assistant) and the `remember` / `recall` tools. |
+| `runtime/persistence.py` | `open_runtime`: LangGraph SQLite checkpointer, SQLite store, and the composite file backend with `/memories/` routed to the store. Seeds `/memories/AGENTS.md`. |
 | `subagents.py` | `ROLES`: the eight role contracts (prompt file, description, tool names, memory access). `build_subagents` turns them into deepagents `SubAgent` specs. |
-| `domain.py` | `Protocol ExperimentBackend`, `LocalStubBackend`, `validate_hparams`, `promotion_gate`, and `make_tools` (the deterministic tool functions). |
-| `dataset.py` | Chat-format SFT verification (`verify_rows`), safe file references (`resolve`), load and save. |
-| `budget.py` | Token heuristic, cost estimate, `spend.jsonl` ledger, `within_budget`. |
-| `nebius.py` | `NebiusBackend`: fine-tuning jobs and deterministic scoring over the Nebius REST API. |
-| `web.py` | Tavily `web_search` and `web_extract`. |
-| `hf.py` | Hugging Face Hub `hf_search`, `hf_model_info`, `hf_dataset_info`. |
-| `replay.py` | `run_with_recovery`, `decide`, `pending_actions`, `history`, `fork`, `ledger`; the run ledger. |
-| `telemetry.py` | `TelemetryHandler` (LangChain callback that writes JSONL events) and `summarize` / `telemetry_tool`. |
+| `experiments/domain.py` | `Protocol ExperimentBackend`, `LocalStubBackend`, `validate_hparams`, `promotion_gate`, and `make_tools` (the deterministic tool functions). |
+| `tools/dataset.py` | Chat-format SFT verification (`verify_rows`), safe file references (`resolve`), load and save. |
+| `tools/budget.py` | Token heuristic, cost estimate, `spend.jsonl` ledger, `within_budget`. |
+| `experiments/nebius.py` | `NebiusBackend`: fine-tuning jobs and deterministic scoring over the Nebius REST API. |
+| `tools/web.py` | Tavily `web_search` and `web_extract`. |
+| `tools/hf.py` | Hugging Face Hub `hf_search`, `hf_model_info`, `hf_dataset_info`. |
+| `runtime/replay.py` | `run_with_recovery`, `decide`, `pending_actions`, `history`, `fork`, `ledger`; the run ledger. |
+| `observability/telemetry.py` | `TelemetryHandler` (LangChain callback that writes JSONL events) and `summarize` / `telemetry_tool`. |
 | `prompts/*.md` | Per-role system prompts, appended to the shared preamble in `subagents.py`. |
 
 ## Data flow
@@ -182,7 +183,7 @@ successful submission, `record_spend` appends to `spend.jsonl`.
 
 ## Replay module
 
-`replay.py` provides the operations on a thread.
+`runtime/replay.py` provides the operations on a thread.
 
 | Function | Behaviour |
 |----------|-----------|
@@ -195,7 +196,7 @@ successful submission, `record_spend` appends to `spend.jsonl`.
 
 The run ledger is written by `_record` at the start of each attempt and at the end of the run.
 
-### Cassette (`backboard_model.py`)
+### Cassette (`llm/backboard_model.py`)
 
 `Cassette` is a JSONL file of `{"key", "response"}` rows.
 
@@ -227,7 +228,7 @@ exception messages are not written; only the exception class name is.
 and `recent_errors` (last five). `only_errors` drops `by_name`. `telemetry_tool` exposes the same
 summary to the coordinator as `read_telemetry`. The `telemetry` CLI command runs without a key.
 
-## Nebius API calls (`nebius.py`)
+## Nebius API calls (`experiments/nebius.py`)
 
 The base URL is `NEBIUS_BASE_URL` (default `https://api.tokenfactory.nebius.com/v1`). Each request sends
 `Authorization: Bearer <NEBIUS_API_KEY>` and uses a synchronous `httpx.Client` with a 120-second timeout.
@@ -262,7 +263,7 @@ hyperparameter and dataset validation, the approval gate, the budget, and the pr
 
 ## Parallel subagents
 
-`SubagentConcurrencyMiddleware` (`concurrency.py`) is attached to the coordinator only. Each `task`
+`SubagentConcurrencyMiddleware` (`runtime/concurrency.py`) is attached to the coordinator only. Each `task`
 tool call acquires a slot from a semaphore sized by `POSTTRAIN_MAX_PARALLEL` (default `2`, values
 below 1 read as 1). When the coordinator emits several `task` calls in one message, LangGraph runs
 them concurrently. Calls beyond the limit wait for a slot; none are dropped.

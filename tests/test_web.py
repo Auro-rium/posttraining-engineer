@@ -2,7 +2,7 @@ import httpx
 
 from posttrain_agent.config import Settings
 from posttrain_agent.subagents import ROLES
-from posttrain_agent.web import web_tools
+from posttrain_agent.tools.web import web_tools
 
 
 def tools(handler, key="k"):

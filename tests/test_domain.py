@@ -1,7 +1,12 @@
 import json
 
 from posttrain_agent.config import Settings
-from posttrain_agent.domain import LocalStubBackend, make_tools, promotion_gate, validate_hparams
+from posttrain_agent.experiments.domain import (
+    LocalStubBackend,
+    make_tools,
+    promotion_gate,
+    validate_hparams,
+)
 
 GOOD = {"lora_r": 16, "lora_alpha": 32, "lora_dropout": 0.05, "learning_rate": 2e-4,
         "n_epochs": 3, "batch_size": 8, "context_length": 8192}

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from posttrain_agent.events import Event
-from posttrain_agent.fold import empty_state, fold, snapshot
+from posttrain_agent.observability.events import Event
+from posttrain_agent.observability.fold import empty_state, fold, snapshot
 
 GOLDEN = json.loads((Path(__file__).parent.parent / "contract" / "golden.json").read_text())
 

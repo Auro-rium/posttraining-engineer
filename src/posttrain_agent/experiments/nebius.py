@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 
-from .config import Settings
+from ..config import Settings
 
 MAX_TASKS = 200
 TERMINAL = {"succeeded", "failed", "cancelled"}

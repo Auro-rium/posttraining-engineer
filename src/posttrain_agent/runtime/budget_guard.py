@@ -16,15 +16,14 @@ import json
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NotRequired
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain.agents.middleware.types import PrivateStateAttr, hook_config
 from langchain_core.messages import AIMessage, SystemMessage
 from langgraph.channels.untracked_value import UntrackedValue
-from typing_extensions import NotRequired
 
-from .events import CURRENT_RUN
+from ..observability.events import CURRENT_RUN
 
 WARN_AT = 0.75  # fraction of either cap after which the model is told to wrap up
 
