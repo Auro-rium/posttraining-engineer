@@ -125,8 +125,9 @@ def sanitize(type: str, data: dict) -> dict | None:
             continue
         if type == "a2a.message" and key == "text":
             if isinstance(value, str):
-                out["text_len"] = len(value)  # length before cutting, so the UI can show "cut"
-                out[key] = scrub(value)[:A2A_TEXT_MAX]
+                clean = scrub(value)
+                out["text_len"] = len(clean)  # length before cutting, so the UI shows "cut" only if cut
+                out[key] = clean[:A2A_TEXT_MAX]
             continue
         cleaned = _clean(value, 1)
         if cleaned is not _DROP:
