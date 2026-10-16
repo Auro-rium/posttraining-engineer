@@ -47,7 +47,11 @@ services:
       - path: .env
         required: false
     environment:
-      STATE_DIR: /state
+      # `environment` beats env_file, so a relative path in .env cannot point the agent at the
+      # read-only image filesystem.
+      POSTTRAIN_STATE_DIR: /state
+      POSTTRAIN_DATA_DIR: /state/data
+      POSTTRAIN_SUITE_DIR: /state/suite
     volumes:
       - ./state:/state  # the only host path the agent can see
     read_only: true
