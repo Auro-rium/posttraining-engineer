@@ -23,6 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .config import load_dotenv
 from .observability import fold
 from .observability.events import Event
 
@@ -311,6 +312,7 @@ def create_app(
 
 
 def main() -> None:
+    load_dotenv()  # ./.env fills in anything not already exported (entry point only)
     token = os.environ.get("READ_TOKEN", "")
     if not token:
         print(

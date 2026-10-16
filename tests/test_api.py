@@ -275,7 +275,8 @@ async def test_decision_endpoint_is_501(tmp_path):
     assert r.status_code == 501
 
 
-def test_main_refuses_to_start_without_read_token(monkeypatch, capsys):
+def test_main_refuses_to_start_without_read_token(monkeypatch, capsys, tmp_path):
+    monkeypatch.chdir(tmp_path)  # no ./.env here, so main() cannot pick up a real READ_TOKEN
     monkeypatch.delenv("READ_TOKEN", raising=False)
     with pytest.raises(SystemExit) as ei:
         api.main()
