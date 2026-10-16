@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { History, RunView } from "../lib/connection";
 import type { RunState } from "../lib/events";
 import { foldEvent } from "../lib/reducer";
+import { A2APanel } from "./A2APanel";
 import { AgentBoard } from "./AgentBoard";
 import { ApprovalBanner } from "./ApprovalBanner";
 import { type BlipKind, SoundToggle, useBlips } from "./Blips";
@@ -84,6 +85,7 @@ export function DashboardView({ view, runId }: { view: RunView; runId?: string }
           <JobPanel state={state} />
         </aside>
       </main>
+      <A2APanel state={state} runId={runId} simulated={view.mode === "REPLAY" && view.source === "sample"} />
       <div className="grid-bottom">
         <JobLog state={state} />
         <Telemetry state={state} history={shownHistory} />

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import goldenJson from "../../contract/golden.json";
 import { EVENT_TYPES, type RunState } from "./events";
-import { emptyState, foldEvent } from "./reducer";
+import { A2A_MAX, emptyState, foldEvent } from "./reducer";
 
 type Case = {
   name: string;
@@ -60,12 +60,13 @@ describe("golden fixtures", () => {
 });
 
 describe("reducer", () => {
-  it("exposes the 15 event types and exactly the fold.py state keys", () => {
-    expect(EVENT_TYPES).toHaveLength(15);
+  it("exposes the 16 event types and exactly the fold.py state keys", () => {
+    expect(EVENT_TYPES).toHaveLength(16);
+    expect(EVENT_TYPES).toContain("a2a.message");
     expect(STATE_KEYS.sort()).toStrictEqual(
       [
         "status", "attempt", "backend", "experiment", "agents", "active_slots", "log", "scores",
-        "gate", "budget", "job", "job_log", "approval", "telemetry", "checkpoints", "last_seq",
+        "gate", "budget", "job", "job_log", "approval", "telemetry", "checkpoints", "a2a", "last_seq",
       ].sort(),
     );
   });
@@ -174,5 +175,91 @@ describe("reducer", () => {
     ]);
     expect(Object.is(s.attempt, 0)).toBe(true);
     expect(s.active_slots).toStrictEqual([9, 10]);
+  });
+});
+
+describe("a2a.message", () => {
+  const msg = (seq: number, data: Record<string, unknown>) => ({ seq, ts: 100 + seq, run: "r", type: "a2a.message", data });
+  const brief = { from: "coordinator", to: "evaluator", kind: "brief", text: "go", text_len: 2 };
+
+  it("appends present keys only, in order, and logs from/to/kind", () => {
+    const s = foldAll([
+      msg(1, brief),
+      msg(2, { from: "evaluator", to: "coordinator", kind: "result", ok: false }),
+      msg(3, { from: "x", to: "y", kind: "note", extra: [1, 2], text: "" }),
+    ]);
+    expect(s.a2a).toStrictEqual([
+      brief,
+      { from: "evaluator", to: "coordinator", kind: "result", ok: false },
+      { from: "x", to: "y", kind: "note", text: "" },
+    ]);
+    expect(Object.keys(s.a2a[0])).toStrictEqual(["from", "to", "kind", "text", "text_len"]);
+    expect(s.log.map((e) => e.summary)).toStrictEqual([
+      "from=coordinator to=evaluator kind=brief",
+      "from=evaluator to=coordinator kind=result",
+      "from=x to=y kind=note",
+    ]);
+    expect(s.last_seq).toBe(3);
+  });
+
+  it("ignores malformed messages entirely (no state, log or last_seq change)", () => {
+    const base = foldEvent(emptyState(), msg(1, brief));
+    const bad: Record<string, unknown>[] = [
+      {},
+      { to: "b", kind: "brief" },
+      { from: "a", kind: "brief" },
+      { from: "a", to: "b" },
+      { from: 1, to: "b", kind: "brief" },
+      { from: "a", to: null, kind: "brief" },
+      { from: "a", to: "b", kind: true },
+      { from: "a", to: "b", kind: "brief", text: null },
+      { from: "a", to: "b", kind: "brief", text: 5 },
+      { from: "a", to: "b", kind: "brief", text: ["x"] },
+      { from: "a", to: "b", kind: "result", ok: "yes" },
+      { from: "a", to: "b", kind: "result", ok: null },
+      { from: "a", to: "b", kind: "result", ok: 1 },
+      { from: "a", to: "b", kind: "brief", text_len: 1.5 },
+      { from: "a", to: "b", kind: "brief", text_len: "3" },
+      { from: "a", to: "b", kind: "brief", text_len: true },
+      { from: "a", to: "b", kind: "brief", text_len: null },
+    ];
+    for (const data of bad) {
+      expect(foldEvent(base, msg(2, data)), JSON.stringify(data)).toBe(base);
+    }
+  });
+
+  it("int rule: an integer-valued text_len is stored as an int, -0 as 0", () => {
+    const s = foldAll([
+      msg(1, { ...brief, text_len: 2.0 }),
+      msg(2, { ...brief, text_len: -0 }),
+      msg(3.0, { ...brief, text_len: 1e3 }),
+    ]);
+    expect(s.a2a.map((m) => m.text_len)).toStrictEqual([2, 0, 1000]);
+    expect(Object.is(s.a2a[1].text_len, 0)).toBe(true);
+    expect(s.last_seq).toBe(3);
+  });
+
+  it(`keeps the last ${A2A_MAX} messages`, () => {
+    const events = Array.from({ length: A2A_MAX + 1 }, (_, i) => msg(i + 1, { ...brief, text: `m${i + 1}` }));
+    const s = foldAll(events);
+    expect(s.a2a).toHaveLength(A2A_MAX);
+    expect(s.a2a[0].text).toBe("m2");
+    expect(s.a2a.at(-1)!.text).toBe(`m${A2A_MAX + 1}`);
+    expect(s.last_seq).toBe(A2A_MAX + 1);
+  });
+
+  it("a duplicate or stale seq is ignored", () => {
+    const s = foldAll([msg(1, brief), msg(2, { ...brief, text: "second" })]);
+    expect(foldEvent(s, msg(2, { ...brief, text: "dup" }))).toBe(s);
+    expect(foldEvent(s, msg(1, { ...brief, text: "stale" }))).toBe(s);
+    expect(s.a2a.map((m) => m.text)).toStrictEqual(["go", "second"]);
+  });
+
+  it("does not alias event data or pollute prototypes", () => {
+    const data = { from: "__proto__", to: "constructor", kind: "brief", text: "t" };
+    const s = foldEvent(emptyState(), msg(1, data));
+    data.text = "changed";
+    expect(s.a2a[0]).toStrictEqual({ from: "__proto__", to: "constructor", kind: "brief", text: "t" });
+    expect(Object.getPrototypeOf(s.a2a[0])).toBe(Object.prototype);
   });
 });

@@ -72,6 +72,19 @@ LIVE.
 Under `prefers-reduced-motion: reduce` every animation and transition is off; the content is the
 same.
 
+## A2A conversation panel
+
+The `A2A CONVERSATION` panel shows the `a2a.message` events: the coordinator's brief to each
+subagent (left, amber) and the subagent's reply (right, cyan), oldest first, following the newest
+message while scrolled to the bottom. Each message shows `from → to`, a `BRIEF`/`RESULT` badge,
+`✓ ok`/`✗ fail` on results and the text as plain text (a text that is a whole JSON object is
+pretty-printed). Text longer than 6 lines starts collapsed. The backend scrubs secrets and cuts
+text at 2000 chars; a cut message says `cut: showing N of M chars`. The panel shows the snapshot's
+last 100 messages and follows the timeline scrubber. `export JSON` downloads the messages on
+screen as `{run, messages}` (without `seq`/`ts`; for the full, uncapped conversation use
+`GET /v1/runs/{id}/a2a` or `posttrain a2a`). In the bundled sample the conversation is simulated
+and badged `SIMULATED`.
+
 ## Tests
 
 ```bash

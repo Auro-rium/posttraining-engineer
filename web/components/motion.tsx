@@ -73,9 +73,12 @@ export function CountUp({ value, digits = 2, animate = true, className }: CountU
       setShown(value);
       return;
     }
-    const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+    // t0 is the first frame's own timestamp: rAF time and performance.now() need not share a clock
+    // (jsdom's differ under load, which stalled the count).
+    let t0: number | null = null;
     let raf = 0;
     const step = (now: number) => {
+      if (t0 === null) t0 = now;
       const p = Math.min(1, Math.max(0, (now - t0) / COUNT_UP_MS));
       const eased = 1 - (1 - p) ** 3;
       const v = p >= 1 ? value : from + (value - from) * eased;

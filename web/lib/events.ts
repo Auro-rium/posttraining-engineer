@@ -15,6 +15,7 @@ export const EVENT_TYPES = [
   "approval.pending",
   "approval.resolved",
   "checkpoint",
+  "a2a.message",
   "telemetry.snapshot",
 ] as const;
 
@@ -56,6 +57,20 @@ export type JobLogLine = Partial<{ level: Json; message: Json }>;
 export type Checkpoint = Partial<{ checkpoint_id: Json; step: Json }>;
 export type Experiment = Partial<{ goal_len: Json; experiment_budget: Json }>;
 
+/**
+ * One agent-to-agent message (fold.py `a2a.message`): the coordinator's brief to a subagent or the
+ * subagent's reply. Optional keys are present only when the event carried them. `text` is
+ * secret-scrubbed and may be cut; `text_len` is its length (in code points) before cutting.
+ */
+export type A2AMessage = {
+  from: string;
+  to: string;
+  kind: string;
+  text?: string;
+  ok?: boolean;
+  text_len?: number;
+};
+
 /** Exactly the keys of fold.py `empty_state()`. */
 export type RunState = {
   status: string | null;
@@ -73,5 +88,7 @@ export type RunState = {
   approval: JsonObject | null;
   telemetry: JsonObject;
   checkpoints: Checkpoint[];
+  /** The last A2A_MAX (100) agent-to-agent messages, oldest first. */
+  a2a: A2AMessage[];
   last_seq: number;
 };

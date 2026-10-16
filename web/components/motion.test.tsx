@@ -271,6 +271,7 @@ describe("motion and accessibility", () => {
       pairs.push([fg, "bg"], [fg, "bg-glow"]);
     }
     pairs.push(["amber", "amber-bg"], ["bg", "red"]); // approval banner / RECONNECTING; AUTH FAILED
+    for (const fg of ["green", "green-dim", "amber", "cyan", "red"]) pairs.push([fg, "code-bg"]); // A2A text blocks
     for (const [fg, bg] of pairs) {
       expect(ratio(token(fg), token(bg)), `--${fg} on --${bg}`).toBeGreaterThanOrEqual(4.5);
     }

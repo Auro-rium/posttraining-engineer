@@ -20,6 +20,7 @@
   --cyan: #55aadd;
   --red: #ff5a5a;
   --track: #101a12;
+  --code-bg: #0a120c; /* A2A message text blocks; contrast of every text token on it is tested */
   --focus: #ffb000;
   --glow-green: 0 0 6px rgba(125, 255, 155, 0.45);
   --glow-amber: 0 0 6px rgba(255, 176, 0, 0.4);
@@ -287,6 +288,44 @@ button { font: inherit; }
 .live-btn:not(:disabled):hover { background: var(--amber); color: var(--bg); }
 .live-btn:disabled { color: var(--green-dim); border-color: var(--green-dim); cursor: default; }
 
+/* ---------- A2A conversation: coordinator on the left (amber, as on the agent board), subagents
+   on the right (cyan). Text is untrusted model output: rendered as text, wrapped, never widened. */
+.a2a { border-top: 1px solid var(--panel-border); }
+.a2a .panel-title { flex-wrap: wrap; }
+.a2a-count { letter-spacing: 0; }
+.a2a-sim { padding: 0 4px; border: 1px solid var(--amber); color: var(--amber); font-weight: 600; letter-spacing: 0.04em; }
+.a2a-export, .a2a-toggle {
+  background: none; color: var(--green-dim); border: 1px solid var(--panel-border);
+  padding: 0 6px; cursor: pointer; letter-spacing: 0.04em; font-size: 11px;
+}
+.a2a-export { order: 1; }
+.a2a .panel-title::after { order: 0; }
+.a2a-export:not(:disabled):hover, .a2a-toggle:hover { color: var(--green); border-color: var(--green-dim); }
+.a2a-export:disabled { cursor: default; }
+.a2a-scroll { display: flex; flex-direction: column-reverse; max-height: 55vh; overflow-y: auto; scrollbar-color: var(--panel-border) transparent; }
+.a2a-list { display: flex; flex-direction: column; gap: 8px; padding: 2px 0; }
+.a2a-msg {
+  min-width: 0; max-width: 82%; padding: 4px 8px; border: 1px solid var(--panel-border);
+  animation: row-in 0.45s ease-out both;
+}
+.a2a-coord { align-self: flex-start; border-left: 3px solid var(--amber); }
+.a2a-sub { align-self: flex-end; border-right: 3px solid var(--cyan); }
+.a2a-head { overflow-wrap: anywhere; font-size: 12px; }
+.a2a-kind-brief { color: var(--amber); border-color: var(--amber); }
+.a2a-kind-result { color: var(--cyan); border-color: var(--cyan); }
+.a2a-ok { color: var(--green); }
+.a2a-fail { color: var(--red); font-weight: 600; }
+.a2a-text {
+  margin: 4px 0 0; padding: 4px 6px; background: var(--code-bg); color: var(--green);
+  font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%;
+}
+.a2a-sub .a2a-text { color: var(--green); }
+.a2a-coord .a2a-text { color: var(--amber); }
+.a2a-empty-text { margin: 4px 0 0; }
+.a2a-foot { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; font-size: 11px; }
+.a2a-foot:empty { display: none; }
+.a2a-toggle { margin-top: 4px; }
+
 .home { padding: 20px 16px; max-width: 900px; }
 .home h1 { color: var(--amber); margin-bottom: 14px; font-size: 18px; letter-spacing: 0.08em; text-shadow: var(--glow-amber); }
 .home li { padding: 4px 0; }
@@ -295,6 +334,7 @@ button { font: inherit; }
   .grid-main, .grid-bottom { grid-template-columns: 1fr; }
   .agents, .stream, .joblog { border-right: 0; border-bottom: 1px solid var(--panel-border); }
   .score-value { font-size: 32px; }
+  .a2a-msg { max-width: 94%; }
 }
 /* narrow screens: the boot line wraps instead of typing (the cover works on one line only) */
 @media (max-width: 640px) {

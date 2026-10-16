@@ -2,7 +2,7 @@ import { expect, type Page, test } from "@playwright/test";
 
 /**
  * Smoke test of the production build with no NEXT_PUBLIC_API_URL: /run/<id> replays the bundled
- * simulated sample (web/public/sample-run.jsonl, ~30 events over ~25 s) and must say so.
+ * simulated sample (web/public/sample-run.jsonl, ~38 events over ~30 s) and must say so.
  */
 
 const RUN_PATH = "/run/sample";
@@ -69,6 +69,20 @@ test("sample replay: honesty label, events flow, SIMULATED badges, scrubber", as
   await expect(latest).toBeDisabled();
   // The latest state still carries the simulated badges.
   await expect(page.locator(".badge-sim").first()).toBeVisible();
+
+  // The simulated A2A conversation arrives last and is labelled SIMULATED.
+  const a2a = page.getByRole("region", { name: "Agent-to-agent conversation" });
+  await expect(a2a.locator(".a2a-msg")).toHaveCount(8);
+  await expect(a2a.locator(".a2a-sim")).toHaveText("SIMULATED");
+});
+
+test("phone width: the A2A panel does not scroll the page sideways", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(RUN_PATH);
+  await expect(page.locator(".a2a-msg")).toHaveCount(8);
+  await page.getByRole("button", { name: /expand/ }).first().click();
+  const width = await page.evaluate(() => document.documentElement.scrollWidth);
+  expect(width).toBeLessThanOrEqual(390);
 });
 
 test("reduced motion: no animation is active", async ({ page }) => {

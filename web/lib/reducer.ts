@@ -8,10 +8,11 @@
  * - Keys come from untrusted data, so every write uses own-property definition (object spread or
  *   defineProperty), never `obj[key] = v`, to keep "__proto__" from touching prototypes.
  */
-import { EVENT_TYPES, type EventType, type Json, type JsonObject, type RunState } from "./events";
+import { type A2AMessage, EVENT_TYPES, type EventType, type Json, type JsonObject, type RunState } from "./events";
 
 export const LOG_MAX = 200;
 export const JOB_LOG_MAX = 50;
+export const A2A_MAX = 100;
 
 const TYPES: ReadonlySet<string> = new Set(EVENT_TYPES);
 
@@ -30,8 +31,10 @@ const SUMMARY_FIELDS: Record<EventType, readonly string[]> = {
   "approval.pending": ["action"],
   "approval.resolved": ["decision"],
   checkpoint: ["checkpoint_id", "step"],
+  "a2a.message": ["from", "to", "kind"],
   "telemetry.snapshot": [],
 };
+const A2A_KEYS = ["from", "to", "kind", "text", "ok", "text_len"] as const;
 const SCORE_KEYS = ["split", "checkpoint", "value", "n", "evidence"] as const;
 const GATE_KEYS = [
   "decision",
@@ -58,6 +61,7 @@ export function emptyState(): RunState {
     approval: null,
     telemetry: {},
     checkpoints: [],
+    a2a: [],
     last_seq: 0,
   };
 }
@@ -205,6 +209,16 @@ function apply(s: RunState, type: EventType, data: Record<string, unknown>): Par
       return { approval: merge({}, data) };
     case "approval.resolved":
       return { approval: null };
+    case "a2a.message": {
+      // Presence is `has`, as in Python `"text" in data`: an explicit null is malformed too.
+      if (!["from", "to", "kind"].every((k) => typeof d(k) === "string")) return null;
+      if (has(data, "text") && typeof data.text !== "string") return null;
+      if (has(data, "ok") && typeof data.ok !== "boolean") return null;
+      if (has(data, "text_len") && !isInt(data.text_len)) return null;
+      const msg = pick(data, A2A_KEYS);
+      if (has(msg, "text_len")) setOwn(msg, "text_len", toInt(msg.text_len as number));
+      return { a2a: [...s.a2a, msg as A2AMessage].slice(-A2A_MAX) };
+    }
     case "checkpoint":
       return { checkpoints: [...s.checkpoints, pick(data, ["checkpoint_id", "step"])] };
     case "telemetry.snapshot":
