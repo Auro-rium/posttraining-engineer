@@ -613,7 +613,19 @@ the CLI.
 
 Every run appends redacted events (statuses, scores, job progress, budget, approvals) to a SQLite journal under the state directory. A read-only API streams them
 to the dashboard over Server-Sent Events. Failures are journaled as exception type names only; the
-journal never holds prompts, completions or secrets.
+journal never holds raw model prompts or completions, tool arguments or secrets.
+
+**Agent-to-agent conversation.** The one exception is the coordinator/subagent traffic: each
+`task` delegation is stored as two `a2a.message` events, the coordinator's brief and the
+subagent's reply, as JSON in the same journal and shown in the dashboard's A2A panel. Their text is
+scrubbed of known API keys, bearer tokens and `key=value` credentials, and cut to 2000 characters
+(`text_len` keeps the original length). Briefs are written by the coordinator and may quote task
+details, so treat the journal as sensitive. Export a run's full conversation as JSON:
+
+```bash
+posttrain a2a --thread t1 --out a2a-t1.json     # from the journal; no API key needed
+curl "http://127.0.0.1:8787/v1/runs/t1/a2a?token=$READ_TOKEN"   # same, over the API
+```
 
 ```bash
 cp .env.example .env                  # set READ_TOKEN (required), ALLOWED_ORIGIN, UID/GID
