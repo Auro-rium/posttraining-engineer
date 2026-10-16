@@ -260,10 +260,10 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         result = backend.train(hyperparameters, dataset_mod.resolve(settings.data_dir, dataset_ref),
                                base_model or settings.base_model)
         if result.get("provider_job_id"):
-            budget_mod.record_spend(settings, result["provider_job_id"],
-                                    est["estimated_cost_usd"], dataset_ref)
+            cost = est["estimated_cost_usd"] or 0.0  # None when running unpriced
+            budget_mod.record_spend(settings, result["provider_job_id"], cost, dataset_ref)
             # no re-read: nothing may raise after a paid launch
-            _budget({**est, "spent_usd": round(est["spent_usd"] + est["estimated_cost_usd"], 4)})
+            _budget({**est, "spent_usd": round(est["spent_usd"] + cost, 4)})
         _job(result)
         return {**result, "dataset_sha256": report["sha256"], "estimate": est}
 

@@ -86,6 +86,44 @@ def test_gate_still_requires_verified_evidence_even_with_a_huge_gain():
     assert promotion_gate(_res(0.1, 100), _res(0.9, 100, "EXPLANATION"))["decision"] == "REJECT"
 
 
+HP = {"lora_r": 16, "lora_alpha": 32, "lora_dropout": 0.05, "learning_rate": 1e-4,
+      "n_epochs": 2, "batch_size": 8, "context_length": 8192}
+
+
+def _unpriced(tmp_path, **kw):
+    suite = _suite(tmp_path)
+    s = Settings(suite_dir=suite, data_dir=tmp_path / "data", state_dir=tmp_path / "state",
+                 require_approval=False, **kw)
+    tools = make_tools(LocalStubBackend(), s)
+    assert tools["generate_game_sft"]("d", n_rows=200)["ok"]
+    return s, tools
+
+
+def test_launch_is_blocked_without_a_price_unless_unpriced_is_opted_into(tmp_path):
+    s, tools = _unpriced(tmp_path)
+    out = tools["launch_training"](HP, "d.jsonl")
+    assert out["status"] == "BLOCKED" and out["stage"] == "budget"
+    assert "POSTTRAIN_ALLOW_UNPRICED" in out["estimate"]["note"]
+
+
+def test_unpriced_launch_is_capped_by_trained_tokens_and_records_zero_usd(tmp_path):
+    s, tools = _unpriced(tmp_path, allow_unpriced=True, max_trained_tokens=10_000_000)
+    est = tools["estimate_budget"]("d.jsonl", HP)
+    assert est["within_budget"] is True and est["estimated_cost_usd"] is None
+    assert "UNPRICED" in est["note"]
+    out = tools["launch_training"](HP, "d.jsonl")
+    assert out.get("provider_job_id") and out["estimate"]["estimated_cost_usd"] is None
+    assert budget_spent(s) == 0.0
+    (tmp_path / "t").mkdir()
+    _, tight = _unpriced(tmp_path / "t", allow_unpriced=True, max_trained_tokens=10)
+    assert tight["launch_training"](HP, "d.jsonl")["status"] == "BLOCKED"
+
+
+def budget_spent(s):
+    from posttrain_agent.tools import budget
+    return budget.spent_usd(s)
+
+
 def test_nebius_upload_drops_private_metadata_and_scores_per_game(tmp_path):
     seen = {}
 

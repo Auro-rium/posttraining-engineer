@@ -64,8 +64,15 @@ def estimate(settings: Settings, dataset_ref: str, hyperparameters: dict[str, An
         "basis": "chars/4 heuristic; Nebius bills by compute, so treat as an estimate",
     }
     if settings.price_per_mtok is None:
+        if settings.allow_unpriced:  # explicit opt-in: cap trained tokens instead of dollars
+            out.update(estimated_cost_usd=None, max_trained_tokens=settings.max_trained_tokens,
+                       within_budget=trained <= settings.max_trained_tokens,
+                       note="UNPRICED: no price configured, so the job is limited by a trained-token "
+                            "cap instead of USD; the dollar cost is unknown")
+            return out
         out.update(estimated_cost_usd=None, within_budget=None,
-                   note="set POSTTRAIN_PRICE_PER_MTOK to price the job; launch is blocked until set")
+                   note="set POSTTRAIN_PRICE_PER_MTOK to price the job (or opt in with "
+                        "POSTTRAIN_ALLOW_UNPRICED=1); launch is blocked until then")
         return out
     cost = round(trained / 1e6 * settings.price_per_mtok, 4)
     out.update(estimated_cost_usd=cost,
