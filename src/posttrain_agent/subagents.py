@@ -59,7 +59,7 @@ def build_subagents(
         spec = SubAgent(
             name=name,
             description=description,
-            system_prompt=PREAMBLE + load_prompt(file),
+            system_prompt=PREAMBLE + load_prompt("mission.md") + "\n" + load_prompt(file),
             tools=role_tools,
             middleware=list(middleware),
         )

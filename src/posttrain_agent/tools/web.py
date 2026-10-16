@@ -31,20 +31,30 @@ def web_tools(
             return {"error": f"tavily HTTP {resp.status_code}"}
         return resp.json()
 
-    async def web_search(query: str, max_results: int = 5, topic: str = "general") -> dict[str, Any]:
-        """Search the web (Tavily) for papers, docs or prior art. Never include held-out data."""
+    async def web_search(query: str, max_results: int = 5, topic: str = "general",
+                         depth: str = "basic",
+                         domains: list[str] | None = None) -> dict[str, Any]:
+        """Search the web (Tavily) for papers, docs or prior art. Never include held-out data.
+
+        ``depth`` 'advanced' reads deeper (better for research, costs more credits); ``domains``
+        restricts results to those sites, e.g. ['arxiv.org', 'huggingface.co'].
+        """
         if any(m in query for m in _SEALED_MARKERS):
             return {"error": "queries must not contain sealed/held-out references"}
-        data = await _post("/search", {
+        body: dict[str, Any] = {
             "query": query, "max_results": max(1, min(max_results, 10)),
             "topic": topic if topic in {"general", "news"} else "general",
+            "search_depth": depth if depth in {"basic", "advanced"} else "basic",
             "include_answer": True,
-        })
+        }
+        if domains:
+            body["include_domains"] = [d for d in domains if isinstance(d, str) and d][:10]
+        data = await _post("/search", body)
         if "error" in data:
             return data
         return {"evidence": "EXPLANATION", "answer": data.get("answer"),
                 "results": [{"title": r.get("title"), "url": r.get("url"),
-                             "snippet": (r.get("content") or "")[:600]}
+                             "snippet": (r.get("content") or "")[:800]}
                             for r in data.get("results", [])]}
 
     async def web_extract(urls: list[str]) -> dict[str, Any]:

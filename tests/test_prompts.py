@@ -27,6 +27,22 @@ def test_coordinator_prompt_covers_budget_stops_and_resume():
         assert needle in ORCHESTRATOR_PROMPT
 
 
+def test_every_role_and_the_coordinator_get_the_shared_project_definition():
+    from posttrain_agent.subagents import build_subagents
+    tools = {t: (lambda: None) for _, _, names, _ in ROLES.values() for t in names}
+    for spec in build_subagents(tools):
+        assert "PROJECT DEFINITION" in spec["system_prompt"], spec["name"]
+        assert "supervised fine-tuning" in spec["system_prompt"]
+    assert "not pretraining" in load_prompt("mission.md")
+
+
+def test_researcher_playbook_uses_tavily_features_and_demands_sources():
+    text = load_prompt("research.md")
+    for needle in ("depth=\"advanced\"", "domains", "web_extract", "queries_run", "findings",
+                   "source URL", "answer` text is not a source"):
+        assert needle in text, needle
+
+
 def test_game_tools_pass_the_dataset_verifier():
     row = {"messages": [
         {"role": "user", "content": "Nim: the pile has 6 stones."},

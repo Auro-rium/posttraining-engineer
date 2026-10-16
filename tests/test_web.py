@@ -22,7 +22,22 @@ async def test_search_maps_results_and_sends_bearer():
 
     out = await tools(handler)["web_search"]("qlora rank")
     assert seen == {"auth": "Bearer k", "url": "https://api.tavily.com/search"}
-    assert out["evidence"] == "EXPLANATION" and len(out["results"][0]["snippet"]) == 600
+    assert out["evidence"] == "EXPLANATION" and len(out["results"][0]["snippet"]) == 800
+
+
+async def test_search_depth_and_domain_filter_are_sent_and_validated():
+    import json
+    bodies = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(req.content))
+        return httpx.Response(200, json={"results": []})
+
+    t = tools(handler)["web_search"]
+    await t("lora sft", depth="advanced", domains=["arxiv.org", "", 5])
+    await t("lora sft", depth="bogus")
+    assert bodies[0]["search_depth"] == "advanced" and bodies[0]["include_domains"] == ["arxiv.org"]
+    assert bodies[1]["search_depth"] == "basic" and "include_domains" not in bodies[1]
 
 
 async def test_missing_key_and_http_error_and_sealed_query_fail_soft():

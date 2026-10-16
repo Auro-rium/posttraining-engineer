@@ -20,7 +20,7 @@ from .observability.telemetry import telemetry_tool
 from .runtime.budget_guard import BudgetGuard, RunTokenLedger
 from .runtime.concurrency import SubagentConcurrencyMiddleware
 from .runtime.persistence import SEED_MEMORY, Runtime
-from .subagents import ROLES, build_subagents
+from .subagents import ROLES, build_subagents, load_prompt
 from .tools import budget
 from .tools.hf import hf_tools
 from .tools.web import web_tools
@@ -130,7 +130,7 @@ async def build_agent(
     return create_deep_agent(
         model=build_model(settings, **extra),
         tools=[remember, recall, tools["web_search"], tools["read_telemetry"]],
-        system_prompt=ORCHESTRATOR_PROMPT,
+        system_prompt=ORCHESTRATOR_PROMPT + "\n" + load_prompt("mission.md"),
         subagents=build_subagents(
             tools, (remember, recall),
             [*middleware, BudgetGuard("subagent", settings.subagent_max_calls,
