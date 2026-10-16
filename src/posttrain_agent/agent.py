@@ -11,6 +11,7 @@ from deepagents import create_deep_agent
 
 from . import budget
 from .backboard_model import Cassette
+from .budget_guard import BudgetGuard, RunTokenLedger
 from .concurrency import SubagentConcurrencyMiddleware
 from .config import Settings
 from .domain import ExperimentBackend, LocalStubBackend, make_tools
@@ -97,6 +98,7 @@ async def build_agent(
     tools.update(hf_tools(settings, http_client_factory))
     tools["read_telemetry"] = telemetry_tool(settings.state_dir / "telemetry.jsonl")
 
+    ledger = RunTokenLedger(settings.state_dir / "run_tokens.json", settings.run_max_tokens)
     interrupt_on = None
     if settings.require_approval:
         interrupt_on = {"launch_training": {
@@ -108,10 +110,14 @@ async def build_agent(
         tools=[remember, recall, tools["web_search"], tools["read_telemetry"]],
         system_prompt=ORCHESTRATOR_PROMPT,
         subagents=build_subagents(
-            tools, (remember, recall), middleware,
+            tools, (remember, recall),
+            [*middleware, BudgetGuard("subagent", settings.subagent_max_calls,
+                                      settings.subagent_max_tokens, ledger)],
             {r: build_model(settings, provider=p, model=m, **extra)
              for r, (p, m) in settings.role_models.items() if r in ROLES}),
         middleware=[limiter or SubagentConcurrencyMiddleware(settings.max_parallel_subagents, journal=journal),
+                    BudgetGuard("coordinator", settings.coordinator_max_calls,
+                                settings.coordinator_max_tokens, ledger),
                     *middleware],
         backend=runtime.backend,
         memory=[SEED_MEMORY],
