@@ -623,6 +623,27 @@ docker compose --profile tunnel up    # also the named Cloudflare tunnel (needs 
 docker compose --profile quick up     # or a temporary trycloudflare.com URL, no token
 ```
 
+### Why the API is containerized and the agent is sandboxed
+
+They guard different things.
+
+- **API (internet-facing).** The tunnel exposes it publicly, so it holds only `READ_TOKEN`, opens the
+  journal read-only and has no model or search keys.
+- **Agent (untrusted input).** It reads web and Hugging Face content a third party can write, so a
+  prompt injection is possible, and it holds the Backboard, Nebius and Tavily keys. Today its files
+  are virtual and it has no shell tool, so it cannot touch the host. That is a property of the code,
+  not an enforced boundary. The container enforces it and makes a future code-execution tool safer.
+
+```bash
+docker compose --profile agent run --rm agent run "improve the checkpoint" --thread t1
+docker compose --profile agent run --rm agent approve --thread t1
+```
+
+The `agent` service runs as a non-root user with a read-only root filesystem, no capabilities,
+`no-new-privileges`, PID and memory limits, and only `./state` mounted. It has its own network, so it
+shares nothing with the API or tunnel. Compose cannot restrict which hosts it may reach; use an
+egress proxy if you need that.
+
 - On a fresh checkout the API answers 503 (`journal unavailable`) until the first run writes
   `state/events.sqlite`; the tunnels start regardless. The dashboard shows RECONNECTING until then.
 - The api runs as `${UID}:${GID}` so it can open the host-owned `./state` files. bash does not

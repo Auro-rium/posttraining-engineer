@@ -33,6 +33,33 @@ services:
       start_period: 10s
       retries: 3
 
+  # Sandboxed agent runner. It holds the model/search API keys, reads untrusted web content, and
+  # is kept off the tunnel network. Usage:
+  #   docker compose --profile agent run --rm agent run "improve the model" --thread t1
+  #   docker compose --profile agent run --rm agent approve --thread t1
+  # Compose cannot allowlist egress hosts; put it behind a proxy if you need that.
+  agent:
+    profiles: ["agent"]
+    build: .
+    entrypoint: ["posttrain"]
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      STATE_DIR: /state
+    volumes:
+      - ./state:/state  # the only host path the agent can see
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 2g
+    networks: [agent_net]
+
   # cloudflared is left on `latest` (no tag pinned that I could verify); pin it for production.
   tunnel:
     profiles: ["tunnel"]
@@ -58,3 +85,6 @@ services:
         # see tunnel: the API returns 503 to clients until the first run writes the journal.
         condition: service_started
     restart: unless-stopped
+
+networks:
+  agent_net: {}  # the agent shares no network with the api or the tunnel
