@@ -21,7 +21,12 @@ It rejects, failing closed, unless ALL hold:
 - both have verified evidence (`LIVE` or `PRIOR_VERIFIED_RUN`); `EXPLANATION` (simulated) never
   counts;
 - suite, split and seed are identical for champion and candidate;
+- `judged_by` is identical (the same judge scored both);
 - the candidate improves on the champion by at least 10% relative to the champion's score;
+- the improvement is statistically significant: a one-sided two-proportion z-test over the two
+  accuracies and their task counts `n` must give z at least 1.645. A gain that small samples could
+  produce by chance is rejected; the verdict reports `z`. (Without `n` on both sides this test does
+  not apply.)
 - the candidate does not lose more than 0.05 absolute score versus the champion.
 
 ## PROCEDURE

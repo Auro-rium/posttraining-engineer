@@ -21,6 +21,8 @@ OBJECTIVE_TOOLS = frozenset({
 ROLES = frozenset({"system", "user", "assistant", "tool"})
 SEALED_MARKERS = ("heldout://", "sealed://", "heldout/", "sealed/")
 VERIFIED = frozenset({"LIVE", "PRIOR_VERIFIED_RUN"})
+MAX_ROWS = 1200  # hard cap on SFT dataset size
+RULE_VERIFIED = "RULE_VERIFIED"  # answer recomputed from the game rule by code
 _NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
@@ -58,13 +60,18 @@ def _row_errors(row: Any) -> list[str]:
     if any(marker in blob for marker in SEALED_MARKERS):
         errs.append("row references sealed/held-out data")
     ev = (row.get("metadata") or {}).get("evidence")
-    if ev is not None and ev not in VERIFIED | {"EXPLANATION"}:
+    if ev is not None and ev not in VERIFIED | {"EXPLANATION", RULE_VERIFIED}:
         errs.append(f"unknown evidence label {ev!r}")
     return errs
 
 
-def verify_rows(rows: list[Any], *, min_rows: int = 1) -> dict[str, Any]:
-    """Return {ok, row_count, errors, warnings, sha256, evidence}. Errors are capped at 20."""
+def verify_rows(rows: list[Any], *, min_rows: int = 1,
+                max_rows: int = MAX_ROWS) -> dict[str, Any]:
+    """Return {ok, row_count, errors, warnings, sha256, evidence}. Errors are capped at 20.
+
+    ``max_rows`` can lower the limit but never raise it above the hard ``MAX_ROWS`` cap.
+    """
+    max_rows = min(max_rows, MAX_ROWS)
     errors: list[str] = []
     warnings: list[str] = []
     seen: dict[str, int] = {}
@@ -80,6 +87,8 @@ def verify_rows(rows: list[Any], *, min_rows: int = 1) -> dict[str, Any]:
                 labels.add(row["metadata"]["evidence"])
     if len(rows) < min_rows:
         errors.append(f"need at least {min_rows} rows, got {len(rows)}")
+    if len(rows) > max_rows:
+        errors.append(f"too many rows: {len(rows)} > the {max_rows}-row cap; drop or sample rows")
     if "EXPLANATION" in labels:
         warnings.append("dataset contains EXPLANATION-labelled rows (simulated, not verified)")
     if not labels:
@@ -108,22 +117,23 @@ def load_rows(data_dir: Path, ref: str) -> list[Any]:
     return rows
 
 
-def verify_file(data_dir: Path, ref: str) -> dict[str, Any]:
+def verify_file(data_dir: Path, ref: str, max_rows: int = MAX_ROWS) -> dict[str, Any]:
     try:
         rows = load_rows(data_dir, ref)
     except (OSError, ValueError) as exc:
         return {"ok": False, "errors": [str(exc)], "row_count": 0, "warnings": [],
                 "sha256": None, "evidence": []}
-    return verify_rows(rows)
+    return verify_rows(rows, max_rows=max_rows)
 
 
-def save_rows(data_dir: Path, ref: str, rows: list[Any]) -> dict[str, Any]:
+def save_rows(data_dir: Path, ref: str, rows: list[Any],
+              max_rows: int = MAX_ROWS) -> dict[str, Any]:
     """Verify then write ``rows`` as JSONL. Nothing is written unless verification passes."""
     try:
         path = resolve(data_dir, ref)
     except ValueError as exc:
         return {"ok": False, "errors": [str(exc)]}
-    report = verify_rows(rows)
+    report = verify_rows(rows, max_rows=max_rows)
     if not report["ok"]:
         return report
     path.parent.mkdir(parents=True, exist_ok=True)

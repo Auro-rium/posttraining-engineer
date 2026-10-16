@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.1,<2", "ruff>=0.12,<1"]
 api = ["fastapi>=0.115", "uvicorn>=0.30"]
+sandbox = ["contree-sdk==0.3.6"]  # Nebius Sandboxes (Beta): runs the evaluation judge
 
 [project.scripts]
 posttrain = "posttrain_agent.cli:main"

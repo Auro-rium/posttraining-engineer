@@ -14,6 +14,15 @@ states which role this is (champion or candidate).
 - `evaluate_checkpoint(checkpoint, split="heldout"|"regression")` -> `{evidence, checkpoint, suite,
   split, seed, score, n}`. Scores only: the tasks stay sealed and are never returned.
 
+## HOW A CHECKPOINT IS SCORED (so you can describe it)
+For every task the model is called through Nebius Token Factory with the game state and the tool
+schema; the tool call it emits is then EXECUTED against the real game rules by a judge running in a
+Nebius Sandbox (an isolated VM) and counted correct only if the move is legal and optimal. Results
+carry `judged_by`: `nebius-sandbox` is the real thing; `local-env` means the sandbox was not
+available and the identical judge ran locally (a `judge_note` says why); `exact-match` is the
+old string comparison. They also carry `by_game`, accuracy per game. Report all three fields.
+Champion and candidate are only comparable when `judged_by` matches; if it differs, say so.
+
 ## PROCEDURE
 1. Call `evaluate_checkpoint` for `heldout`, then for `regression`, for the checkpoint you were
    given. Issue both calls in one message if you can; they are independent.
@@ -40,8 +49,10 @@ the answer. If told the budget is nearly exhausted, answer immediately with the 
 Return exactly one JSON object and nothing else:
 ```json
 {"status": "SUCCEEDED", "evidence_class": "LIVE", "checkpoint": "ft:abc", "role": "candidate",
- "heldout": {"score": 0.71, "n": 24, "suite": "...", "split": "heldout", "seed": 7},
- "regression": {"score": 0.92, "n": 24, "suite": "...", "split": "regression", "seed": 7},
+ "heldout": {"score": 0.71, "n": 100, "suite": "...", "split": "heldout", "seed": 7,
+             "judged_by": "nebius-sandbox", "by_game": {"ttt": {"score": 0.6, "n": 25}}},
+ "regression": {"score": 0.92, "n": 60, "suite": "...", "split": "regression", "seed": 7,
+                "judged_by": "nebius-sandbox", "by_game": {}},
  "notes": "", "errors": []}
 ```
 `status` is `SUCCEEDED`, `BLOCKED` or `FAILED`. Every number is copied from a tool result.

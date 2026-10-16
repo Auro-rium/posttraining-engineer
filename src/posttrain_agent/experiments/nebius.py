@@ -22,15 +22,35 @@ from typing import Any
 import httpx
 
 from ..config import Settings
+from . import game_env
+from .sandbox import SandboxJudge, SandboxUnavailable, sandbox_configured
 
-MAX_TASKS = 200
+MAX_TASKS = 300
 TERMINAL = {"succeeded", "failed", "cancelled"}
+
+
+def _note(r: dict[str, Any]) -> dict[str, Any]:
+    return {"judge_note": r["judge_note"]} if r.get("judge_note") else {}
+
+
+def _provider_jsonl(path: Path) -> bytes:
+    """The dataset as the provider's format allows: our private ``metadata`` key is not sent."""
+    out = []
+    for line in path.read_text().splitlines():
+        if line.strip():
+            row = json.loads(line)
+            if isinstance(row, dict):
+                row.pop("metadata", None)
+            out.append(json.dumps(row, sort_keys=True))
+    return ("\n".join(out) + "\n").encode()
 
 
 class NebiusBackend:
     def __init__(self, settings: Settings,
-                 client_factory: Callable[[], httpx.Client] | None = None) -> None:
+                 client_factory: Callable[[], httpx.Client] | None = None,
+                 sandbox: SandboxJudge | None = None) -> None:
         self.s = settings
+        self._sandbox = sandbox
         self._make = client_factory or (lambda: httpx.Client(timeout=120))
 
     # -- plumbing ---------------------------------------------------------------
@@ -47,7 +67,7 @@ class NebiusBackend:
     # -- training ---------------------------------------------------------------
     def train(self, config: dict[str, Any], dataset_path: Path, base_model: str) -> dict[str, Any]:
         up = self._req("POST", "/files", data={"purpose": "fine-tune"},
-                       files={"file": (dataset_path.name, dataset_path.read_bytes())})
+                       files={"file": (dataset_path.name, _provider_jsonl(dataset_path))})
         if "error" in up:
             return {"status": "BLOCKED", "stage": "upload", **up}
         job = self._req("POST", "/fine_tuning/jobs", json={
@@ -89,8 +109,8 @@ class NebiusBackend:
             return {"error": f"no task file for split {split!r}"}
         tasks = [json.loads(x) for x in path.read_text().splitlines() if x.strip()][:MAX_TASKS]
         model = self.s.base_model if checkpoint == "base" else checkpoint
-        hits, failures = 0, []
-        for t in tasks:
+        gots: list[dict | None] = []
+        for t in tasks:  # phase 1: real inference on Token Factory
             body: dict[str, Any] = {"model": model, "messages": t["messages"], "temperature": 0}
             if t.get("tools"):
                 body["tools"] = t["tools"]
@@ -105,23 +125,67 @@ class NebiusBackend:
                     got = {"name": fn["name"], "arguments": json.loads(fn["arguments"])}
                 except ValueError:
                     got = {"name": fn["name"], "arguments": None}
-            if got == t["expected"]:
+            gots.append(got)
+        verdicts = self._judge(tasks, gots)  # phase 2: execute the calls against the game rules
+        if "error" in verdicts:
+            return verdicts
+        hits, failures = 0, []
+        per_game: dict[str, list[int]] = {}  # game -> [hits, n]
+        for t, got, v in zip(tasks, gots, verdicts["results"], strict=True):
+            game = per_game.setdefault(str(t["id"]).split("-")[0], [0, 0])
+            game[1] += 1
+            if v["ok"]:
                 hits += 1
+                game[0] += 1
             else:
-                failures.append({"task_id": t["id"], "expected": t["expected"], "got": got})
-        return {"n": len(tasks), "score": round(hits / len(tasks), 4) if tasks else 0.0,
-                "failures": failures}
+                failures.append({"task_id": t["id"], "expected": t["expected"], "got": got,
+                                 "reason": v.get("reason", "")})
+        out = {"n": len(tasks), "score": round(hits / len(tasks), 4) if tasks else 0.0,
+               "by_game": {g: {"score": round(h / m, 4), "n": m} for g, (h, m) in per_game.items()},
+               "judged_by": verdicts["judged_by"], "failures": failures}
+        if verdicts.get("note"):
+            out["judge_note"] = verdicts["note"]
+        return out
+
+    def _judge(self, tasks: list[dict], gots: list[dict | None]) -> dict[str, Any]:
+        """Verdicts per task. Stateful tasks are judged by outcome (sandbox, else labelled local)."""
+        if not all("state" in t for t in tasks):  # old-format suites: exact match to `expected`
+            return {"judged_by": "exact-match", "results": [
+                {"ok": g == t["expected"], "reason": ""} for t, g in zip(tasks, gots, strict=True)]}
+        items = [{"id": t["id"], "state": t["state"], "name": (g or {}).get("name"),
+                  "arguments": (g or {}).get("arguments")} for t, g in zip(tasks, gots, strict=True)]
+        mode, note = self.s.eval_judge, None
+        if mode in ("auto", "sandbox"):
+            judge = self._sandbox or (SandboxJudge(self.s) if sandbox_configured(self.s) else None)
+            if judge is None and mode == "sandbox":
+                return {"error": "POSTTRAIN_EVAL_JUDGE=sandbox but the Nebius sandbox is not "
+                                 "configured (need NEBIUS_PROJECT_ID and contree-sdk)",
+                        "stage": "judge"}
+            if judge is not None:
+                try:
+                    return {"judged_by": "nebius-sandbox", "results": judge.judge(items)}
+                except SandboxUnavailable as exc:
+                    if mode == "sandbox":
+                        return {"error": str(exc), "stage": "judge"}
+                    note = f"sandbox failed, judged locally: {exc}"
+            else:
+                note = "sandbox not configured, judged locally"
+        return {"judged_by": "local-env", "note": note,
+                "results": game_env.judge_batch(items)}
 
     def benchmark(self, checkpoint: str, suite: str, seed: int) -> dict[str, Any]:
         r = self._score(checkpoint, "train")
         if "error" in r:
             return r
         return {"evidence": "LIVE", "checkpoint": checkpoint, "suite": suite, "split": "train",
-                "seed": seed, "score": r["score"], "n": r["n"], "failures": r["failures"][:20]}
+                "seed": seed, "score": r["score"], "n": r["n"], "by_game": r["by_game"],
+                "judged_by": r["judged_by"], **_note(r), "failures": r["failures"][:20]}
 
     def evaluate(self, checkpoint: str, suite: str, split: str, seed: int) -> dict[str, Any]:
         r = self._score(checkpoint, split)
         if "error" in r:
             return r
         return {"evidence": "LIVE", "checkpoint": checkpoint, "suite": suite, "split": split,
-                "seed": seed, "score": r["score"], "n": r["n"]}  # scores only: tasks stay sealed
+                "seed": seed, "score": r["score"], "n": r["n"],
+                "by_game": r["by_game"], "judged_by": r["judged_by"],
+                **_note(r)}  # scores only: tasks stay sealed

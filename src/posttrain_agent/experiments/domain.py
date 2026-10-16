@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+import math
 from math import isfinite
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..config import Settings
 from ..observability.events import Journal, emit
+from . import games as games_mod
 from ..tools import budget as budget_mod
 from ..tools import dataset as dataset_mod
 
@@ -38,6 +40,7 @@ OPTIONAL_HPARAMS: dict[str, tuple[float, float, bool]] = {
     "weight_decay": (0.0, 0.1, False),
 }
 MIN_RELATIVE_IMPROVEMENT = 0.10
+MIN_Z = 1.645  # one-sided 5% two-proportion test: the gain must not be sampling noise
 MAX_ABSOLUTE_REGRESSION = 0.05
 
 
@@ -131,7 +134,7 @@ def promotion_gate(champion: dict[str, Any], candidate: dict[str, Any]) -> dict[
     for side, res in (("champion", champion), ("candidate", candidate)):
         if res.get("evidence") not in VERIFIED:
             reasons.append(f"{side} evidence {res.get('evidence')!r} is not verified")
-    for key in ("suite", "split", "seed"):
+    for key in ("suite", "split", "seed", "judged_by"):  # judged_by: never compare two judges
         if champion.get(key) != candidate.get(key):
             reasons.append(f"{key} differs between champion and candidate")
     delta = n - c
@@ -140,8 +143,32 @@ def promotion_gate(champion: dict[str, Any], candidate: dict[str, Any]) -> dict[
         reasons.append("minimum relative improvement not met")
     if max(0.0, -delta) > MAX_ABSOLUTE_REGRESSION:
         reasons.append("maximum regression exceeded")
+    z = _improvement_z(champion, candidate, c, n)
+    if z is not None and z < MIN_Z:
+        reasons.append(f"improvement not statistically significant (z={z:.2f} < {MIN_Z}, "
+                       f"n={champion['n']}/{candidate['n']})")
     return {"decision": "REJECT" if reasons else "PROMOTE", "reasons": reasons,
-            "champion_score": c, "candidate_score": n, "relative_improvement": relative}
+            "champion_score": c, "candidate_score": n, "relative_improvement": relative,
+            "z": None if z is None else round(z, 3)}
+
+
+def _improvement_z(champion: dict[str, Any], candidate: dict[str, Any],
+                   c: float, n: float) -> float | None:
+    """One-sided two-proportion z for candidate > champion; None if sizes are not usable.
+
+    Scores are accuracies (fractions of ``n`` tasks). Without integer ``n`` on both sides, or with
+    scores outside [0, 1], no significance test applies and the other rules decide alone.
+    """
+    n1, n2 = champion.get("n"), candidate.get("n")
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in (n1, n2)):
+        return None
+    if not (0.0 <= c <= 1.0 and 0.0 <= n <= 1.0):
+        return None
+    pooled = (c * n1 + n * n2) / (n1 + n2)
+    se = math.sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n2))
+    if se == 0:
+        return math.inf if n > c else 0.0
+    return (n - c) / se
 
 
 def make_tools(backend: ExperimentBackend, settings: Settings,
@@ -189,12 +216,29 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
 
     def verify_dataset(rows: list[dict[str, Any]]) -> dict[str, Any]:
         """Verify chat-format SFT rows (schema, allow-listed tools, no sealed refs, no duplicates)."""
-        return dataset_mod.verify_rows(rows)
+        return dataset_mod.verify_rows(rows, max_rows=settings.max_dataset_rows)
 
     def save_dataset(name: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         """Verify rows and, only if they pass, save them as '<name>.jsonl'. Returns the dataset ref."""
         ref = name if name.endswith(".jsonl") else f"{name}.jsonl"
-        return dataset_mod.save_rows(settings.data_dir, ref, rows)
+        return dataset_mod.save_rows(settings.data_dir, ref, rows, settings.max_dataset_rows)
+
+    def generate_game_sft(name: str, n_rows: int = 600, seed: int = 100) -> dict[str, Any]:
+        """Generate rule-correct SFT rows (max 1200) from the four games, verify and save them.
+
+        Rows are computed by code (never written by a model), balanced over the games, use
+        paraphrased prompts, and never contain a state from any evaluation split.
+        """
+        states = games_mod.suite_states(settings.suite_dir)
+        if not states:
+            return {"ok": False, "errors": [
+                "evaluation suite files carry no 'state' keys; regenerate them with "
+                "scripts/make_game_suites.py so training data can exclude eval states"]}
+        rows, counts = games_mod.generate_sft(n_rows, seed, states, settings.max_dataset_rows)
+        ref = name if name.endswith(".jsonl") else f"{name}.jsonl"
+        report = dataset_mod.save_rows(settings.data_dir, ref, rows, settings.max_dataset_rows)
+        return {**report, "by_game": counts, "excluded_eval_states": len(states),
+                "requested": n_rows}
 
     def estimate_budget(dataset_ref: str, hyperparameters: dict[str, Any]) -> dict[str, Any]:
         """Estimate trained tokens and cost of a job against the remaining budget."""
@@ -207,7 +251,7 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         """Launch ONE LoRA fine-tuning job (needs human approval). Re-checks hyperparameters, dataset and budget."""
         if errors := validate_hparams(hyperparameters):
             return {"status": "BLOCKED", "stage": "hyperparameters", "errors": errors}
-        report = dataset_mod.verify_file(settings.data_dir, dataset_ref)
+        report = dataset_mod.verify_file(settings.data_dir, dataset_ref, settings.max_dataset_rows)
         if not report["ok"]:
             return {"status": "BLOCKED", "stage": "dataset", "errors": report["errors"]}
         est = budget_mod.estimate(settings, dataset_ref, hyperparameters)
@@ -256,6 +300,7 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
     validate_hparams_tool.__name__ = "validate_hparams"
     return {"run_benchmark": run_benchmark, "validate_hparams": validate_hparams_tool,
             "verify_dataset": verify_dataset, "save_dataset": save_dataset,
+            "generate_game_sft": generate_game_sft,
             "estimate_budget": estimate_budget, "launch_training": launch_training,
             "get_training_status": get_training_status, "read_training_logs": read_training_logs,
             "evaluate_checkpoint": evaluate_checkpoint, "decide_promotion": decide_promotion}
