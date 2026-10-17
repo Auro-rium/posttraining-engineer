@@ -39,6 +39,27 @@ def sandbox_configured(settings: Settings) -> bool:
                 and importlib.util.find_spec("contree_sdk"))
 
 
+def contree_client(settings: Settings, transport_timeout: float | None = None,
+                   operation_timeout: float | None = None) -> Any:
+    """A host-side ConTree client. The key reaches the SDK only through this process' environment;
+    it is never put into a sandbox command, its stdin, its files or its environment.
+
+    ``transport_timeout`` overrides the SDK's 10 s per-request timeout, which cuts multi-MB file
+    uploads (seen live on a LoRA adapter: ``ApiTimeoutError`` on ``POST /v1/files``)."""
+    try:
+        from contree_sdk import Contree
+        from contree_sdk.config import ContreeConfig
+    except ImportError as exc:
+        raise SandboxUnavailable("contree-sdk is not installed (pip install '.[sandbox]')") from exc
+    if not (settings.nebius_api_key and settings.nebius_project_id):
+        raise SandboxUnavailable("NEBIUS_API_KEY and NEBIUS_PROJECT_ID are required")
+    os.environ.setdefault("NEBIUS_API_KEY", settings.nebius_api_key)  # the SDK reads these
+    os.environ.setdefault("NEBIUS_PROJECT_ID", settings.nebius_project_id)
+    overrides = {k: v for k, v in (("transport_timeout", transport_timeout),
+                                   ("operation_timeout", operation_timeout)) if v is not None}
+    return Contree(ContreeConfig(**overrides)) if overrides else Contree()
+
+
 def _run_sync(make: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
     """Run a coroutine to completion from sync code, even when a loop is already running."""
     try:
@@ -68,17 +89,7 @@ class SandboxJudge:
         self._src = base64.b64encode(Path(game_env.__file__).read_bytes()).decode()
 
     def _client(self) -> Any:
-        if self._factory:
-            return self._factory()
-        try:
-            from contree_sdk import Contree
-        except ImportError as exc:
-            raise SandboxUnavailable("contree-sdk is not installed (pip install '.[sandbox]')") from exc
-        if not (self.s.nebius_api_key and self.s.nebius_project_id):
-            raise SandboxUnavailable("NEBIUS_API_KEY and NEBIUS_PROJECT_ID are required")
-        os.environ.setdefault("NEBIUS_API_KEY", self.s.nebius_api_key)  # the SDK reads these
-        os.environ.setdefault("NEBIUS_PROJECT_ID", self.s.nebius_project_id)
-        return Contree()
+        return self._factory() if self._factory else contree_client(self.s)
 
     def judge(self, items: list[dict]) -> list[dict]:
         """Verdicts ``[{id, ok, reason}]`` for ``[{id, state, name, arguments}]``, in order."""

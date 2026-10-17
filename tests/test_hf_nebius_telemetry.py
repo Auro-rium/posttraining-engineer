@@ -102,7 +102,8 @@ def test_nebius_evaluation_scores_exact_match_and_keeps_heldout_sealed(tmp_path)
     assert ev["score"] == 0.5 and ev["n"] == 2 and "failures" not in ev and ev["evidence"] == "LIVE"
     bench = b.benchmark("ft:x", "s", 7)
     assert bench["score"] == 0.0 and bench["failures"][0]["task_id"] == "t1"
-    assert json.loads(calls[0][2])["model"] == b.s.base_model  # 'base' alias
+    chat = [c for c in calls if c[1].endswith("/chat/completions")]
+    assert json.loads(chat[0][2])["model"] == b.s.base_model  # 'base' alias
     assert "error" in b.evaluate("base", "s", "regression", 7)
 
 

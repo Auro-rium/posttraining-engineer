@@ -134,7 +134,9 @@ def promotion_gate(champion: dict[str, Any], candidate: dict[str, Any]) -> dict[
     for side, res in (("champion", champion), ("candidate", candidate)):
         if res.get("evidence") not in VERIFIED:
             reasons.append(f"{side} evidence {res.get('evidence')!r} is not verified")
-    for key in ("suite", "split", "seed", "judged_by"):  # judged_by: never compare two judges
+    # judged_by / served_by: never compare two judges or two serving paths (sandbox CPU bf16
+    # transformers vs serverless). Absent on both sides (older results) compares equal.
+    for key in ("suite", "split", "seed", "judged_by", "served_by"):
         if champion.get(key) != candidate.get(key):
             reasons.append(f"{key} differs between champion and candidate")
     delta = n - c
@@ -209,10 +211,29 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         _score(res, "train", checkpoint)
         return res
 
-    def validate_hparams_tool(config: dict[str, Any]) -> dict[str, Any]:
-        """Check LoRA hyperparameters against the fixed search space. Returns {valid, errors}."""
-        errors = validate_hparams(config)
-        return {"valid": not errors, "errors": errors}
+    def validate_hparams_tool(
+        hyperparameters: dict[str, Any] | None = None,
+        lora_r: Any = None, lora_alpha: Any = None, lora_dropout: Any = None,
+        learning_rate: Any = None, n_epochs: Any = None, batch_size: Any = None,
+        context_length: Any = None, warmup_ratio: Any = None, weight_decay: Any = None,
+        packing: Any = None,
+    ) -> dict[str, Any]:
+        """Check LoRA hyperparameters against the fixed search space. Returns {valid, errors}.
+
+        Pass them nested as `hyperparameters={...}` (same shape as estimate_budget and
+        launch_training) or as flat arguments (`lora_r=16, ...`); flat values override nested.
+        """
+        # Not named `config`: LangChain reserves that argument name for its RunnableConfig and
+        # silently drops it from the model's call, which crashed this tool before.
+        flat = {"lora_r": lora_r, "lora_alpha": lora_alpha, "lora_dropout": lora_dropout,
+                "learning_rate": learning_rate, "n_epochs": n_epochs, "batch_size": batch_size,
+                "context_length": context_length, "warmup_ratio": warmup_ratio,
+                "weight_decay": weight_decay, "packing": packing}
+        if hyperparameters is not None and not isinstance(hyperparameters, dict):
+            return {"valid": False, "errors": ["hyperparameters must be an object"]}
+        merged = {**(hyperparameters or {}), **{k: v for k, v in flat.items() if v is not None}}
+        errors = validate_hparams(merged)
+        return {"valid": not errors, "errors": errors, "checked": merged}
 
     def verify_dataset(rows: list[dict[str, Any]]) -> dict[str, Any]:
         """Verify chat-format SFT rows (schema, allow-listed tools, no sealed refs, no duplicates)."""

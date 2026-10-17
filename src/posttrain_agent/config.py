@@ -59,7 +59,7 @@ class Settings:
     hf_token: str = ""
     nebius_api_key: str = ""
     nebius_base_url: str = "https://api.tokenfactory.nebius.com/v1"
-    base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    base_model: str = "Qwen/Qwen3-0.6B"
     max_cost_usd: float = 25.0  # total estimated spend across all launched jobs
     price_per_mtok: float | None = None  # USD per 1M trained tokens; Nebius publishes none
     data_dir: Path = Path("state/data")
@@ -82,6 +82,9 @@ class Settings:
     nebius_project_id: str = ""
     sandbox_image: str = "python:3.12-slim"
     eval_judge: str = "auto"  # auto: sandbox if configured, else local | sandbox: required | local
+    # how the evaluated model is served: auto (serverless if /models lists the base model, else
+    # sandbox CPU) | serverless (Token Factory /chat/completions) | sandbox (transformers in a sandbox)
+    serve: str = "auto"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -123,6 +126,7 @@ class Settings:
             nebius_project_id=e("NEBIUS_PROJECT_ID", ""),
             sandbox_image=e("POSTTRAIN_SANDBOX_IMAGE", cls.sandbox_image),
             eval_judge=e("POSTTRAIN_EVAL_JUDGE", "auto").lower(),
+            serve=e("POSTTRAIN_SERVE", "auto").lower(),
             role_models={k[len("POSTTRAIN_MODEL_"):].lower(): _split_models(v)[0]
                          for k, v in os.environ.items()
                          if k.startswith("POSTTRAIN_MODEL_") and k != "POSTTRAIN_MODEL_RETRIES" and v},

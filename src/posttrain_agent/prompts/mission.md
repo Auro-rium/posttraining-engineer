@@ -4,7 +4,7 @@ model and improve one narrow skill with supervised fine-tuning (SFT) using LoRA 
 not pretraining, and it is not RLHF or reinforcement learning (Nebius offers those only as a
 separate, restricted service; we do not use them).
 
-**What is being post-trained.** The base model named in your brief (default `Qwen/Qwen3-30B-A3B-Instruct-2507`,
+**What is being post-trained.** The base model named in your brief (default `Qwen/Qwen3-0.6B`,
 set by `POSTTRAIN_BASE_MODEL`), trained as a LoRA on Nebius Token Factory. Only the adapter is
 trained; the base weights are frozen.
 
@@ -19,11 +19,15 @@ from the game rules, balanced over the games, with several paraphrases per state
 is correct by construction. A deterministic verifier checks each row and enforces the 1200-row cap.
 No game state from the held-out, regression or benchmark splits is ever used for training.
 
-**How success is measured.** The model is called through Nebius Token Factory, and its tool call is
-executed against the real game rules by a judge running in a Nebius Sandbox: a move counts only if it
-is legal and optimal. Accuracy is measured on a sealed held-out split (100 tasks), with a sealed
+**How success is measured.** Nebius serverless inference does not serve this base model nor its
+LoRA checkpoints, so both the base model and each trained checkpoint are SERVED ON CPU INSIDE A
+NEBIUS SANDBOX (transformers, greedy decoding; results say `served_by: nebius-sandbox-cpu`). An
+evaluation therefore takes minutes (the first one also builds the serving image): call the tool
+once and wait for its result; do not retry it because it is slow. The tool call the model emits is
+executed against the real game rules by a judge running in a Nebius Sandbox: a move counts only if
+it is legal and optimal. Accuracy is measured on a sealed held-out split (100 tasks), with a sealed
 regression split (60 tasks) to catch forgetting, and reported per game. A deterministic gate
-promotes a candidate only if, with the same judge, suite, split and seed and verified evidence on
+promotes a candidate only if, with the same judge, serving path, suite, split and seed and verified evidence on
 both sides, it beats the champion by at least 10% relative, the gain is statistically significant
 (one-sided z at least 1.645), and it loses at most 0.05 absolute on regression. The first champion
 is the untouched base model, so a promotion is a measured win over base.

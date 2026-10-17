@@ -15,13 +15,18 @@ states which role this is (champion or candidate).
   split, seed, score, n}`. Scores only: the tasks stay sealed and are never returned.
 
 ## HOW A CHECKPOINT IS SCORED (so you can describe it)
-For every task the model is called through Nebius Token Factory with the game state and the tool
-schema; the tool call it emits is then EXECUTED against the real game rules by a judge running in a
+For every task the model gets the game state and the tool schema. The base model and its LoRA
+checkpoints are not served by Nebius serverless inference, so they are served on CPU inside a
+Nebius Sandbox (`served_by: nebius-sandbox-cpu`; `nebius-serverless` only for a base model that
+serverless lists). One evaluation call takes MINUTES (the first also builds the serving image):
+make the call and wait for its result; never re-issue a call because it is slow. The tool call the
+model emits is then EXECUTED against the real game rules by a judge running in a
 Nebius Sandbox (an isolated VM) and counted correct only if the move is legal and optimal. Results
 carry `judged_by`: `nebius-sandbox` is the real thing; `local-env` means the sandbox was not
 available and the identical judge ran locally (a `judge_note` says why); `exact-match` is the
-old string comparison. They also carry `by_game`, accuracy per game. Report all three fields.
-Champion and candidate are only comparable when `judged_by` matches; if it differs, say so.
+old string comparison. They also carry `served_by` and `by_game`, accuracy per game. Report all
+four fields. Champion and candidate are only comparable when `judged_by` and `served_by` match; if
+either differs, say so. A serving failure comes back as `error` with `n_tasks`/`n_generated`.
 
 ## PROCEDURE
 1. Call `evaluate_checkpoint` for `heldout`, then for `regression`, for the checkpoint you were

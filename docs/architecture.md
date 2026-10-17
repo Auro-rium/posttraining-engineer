@@ -242,7 +242,22 @@ Nothing is raised. Callers turn the error into a `BLOCKED` or failed result.
 | `GET /fine_tuning/jobs/{id}` | `job_status` | none | Status, `trained_steps`, `total_steps`, `trained_tokens`, `error`. |
 | `GET /fine_tuning/jobs/{id}/checkpoints` | `job_status` | none, only after status `succeeded` | Takes `fine_tuned_model_checkpoint` from the last item as the checkpoint name. |
 | `GET /fine_tuning/jobs/{id}/events` | `job_events` | query `limit` (1 to 200) | Event log. Messages are cut to 300 characters. |
-| `POST /chat/completions` | `_score` | JSON: `model` (base model for `base`, else the checkpoint name), `messages`, `temperature: 0`, and `tools` if the task has them | Evaluation. The score is exact match on the first tool call's name and parsed arguments. |
+| `GET /models` | `serving` | none, once per backend when `POSTTRAIN_SERVE=auto` | Decides `served_by`: `nebius-serverless` if the base model is listed, else `nebius-sandbox-cpu`. A failed probe keeps serverless (not cached). |
+| `POST /chat/completions` | `_infer_serverless` | JSON: `model` (base model for `base`, else the checkpoint name), `messages`, `temperature: 0`, and `tools` if the task has them | Serverless inference; the first tool call is judged. |
+| `GET /fine_tuning/jobs`, `GET /fine_tuning/jobs/{id}/checkpoints` | `_resolve_checkpoint` | `limit=100`; up to 30 succeeded jobs scanned | Sandbox serving: maps a checkpoint name (exact match) to its `result_files`. `job_status` fills the same cache. |
+| `GET /files/{id}`, `GET /files/{id}/content` | `_download_adapter` | none | Sandbox serving: filename (basename) and bytes of each checkpoint file, downloaded on the host. |
+
+**Sandbox CPU serving** (`experiments/sandbox_student.py`). Used because serverless serves neither
+`Qwen/Qwen3-0.6B` nor its `ft:` checkpoints. A non-disposable branch of `POSTTRAIN_SANDBOX_IMAGE`
+gets CPU torch, transformers, peft and the base weights (built once per process); an adapter is one
+more small layer (`adapter_config.json`, `adapter_model.safetensors`, validated by `prepare_adapter`:
+the config must name the base model). The generation script adds peft's `base_model.model.` prefix
+to the provider's tensor keys and fails on any unexpected or missing LoRA key
+(`adapter_load_problem`) before merging. Batches of 8 prompts go on stdin to disposable jobs, at
+most 4 in flight, each with a hard timeout; greedy, `max_new_tokens` 160, chat template with the
+task's `tools` and thinking off. `parse_tool_calls` reads `<tool_call>{json}</tool_call>`. Any failed
+batch or sample makes the whole split an `error` (with `n_tasks`, `n_generated`), never a score. The
+key never enters a sandbox; no env is passed.
 
 `_score` reads `<suite_dir>/<split>.jsonl`, at most 200 tasks. Any inference error stops the whole
 split and returns the error with `stage: "inference"`. Benchmark results (`train`) include up to 20

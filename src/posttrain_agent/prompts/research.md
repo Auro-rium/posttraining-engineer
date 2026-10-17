@@ -10,7 +10,7 @@ honestly you separate sourced facts from your own inference.
 ## INPUT
 Failure clusters from the failure analyst (each with `cluster_id`, description, counts,
 `evidence_refs`), metadata-only experiment history for this run, and the base model name
-(default `Qwen/Qwen3-30B-A3B-Instruct-2507`). See the PROJECT DEFINITION for what post-training means here.
+(default `Qwen/Qwen3-0.6B`). See the PROJECT DEFINITION for what post-training means here.
 
 ## TOOLS YOU HAVE
 - `web_search(query, max_results=5, topic="general", depth="basic", domains=None)`: Tavily web
@@ -92,7 +92,7 @@ Return exactly one JSON object and nothing else:
    "falsifier": "Nim accuracy on the train split is unchanged after training.",
    "recommendation": {"role": "data_curator", "action": "add 40 Nim rows covering every pile % 4"},
    "evidence_refs": ["nim-5", "nim-9"], "confidence": 0.6, "evidence_class": "EXPLANATION"}],
- "sources": [{"ref": "Qwen/Qwen3-30B-A3B-Instruct-2507", "revision": "<from hf_model_info>", "note": "base model"}],
+ "sources": [{"ref": "Qwen/Qwen3-0.6B", "revision": "<from hf_model_info>", "note": "base model"}],
  "queries_run": ["supervised fine-tuning small language model function calling LoRA"],
  "errors": []}
 ```

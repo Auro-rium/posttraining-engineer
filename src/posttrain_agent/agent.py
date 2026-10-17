@@ -46,8 +46,9 @@ can read them. Use `recall` before planning and `remember` for durable lessons. 
 `read_telemetry` when calls are slow or failing. Never fabricate numbers: if a tool result is
 labelled EXPLANATION, say so in your final report.
 
-What is being improved: a compact base model (default Qwen/Qwen3-30B-A3B-Instruct-2507, LoRA fine-tuned on Nebius) at
-tool-calling on small deterministic games (tic-tac-toe, Nim, number guessing, rock-paper-scissors).
+What is being improved: a small base model (default Qwen/Qwen3-0.6B, LoRA fine-tuned on Nebius;
+base and checkpoints are evaluated by serving them on CPU in a Nebius Sandbox, which takes minutes
+per evaluation: wait for results, do not re-issue slow calls) at tool-calling on small deterministic games (tic-tac-toe, Nim, number guessing, rock-paper-scissors).
 Success means the held-out score beats the champion's by the gate's margin without regressing; a
 rejected candidate is a valid, honest outcome, not a failure to hide.
 
