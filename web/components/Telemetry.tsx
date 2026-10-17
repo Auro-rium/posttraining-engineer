@@ -3,6 +3,8 @@ import { useEffect, useMemo, useRef } from "react";
 import type { History } from "../lib/connection";
 import type { Json, JsonObject, RunState } from "../lib/events";
 import { ms, num } from "./format";
+import { Dial } from "./Gauges";
+import { CountUp } from "./motion";
 
 type Series = { p50: number[]; p95: number[]; err: number[] };
 
@@ -33,7 +35,7 @@ export function telemetrySeries(history: History): Series {
  * Canvas sparkline. Draws only in an effect, so server render emits an empty canvas, and it does
  * nothing where 2D canvas is unavailable (jsdom). The numbers are always also rendered as text.
  */
-export function Sparkline({ values, label, color = "#7dff9b" }: { values: number[]; label: string; color?: string }) {
+export function Sparkline({ values, label, color = "#3ef0ff" }: { values: number[]; label: string; color?: string }) {
   const ref = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {
     const canvas = ref.current;
@@ -55,19 +57,30 @@ export function Sparkline({ values, label, color = "#7dff9b" }: { values: number
     const y = (v: number) => h - 2 - ((v - lo) / span) * (h - 4);
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 2;
     if (values.length === 1) {
-      ctx.fillRect(x(0) - 1.5, h / 2 - 1.5, 3, 3);
+      ctx.fillRect(x(0) - 2, h / 2 - 2, 4, 4);
       return;
     }
     ctx.beginPath();
     values.forEach((v, i) => (i === 0 ? ctx!.moveTo(x(i), y(v)) : ctx!.lineTo(x(i), y(v))));
     ctx.stroke();
   }, [values, color]);
-  return <canvas ref={ref} className="sparkline" width={120} height={24} role="img" aria-label={`${label} sparkline, ${values.length} points`} />;
+  return <canvas ref={ref} className="sparkline" width={180} height={40} role="img" aria-label={`${label} sparkline, ${values.length} points`} />;
 }
 
-export function Telemetry({ state, history }: { state: RunState; history: History }) {
+function Spark({ title, values, color, now }: { title: string; values: number[]; color: string; now: string }) {
+  return (
+    <div className="spark-card">
+      <div className="spark-head">
+        <span className="spark-title">{title}</span> <span className="spark-now">{now}</span>
+      </div>
+      {values.length > 0 ? <Sparkline values={values} label={title} color={color} /> : <div className="spark-empty dim">no data</div>}
+    </div>
+  );
+}
+
+export function Telemetry({ state, history, live = true }: { state: RunState; history: History; live?: boolean }) {
   const t = state.telemetry;
   // Memoized so the arrays keep their identity and the sparkline effects only redraw on change.
   const series = useMemo(() => telemetrySeries(history), [history]);
@@ -86,10 +99,23 @@ export function Telemetry({ state, history }: { state: RunState; history: Histor
             p50 {ms(t.p50_ms)} · p95 {ms(t.p95_ms)} · err {err !== null ? `${Math.round(err * 100)}%` : "—"}
             {tin !== null || tout !== null ? ` · tokens ${tin ?? "—"} in / ${tout ?? "—"} out` : ""}
           </div>
-          <div className="sparklines">
-            {series.p50.length > 0 ? <Sparkline values={series.p50} label="p50 latency" /> : null}
-            {series.p95.length > 0 ? <Sparkline values={series.p95} label="p95 latency" color="#ffb000" /> : null}
-            {series.err.length > 0 ? <Sparkline values={series.err} label="error rate" color="#ff5a5a" /> : null}
+          <div className="tele-grid">
+            <Dial value={err} label="Error rate" tone={err !== null && err >= 0.05 ? "red" : "lime"} text={err !== null ? `${(err * 100).toFixed(1)}%` : ""} />
+            <div className="sparklines">
+              <Spark title="p50 latency" values={series.p50} color="#3ef0ff" now={ms(t.p50_ms)} />
+              <Spark title="p95 latency" values={series.p95} color="#ff5cf0" now={ms(t.p95_ms)} />
+              <Spark title="error rate" values={series.err} color="#ff5a6e" now={err !== null ? `${(err * 100).toFixed(1)}%` : "—"} />
+            </div>
+            <dl className="tokens">
+              <div>
+                <dt>TOKENS IN</dt>
+                <dd>{tin !== null ? <CountUp value={tin} digits={0} animate={live} /> : <span className="dim">no data</span>}</dd>
+              </div>
+              <div>
+                <dt>TOKENS OUT</dt>
+                <dd>{tout !== null ? <CountUp value={tout} digits={0} animate={live} /> : <span className="dim">no data</span>}</dd>
+              </div>
+            </dl>
           </div>
         </>
       )}

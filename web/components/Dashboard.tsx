@@ -10,6 +10,7 @@ import { type BlipKind, SoundToggle, useBlips } from "./Blips";
 import { Boot } from "./Boot";
 import { Budget } from "./Budget";
 import { EventStream, isErrorEntry } from "./EventStream";
+import { BootSequence, Ticker } from "./Hud";
 import { JobLog, JobPanel } from "./JobPanel";
 import { ScoreGate } from "./ScoreGate";
 import { StatusBar, connLabel } from "./StatusBar";
@@ -63,10 +64,14 @@ export function DashboardView({ view, runId }: { view: RunView; runId?: string }
   }, [liveSeq, live, blip, view.state]);
 
   const empty = view.state.last_seq === 0;
+  const simulated = view.mode === "REPLAY" && view.source === "sample";
   return (
     <div className="dashboard" data-conn={view.conn} data-mode={view.mode} data-historical={target !== null}>
+      <div className="bg-mesh" aria-hidden="true" />
+      <BootSequence />
       <div className="topline">
         <Boot text={`> mission control :: thread ${runId ?? "?"} :: panels online`} />
+        <Ticker state={state} />
         <SoundToggle on={sound.on} onToggle={sound.toggle} supported={sound.supported} />
       </div>
       <StatusBar view={view} state={state} runId={runId} scrubSeq={target} />
@@ -77,19 +82,19 @@ export function DashboardView({ view, runId }: { view: RunView; runId?: string }
         </p>
       ) : null}
       <main className="grid-main">
-        <AgentBoard state={state} />
-        <EventStream state={state} live={live} />
+        <AgentBoard state={state} live={live} simulated={simulated} />
         <aside className="panel rightcol" aria-label="Score, gate, budget and job">
           <ScoreGate state={state} live={live} />
           <Budget state={state} />
           <JobPanel state={state} />
         </aside>
       </main>
-      <A2APanel state={state} runId={runId} simulated={view.mode === "REPLAY" && view.source === "sample"} />
       <div className="grid-bottom">
+        <Telemetry state={state} history={shownHistory} live={live} />
+        <EventStream state={state} live={live} />
         <JobLog state={state} />
-        <Telemetry state={state} history={shownHistory} />
       </div>
+      <A2APanel state={state} runId={runId} simulated={simulated} />
       <Timeline
         history={view.history}
         liveSeq={liveSeq}

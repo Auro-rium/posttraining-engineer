@@ -85,6 +85,24 @@ screen as `{run, messages}` (without `seq`/`ts`; for the full, uncapped conversa
 `GET /v1/runs/{id}/a2a` or `posttrain a2a`). In the bundled sample the conversation is simulated
 and badged `SIMULATED`.
 
+## Plush crew and gauges
+
+The agent board is a "plush crew": one cold-tech inline-SVG mascot per role (coordinator star
+core, benchmark frog, failure_analyst hedgehog, researcher owl, data_curator fox,
+training_designer sheep, training_executor robot bunny, evaluator cat, champion_manager bear).
+Poses come only from state: `agents[role]` gives `working` (active), `done` (ok true), `failed`
+(ok false) or `ended` (no ok flag). A role with no agent events is `asleep`, or `standby` when it
+appears in the A2A conversation. A2A results never make a mascot cheer. The coordinator works
+while the run status is `RUNNING`. The champion_manager's trophy lights only after a `PROMOTE`
+verdict. Speech bubbles show the role's newest A2A message as plain text (90 chars; click for the
+full text). A packet runs along the wire only for a newly arrived `a2a.message` while following
+the latest state. In the sample the crew is labelled `SIMULATED`.
+
+The gauges draw "no data" for a missing value, never zero, and clamp out-of-range values only in
+the drawing; the real number stays in the text. The gate gauge is coloured by the verdict, not by
+the score difference. The reducer does not keep `by_game`, `z` or `judged_by`, so they are not
+shown.
+
 ## Tests
 
 ```bash

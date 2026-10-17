@@ -10,6 +10,7 @@ import { Boot } from "./Boot";
 import { DashboardView } from "./Dashboard";
 import { ANNOUNCE_MS, EventStream } from "./EventStream";
 import { CountUp, REDUCED_MOTION_QUERY } from "./motion";
+import { LOOKS } from "./Plush";
 
 const CSS = readFileSync(join(__dirname, "..", "styles", "terminal.css"), "utf8");
 const SAMPLE: unknown[] = readFileSync(join(__dirname, "..", "public", "sample-run.jsonl"), "utf8")
@@ -272,8 +273,18 @@ describe("motion and accessibility", () => {
     }
     pairs.push(["amber", "amber-bg"], ["bg", "red"]); // approval banner / RECONNECTING; AUTH FAILED
     for (const fg of ["green", "green-dim", "amber", "cyan", "red"]) pairs.push([fg, "code-bg"]); // A2A text blocks
+    // Neo-futuristic theme: every text token on the brightest glass / mesh composites and on the
+    // crew bubbles (code-bg), plus the new neon text tokens everywhere.
+    const textTokens = ["text", "green", "green-dim", "idle", "amber", "cyan", "magenta", "lime", "violet", "steel", "red", "focus"];
+    for (const fg of textTokens) for (const bg of ["bg", "bg-glow", "panel-hi", "panel-hi-b", "mesh-peak", "code-bg", "track"]) pairs.push([fg, bg]);
     for (const [fg, bg] of pairs) {
       expect(ratio(token(fg), token(bg)), `--${fg} on --${bg}`).toBeGreaterThanOrEqual(4.5);
+    }
+    // Plush accents colour the bubble heads (text on --code-bg) and the crew cards.
+    for (const [role, look] of Object.entries(LOOKS)) {
+      for (const bg of ["code-bg", "bg", "panel-hi"]) {
+        expect(ratio(look.accent, token(bg)), `${role} accent on --${bg}`).toBeGreaterThanOrEqual(4.5);
+      }
     }
   });
 });

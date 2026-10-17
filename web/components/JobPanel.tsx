@@ -1,5 +1,6 @@
 import type { Json, RunState } from "../lib/events";
 import { EvidenceBadge, num, str } from "./format";
+import { ProgressRing } from "./Gauges";
 
 /** Training job progress (right column). */
 export function JobPanel({ state }: { state: RunState }) {
@@ -15,17 +16,19 @@ export function JobPanel({ state }: { state: RunState }) {
       {!id && Object.keys(j).length === 0 ? (
         <p className="dim">no training job</p>
       ) : (
-        <>
-          <div>
-            {status} · {done !== null && total !== null ? `${done}/${total} steps` : "steps unknown"}{" "}
-            {"evidence" in j ? <EvidenceBadge evidence={j.evidence as Json} /> : null}
-          </div>
-          {ratio !== null ? (
-            <div className="bar bar-thin" role="progressbar" aria-label="Training steps" aria-valuemin={0} aria-valuemax={total!} aria-valuenow={done!}>
-              <div className="bar-fill bar-cyan" style={{ width: `${(ratio * 100).toFixed(1)}%` }} />
+        <div className="job-row">
+          <ProgressRing done={ratio !== null ? done : null} total={total} label="Training steps" />
+          <div className="job-text">
+            <div>
+              {status} · {done !== null && total !== null ? `${done}/${total} steps` : "steps unknown"}
             </div>
-          ) : null}
-        </>
+            {"evidence" in j ? (
+              <div>
+                <EvidenceBadge evidence={j.evidence as Json} />
+              </div>
+            ) : null}
+          </div>
+        </div>
       )}
     </section>
   );
