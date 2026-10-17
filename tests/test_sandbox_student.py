@@ -115,8 +115,9 @@ def _answer_for(tasks):
 class FakeContree:
     """Records every sandbox call; generation jobs answer through ``answer(item)``."""
 
-    def __init__(self, answer=lambda item: "", job_exit=0, sample_error=None):
+    def __init__(self, answer=lambda item: "", job_exit=0, sample_error=None, delay=0.01):
         self.answer, self.job_exit, self.sample_error = answer, job_exit, sample_error
+        self.delay = delay
         self.runs, self.uses = [], []
         self.inflight = self.max_inflight = 0
         self.images = SimpleNamespace(use=self._use)
@@ -132,7 +133,7 @@ class FakeContree:
             return SimpleNamespace(exit_code=0, uuid=f"img-{n}", stdout="", stderr="")
         self.inflight += 1
         self.max_inflight = max(self.max_inflight, self.inflight)
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(self.delay)
         self.inflight -= 1
         if self.job_exit:
             return SimpleNamespace(exit_code=self.job_exit, uuid=None, stdout="",
@@ -177,6 +178,22 @@ def test_student_builds_once_batches_bounded_and_never_ships_the_key(tmp_path):
                        for r in fake.runs])
     assert KEY not in blob and "proj" not in blob and "env" not in fake.runs[0]
     assert all(b"nb-secret" not in c for r in builds for c in r["files"].values())
+
+
+def test_concurrency_bound_holds_across_parallel_evaluations(tmp_path):
+    import threading
+    tasks = games.make_split(4, 40)
+    fake = FakeContree(_answer_for(tasks), delay=0.05)
+    st = ss.SandboxStudent(_settings(tmp_path), lambda: fake, batch_size=2)
+    st.image_for(None)  # build first so all threads generate at once
+    outs: list = []
+    threads = [threading.Thread(target=lambda: outs.append(len(st.generate(tasks))))
+               for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert outs == [40] * 4 and fake.max_inflight <= ss.CONCURRENCY
 
 
 def test_student_failures_raise_with_partial_counts_never_outputs(tmp_path):
@@ -322,7 +339,8 @@ def test_validate_hparams_tool_accepts_nested_and_flat_calls_through_langchain(t
     assert flat["valid"] is True and flat["checked"] == user_06b
     bad = tool.invoke({**user_06b, "lora_r": 8.5})  # reaches our validator, not pydantic
     assert bad["valid"] is False and any("lora_r" in e for e in bad["errors"])
-    assert tool.invoke({})["valid"] is False  # nothing given: missing keys, no TypeError
+    empty = tool.invoke({})  # nothing given (or a dropped `config` arg): a hint, no TypeError
+    assert empty["valid"] is False and "hyperparameters=" in empty["errors"][0]
     for r, bs in ((8, 4), (16, 8), (32, 16)):  # 0.6B ranges; no tokens-per-batch minimum
         assert tool.invoke({**user_06b, "lora_r": r, "lora_alpha": 2 * r, "batch_size": bs})[
             "valid"]

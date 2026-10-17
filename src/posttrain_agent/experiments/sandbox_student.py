@@ -332,6 +332,7 @@ class SandboxStudent:
         self._job_base_s, self._job_per_s = job_base_timeout_s, job_per_sample_timeout_s
         self._total_s = total_timeout_s
         self._lock = threading.Lock()  # concurrent evaluations must not build the image twice
+        self._slots = threading.BoundedSemaphore(self.concurrency)  # jobs in flight, all calls
         self._deps: str | None = None
         self._adapters: dict[str, str] = {}
         self.timings: list[dict[str, Any]] = []  # image builds and per-batch load/gen seconds
@@ -396,33 +397,42 @@ class SandboxStudent:
     async def _generate(self, image_uuid: str, items: list[dict[str, Any]],
                         has_adapter: bool) -> list[dict[str, Any]]:
         client = self._client()
-        gate = asyncio.Semaphore(self.concurrency)
         cmd = gen_command(self.max_new_tokens, has_adapter)
         chunks = [items[i:i + self.batch_size] for i in range(0, len(items), self.batch_size)]
 
         async def one(chunk: list[dict[str, Any]]) -> dict[str, Any]:
-            async with gate:
-                timeout = self.job_timeout(len(chunk))
-                try:
-                    image = await client.images.use(image_uuid)
-                    res = await asyncio.wait_for(
-                        image.run(shell=cmd, stdin=json.dumps({"items": chunk}), disposable=True,
-                                  timeout=timeout, truncate_output_at=TRUNCATE_OUTPUT_AT),
-                        timeout=timeout + 30)
-                except Exception as exc:  # noqa: BLE001 - timeouts, SDK and network failures
-                    return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
-                if res.exit_code != 0:
-                    return {"error": f"exit {res.exit_code}: {_tail(res.stderr)}"}
-                try:
-                    out = parse_output(_tail(res.stdout, TRUNCATE_OUTPUT_AT))
-                    results = out["results"]
-                except (ValueError, KeyError, TypeError) as exc:
-                    return {"error": f"unreadable generation output: {exc}"}
-                if not isinstance(results, list) or len(results) != len(chunk):
-                    return {"error": "generation returned the wrong number of outputs"}
-                return {"results": results,
-                        "stats": {k: out.get(k) for k in ("load_s", "gen_s", "n", "peak_rss_mb",
-                                                          "versions", "adapter_tensors")}}
+            # The bound is shared by every generate() call on this student (each call runs in
+            # its own event loop/thread), so parallel evaluations together stay within it.
+            # Polling keeps cancellation (total timeout) from leaking a slot.
+            while not self._slots.acquire(blocking=False):
+                await asyncio.sleep(0.05)
+            try:
+                return await run_job(chunk)
+            finally:
+                self._slots.release()
+
+        async def run_job(chunk: list[dict[str, Any]]) -> dict[str, Any]:
+            timeout = self.job_timeout(len(chunk))
+            try:
+                image = await client.images.use(image_uuid)
+                res = await asyncio.wait_for(
+                    image.run(shell=cmd, stdin=json.dumps({"items": chunk}), disposable=True,
+                              timeout=timeout, truncate_output_at=TRUNCATE_OUTPUT_AT),
+                    timeout=timeout + 30)
+            except Exception as exc:  # noqa: BLE001 - timeouts, SDK and network failures
+                return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            if res.exit_code != 0:
+                return {"error": f"exit {res.exit_code}: {_tail(res.stderr)}"}
+            try:
+                out = parse_output(_tail(res.stdout, TRUNCATE_OUTPUT_AT))
+                results = out["results"]
+            except (ValueError, KeyError, TypeError) as exc:
+                return {"error": f"unreadable generation output: {exc}"}
+            if not isinstance(results, list) or len(results) != len(chunk):
+                return {"error": "generation returned the wrong number of outputs"}
+            return {"results": results,
+                    "stats": {k: out.get(k) for k in ("load_s", "gen_s", "n", "peak_rss_mb",
+                                                      "versions", "adapter_tensors")}}
 
         try:
             parts = await asyncio.wait_for(asyncio.gather(*(one(c) for c in chunks)),

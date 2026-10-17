@@ -232,6 +232,11 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         if hyperparameters is not None and not isinstance(hyperparameters, dict):
             return {"valid": False, "errors": ["hyperparameters must be an object"]}
         merged = {**(hyperparameters or {}), **{k: v for k, v in flat.items() if v is not None}}
+        if not merged:
+            return {"valid": False, "errors": [
+                "no hyperparameters received: pass them as hyperparameters={...} or as flat "
+                "arguments (lora_r=..., ...); an argument named `config` is dropped by the tool "
+                "runtime"]}
         errors = validate_hparams(merged)
         return {"valid": not errors, "errors": errors, "checked": merged}
 
