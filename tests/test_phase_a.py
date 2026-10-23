@@ -23,6 +23,8 @@ from posttrain_agent.tools import budget, dataset
 
 needs_tok = pytest.mark.skipif(not pt.available(), reason="jinja2/tokenizers or cached Qwen3 tokenizer missing")
 OLD = Path(__file__).resolve().parents[1] / "state" / "data" / "exp1_data_n1200.jsonl"
+# state/ is gitignored: the live-06b dataset only exists on the machine that ran it
+needs_old = pytest.mark.skipif(not OLD.exists(), reason="state/data/exp1_data_n1200.jsonl absent")
 HP = {"lora_r": 8, "lora_alpha": 8, "lora_dropout": 0.0, "learning_rate": 1e-4, "n_epochs": 3,
       "batch_size": 4, "context_length": 8192, "packing": False}
 
@@ -83,6 +85,7 @@ def test_labels_decode_to_exactly_the_tool_call_and_parse():
 
 
 @needs_tok
+@needs_old
 def test_target_equals_what_the_qwen3_template_renders_itself():
     tok = pt.get_tokenizer()
     for row in _rows(40) + [json.loads(OLD.read_text().splitlines()[0])]:
@@ -204,6 +207,7 @@ def test_launch_requires_a_passing_template_check_and_enough_steps(tmp_path):
 
 
 @needs_tok
+@needs_old
 def test_budget_estimate_is_within_25_percent_of_the_observed_889k(tmp_path):
     (tmp_path / "data").mkdir()
     shutil.copy(OLD, tmp_path / "data" / "d.jsonl")
@@ -212,6 +216,7 @@ def test_budget_estimate_is_within_25_percent_of_the_observed_889k(tmp_path):
     assert e["basis"].startswith("tokenizer")
 
 
+@needs_old
 def test_budget_fallback_is_4x_the_old_char_estimate(tmp_path, monkeypatch):
     monkeypatch.setattr(budget, "_tokenizer", lambda: None)
     (tmp_path / "data").mkdir()

@@ -82,6 +82,23 @@ def _provider_jsonl(path: Path) -> bytes:
     return ("\n".join(out) + "\n").encode()
 
 
+def _swap_token_key(data: bytes, failure: dict[str, Any]) -> bytes | None:
+    """The same pretokenized file with ``token_ids`` <-> ``input_ids`` renamed, or None when the
+    failure is not a 4xx that names the key (or the file is not pretokenized)."""
+    text = f"{failure.get('error', '')} {failure.get('detail', '')}"
+    if "HTTP 4" not in text or not ("token_ids" in text or "input_ids" in text):
+        return None
+    rows = [json.loads(line) for line in data.decode().splitlines() if line.strip()]
+    if not rows or not all(isinstance(r, dict) for r in rows):
+        return None
+    old, new = ("token_ids", "input_ids") if "token_ids" in rows[0] else ("input_ids", "token_ids")
+    if old not in rows[0]:
+        return None
+    out = [json.dumps({(new if k == old else k): v for k, v in r.items()}, sort_keys=True)
+           for r in rows]
+    return ("\n".join(out) + "\n").encode()
+
+
 class NebiusBackend:
     def __init__(self, settings: Settings,
                  client_factory: Callable[[], httpx.Client] | None = None,
@@ -183,17 +200,25 @@ class NebiusBackend:
 
     # -- training ---------------------------------------------------------------
     def train(self, config: dict[str, Any], dataset_path: Path, base_model: str) -> dict[str, Any]:
-        up = self._req("POST", "/files", data={"purpose": "fine-tune"},
-                       files={"file": (dataset_path.name, _provider_jsonl(dataset_path))})
-        if "error" in up:
-            return {**up, "status": "BLOCKED", "stage": "upload"}
-        job = self._req("POST", "/fine_tuning/jobs", json={
-            "model": base_model, "training_file": up["id"], "seed": self.s.seed,
-            "suffix": dataset_path.stem[:64],
-            "hyperparameters": {**config, "lora": True},
-        }, tries=1)  # never auto-retry job creation: a lost response could double-launch a paid job
-        if job.get("error") and "id" not in job:
-            return {**job, "status": "BLOCKED", "stage": "create_job"}
+        """Upload then create the job. Nebius's docs name the pretokenized key both ``token_ids``
+        and ``input_ids``; if the provider rejects the file or job with a 4xx naming the key,
+        re-upload ONCE with the other name. A rejected creation made no job, so no double launch."""
+        data = _provider_jsonl(dataset_path)
+        for attempt in (1, 2):
+            up = self._req("POST", "/files", data={"purpose": "fine-tune"},
+                           files={"file": (dataset_path.name, data)})
+            job = up if "error" in up else self._req("POST", "/fine_tuning/jobs", json={
+                "model": base_model, "training_file": up["id"], "seed": self.s.seed,
+                "suffix": dataset_path.stem[:64],
+                "hyperparameters": {**config, "lora": True},
+            }, tries=1)  # never auto-retry job creation: a lost response could double-launch
+            if not (job.get("error") and "id" not in job):
+                break
+            swapped = _swap_token_key(data, job)
+            if attempt == 2 or swapped is None:
+                stage = "upload" if "error" in up else "create_job"
+                return {**job, "status": "BLOCKED", "stage": stage}
+            data = swapped
         return {"evidence": "LIVE", "status": job.get("status", "queued"),
                 "provider_job_id": job["id"], "training_file": up["id"], "checkpoint": None}
 

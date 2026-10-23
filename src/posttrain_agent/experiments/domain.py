@@ -469,9 +469,10 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         return res
 
     def evaluate_checkpoint(checkpoint: str, split: str = "heldout") -> dict[str, Any]:
-        """Evaluate a checkpoint on a sealed split ('heldout' or 'regression'); scores only."""
-        if split not in {"heldout", "regression"}:
-            return {"error": "split must be 'heldout' or 'regression'"}
+        """Evaluate a checkpoint on a sealed split ('heldout' or 'regression'; 'heldout_phrasing' is
+        informational only and never gates); scores only."""
+        if split not in {"heldout", "regression", "heldout_phrasing"}:
+            return {"error": "split must be 'heldout', 'regression' or 'heldout_phrasing'"}
         job = None
         if checkpoint in {"candidate", "latest"}:
             rec = rs.latest_succeeded(settings.state_dir, CURRENT_RUN.get())
