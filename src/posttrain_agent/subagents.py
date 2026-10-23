@@ -25,16 +25,16 @@ ROLES: dict[str, tuple[str, str, tuple[str, ...], bool]] = {
     "researcher": ("research.md", "Turns failure clusters into falsifiable hypotheses; looks up papers and Hub metadata.",
                    ("web_search", "web_extract", "hf_search", "hf_model_info", "hf_dataset_info"), True),
     "data_curator": ("data_curator.md", "Builds and verifies SFT datasets from verified trajectories.",
-                     ("generate_game_sft", "verify_dataset", "save_dataset", "hf_dataset_info"),
-                     False),
+                     ("generate_game_sft", "verify_dataset", "save_dataset", "inspect_dataset",
+                      "check_chat_template", "hf_dataset_info"), False),
     "training_designer": ("training_designer.md", "Chooses bounded LoRA hyperparameters and checks the budget.",
                           ("validate_hparams", "estimate_budget", "web_search", "hf_model_info"), False),
     "training_executor": ("training_executor.md", "Submits one human-approved fine-tuning job and monitors it.",
-                          ("launch_training", "get_training_status", "read_training_logs"), False),
+                          ("launch_training", "wait_for_training", "read_training_logs"), False),
     "evaluator": ("eval.md", "Evaluates champion and candidate on sealed splits.",
                   ("evaluate_checkpoint",), False),
-    "champion_manager": ("champion_manager.md", "Explains the deterministic promotion gate.",
-                         ("decide_promotion",), False),
+    "champion_manager": ("champion_manager.md", "Runs the deterministic promotion gate over the eval ledger and explains it.",
+                         ("run_gate",), False),
 }
 
 
@@ -47,6 +47,7 @@ def build_subagents(
     memory: Sequence[Any] = (),
     middleware: Sequence[Any] = (),
     models: dict[str, Any] | None = None,
+    disable_general_purpose: bool = False,
 ) -> list[SubAgent]:
     """``memory`` is (remember, recall); researchers get both, everyone else just recall."""
     remember, recall = memory if memory else (None, None)
@@ -67,4 +68,14 @@ def build_subagents(
         if models and name in models:  # else the subagent inherits the coordinator's model
             spec["model"] = models[name]
         specs.append(spec)
+    if disable_general_purpose:
+        # an explicit spec overrides deepagents' built-in all-tools general-purpose subagent; the
+        # concurrency middleware also refuses `task` calls that name it
+        specs.append(SubAgent(
+            name="general-purpose",
+            description="DISABLED. Do not use; delegate to the named specialists.",
+            system_prompt=("This subagent is disabled. Reply only with "
+                           '{"status": "BLOCKED", "errors": ["general-purpose is disabled"]}.'),
+            tools=[recall] if recall is not None else [],
+            middleware=list(middleware)))
     return specs

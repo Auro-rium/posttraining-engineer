@@ -23,6 +23,16 @@ from langchain.agents.middleware import (
 from ..config import Settings
 from .backboard_model import CassetteMiss, ChatBackboard
 
+NO_RETRY_TOOLS = frozenset({"task", "launch_training"})
+
+
+class SafeToolRetryMiddleware(ToolRetryMiddleware):
+    """Tool retry that skips `task` (a retry would re-run a whole subagent) and `launch_training`
+    (a retry after a paid launch could double-launch)."""
+
+    def _should_retry_tool(self, tool_name: str) -> bool:
+        return tool_name not in NO_RETRY_TOOLS and super()._should_retry_tool(tool_name)
+
 
 def is_transient(exc: Exception) -> bool:
     """True for errors worth retrying: rate limits, 5xx, timeouts/network, empty replies.
@@ -73,5 +83,5 @@ def build_middleware(settings: Settings, **model_extra) -> list:
             max_delay=20.0,
         )
     )
-    stack.append(ToolRetryMiddleware(max_retries=1, on_failure="continue"))
+    stack.append(SafeToolRetryMiddleware(max_retries=1, on_failure="continue"))
     return stack

@@ -22,6 +22,7 @@ Per-type effects:
                        otherwise the event is malformed.
   checkpoint           append {checkpoint_id, step}
   telemetry.snapshot   telemetry merged key by key
+  operator.note        log only (note_id, text_len; the note text is never journaled)
   model.call, tool.call  log only
 ``active_slots`` is the numerically ascending sorted list of slots of active agents.
 
@@ -41,7 +42,7 @@ in a summary. Fields per type:
   score: split checkpoint evidence | gate.verdict: decision | budget.update: price_known
   job.update: job_id status | job.log: level message | approval.pending: action
   approval.resolved: decision | checkpoint: checkpoint_id step | telemetry.snapshot: (empty)
-  a2a.message: from to kind
+  a2a.message: from to kind | operator.note: note_id
 """
 
 from __future__ import annotations
@@ -71,6 +72,7 @@ _SUMMARY_FIELDS: dict[str, tuple[str, ...]] = {
     "approval.resolved": ("decision",),
     "checkpoint": ("checkpoint_id", "step"),
     "a2a.message": ("from", "to", "kind"),
+    "operator.note": ("note_id",),
     "telemetry.snapshot": (),
 }
 A2A_MAX = 100

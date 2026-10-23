@@ -56,7 +56,8 @@ def test_path_traversal_refused(tmp_path, ref):
     assert not dataset.verify_file(tmp_path, ref)["ok"]
 
 
-def test_budget_math_cap_and_unknown_price(tmp_path):
+def test_budget_math_cap_and_unknown_price(tmp_path, monkeypatch):
+    monkeypatch.setattr(budget, "_tokenizer", lambda: None)  # chars/4 x 4 fallback
     (tmp_path / "data").mkdir()
     big = row(messages=[{"role": "user", "content": "x" * 4000},
                         {"role": "assistant", "content": "y" * 4000}])
@@ -64,8 +65,8 @@ def test_budget_math_cap_and_unknown_price(tmp_path):
     hp = {"n_epochs": 2, "context_length": 8192}
     s = Settings(state_dir=tmp_path, data_dir=tmp_path / "data", price_per_mtok=10.0, max_cost_usd=1.0)
     e = budget.estimate(s, "d.jsonl", hp)
-    assert e["estimated_trained_tokens"] == 2 * (8032 // 4)  # two epochs of 2008 tokens
-    assert e["estimated_cost_usd"] == pytest.approx(4016 / 1e6 * 10, abs=1e-4)
+    assert e["estimated_trained_tokens"] == 2 * (8032 // 4) * 4  # two epochs, 4x fallback
+    assert e["estimated_cost_usd"] == pytest.approx(16064 / 1e6 * 10, abs=1e-4)
     assert e["within_budget"] is True
     budget.record_spend(s, "j1", 0.99, "d.jsonl")
     assert budget.estimate(s, "d.jsonl", hp)["within_budget"] is False
@@ -74,7 +75,8 @@ def test_budget_math_cap_and_unknown_price(tmp_path):
     assert "error" in budget.estimate(s, "nope.jsonl", hp)
 
 
-def test_context_truncation_counted(tmp_path):
+def test_context_truncation_counted(tmp_path, monkeypatch):
+    monkeypatch.setattr(budget, "_tokenizer", lambda: None)
     (tmp_path / "data").mkdir()
     big = row(messages=[{"role": "user", "content": "x" * 100_000},
                         {"role": "assistant", "content": "ok"}])

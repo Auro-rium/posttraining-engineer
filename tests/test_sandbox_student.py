@@ -104,10 +104,10 @@ def test_prepare_adapter_validates_base_and_renames_weights():
 
 
 def _answer_for(tasks):
-    by_prompt = {t["messages"][0]["content"]: t for t in tasks}
+    by_prompt = {t["messages"][-1]["content"]: t for t in tasks}
 
     def answer(item):
-        exp = by_prompt[item["messages"][0]["content"]]["expected"]
+        exp = by_prompt[item["messages"][-1]["content"]]["expected"]
         return f"<tool_call>\n{json.dumps(exp)}\n</tool_call><|im_end|>"
     return answer
 
@@ -274,10 +274,10 @@ def test_auto_serves_unlisted_base_and_checkpoint_in_the_sandbox(tmp_path):
 
 def test_auto_keeps_serverless_for_a_listed_base_model(tmp_path):
     tasks = _write_suite(tmp_path)
-    by_prompt = {t["messages"][0]["content"]: t for t in tasks}
+    by_prompt = {t["messages"][-1]["content"]: t for t in tasks}
 
     def chat(body):
-        exp = by_prompt[body["messages"][0]["content"]]["expected"]
+        exp = by_prompt[body["messages"][-1]["content"]]["expected"]
         return {"choices": [{"message": {"tool_calls": [{"function": {
             "name": exp["name"], "arguments": json.dumps(exp["arguments"])}}]}}]}
 
@@ -319,7 +319,7 @@ def test_job_status_remembers_checkpoint_files_for_sandbox_serving(tmp_path):
 def test_gate_never_compares_two_serving_paths():
     def res(score, served):
         return {"score": score, "n": 400, "evidence": "LIVE", "suite": "s", "split": "heldout",
-                "seed": 7, "judged_by": "nebius-sandbox", "served_by": served}
+                "seed": 7, "judged_by": "nebius-sandbox", "served_by": served, "parse_rate": 1.0}
     mixed = promotion_gate(res(0.4, "nebius-serverless"), res(0.9, "nebius-sandbox-cpu"))
     assert mixed["decision"] == "REJECT" and "served_by differs" in mixed["reasons"][0]
     same = promotion_gate(res(0.4, "nebius-sandbox-cpu"), res(0.9, "nebius-sandbox-cpu"))

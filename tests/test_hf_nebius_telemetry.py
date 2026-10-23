@@ -99,7 +99,9 @@ def test_nebius_evaluation_scores_exact_match_and_keeps_heldout_sealed(tmp_path)
 
     b, calls = mock_nebius(tmp_path, {("POST", "/chat/completions"): completion})
     ev = b.evaluate("base", "s", "heldout", 7)
-    assert ev["score"] == 0.5 and ev["n"] == 2 and "failures" not in ev and ev["evidence"] == "LIVE"
+    assert ev["score"] == 0.5 and ev["n"] == 2 and ev["evidence"] == "LIVE"
+    assert ev["parse_rate"] == 1.0 and ev["n_wrong_tool"] == 1
+    assert "expected" not in json.dumps(ev["failures"]) and "restart_service" not in json.dumps(ev)
     bench = b.benchmark("ft:x", "s", 7)
     assert bench["score"] == 0.0 and bench["failures"][0]["task_id"] == "t1"
     chat = [c for c in calls if c[1].endswith("/chat/completions")]

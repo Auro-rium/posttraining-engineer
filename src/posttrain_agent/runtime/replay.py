@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +23,7 @@ from langgraph.store.base import BaseStore
 from langgraph.types import Command
 
 from ..llm.backboard_model import CassetteMiss
+from ..llm.resilience import is_transient
 from ..observability.events import CURRENT_RUN, Journal, emit
 
 LEDGER_NS = ("posttrain", "runs")
@@ -30,12 +33,26 @@ FATAL = (CassetteMiss, KeyboardInterrupt, asyncio.CancelledError)
 @dataclass
 class RunReport:
     thread_id: str
-    status: str  # COMPLETED | FAILED | AWAITING_APPROVAL
+    # COMPLETED | INCOMPLETE (ended without a gate verdict/abort) | FAILED | FAILED_TRANSIENT
+    # (provider outage outlasted the retry window; resumable) | AWAITING_APPROVAL
+    status: str
     attempts: int
     result: dict[str, Any] | None = None
     errors: list[str] = field(default_factory=list)
     last_checkpoint_id: str | None = None
     pending: list[dict[str, Any]] = field(default_factory=list)
+
+
+OUTAGE_BUDGET_S = 900.0  # ~15 minutes of retrying a transient provider outage
+MAX_TRANSIENT_ATTEMPTS = 100
+
+
+def is_outage(exc: BaseException) -> bool:
+    """Transient provider/network trouble worth waiting out (as opposed to a bug or a bad request)."""
+    if isinstance(exc, Exception) and is_transient(exc):
+        return True
+    return isinstance(exc, OSError | TimeoutError | ConnectionError) or \
+        type(exc).__module__.startswith("httpx") and "Error" in type(exc).__name__
 
 
 def _cfg(thread_id: str, checkpoint_id: str | None = None,
@@ -149,23 +166,41 @@ async def _run_with_recovery(
     journal: Journal | None = None,
     backend: str | None = None,
     experiment_budget: int | None = None,
+    exit_check: Callable[[str], str | None] | None = None,
+    outage_budget_s: float = OUTAGE_BUDGET_S,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+    jitter: Callable[[], float] = random.random,
 ) -> RunReport:
     """Run ``goal`` on ``thread_id``; resume from the last checkpoint after failures.
 
     If the thread already has state the first attempt resumes instead of restarting.
-    ``resume`` answers a pending human approval (see ``decide``).
+    ``resume`` answers a pending human approval (see ``decide`` ).
+
+    Non-transient errors use the small ``max_attempts`` budget. Transient ones (provider outage,
+    DNS, timeouts) are retried with jittered exponential backoff (cap 60 s) for up to
+    ``outage_budget_s`` in total, emitting ``run.status RETRYING``; if the outage outlasts that the
+    status is ``FAILED_TRANSIENT`` (resumable with ``posttrain resume``). ``exit_check(thread)``
+    returns the missing step when the run ended without a gate verdict or abort: the status is then
+    ``INCOMPLETE`` rather than ``COMPLETED``.
     """
     cfg = _cfg(thread_id, callbacks=callbacks)
     snapshot = await graph.aget_state(cfg)
-    payload: Any = resume or (None if snapshot.values else
+    finished = bool(snapshot.values) and not snapshot.next  # a completed thread: nothing to resume
+    payload: Any = resume or (None if snapshot.values and not (finished and goal) else
                               {"messages": [{"role": "user", "content": goal}]})
+    if resume is None and not goal and finished and exit_check and (why := exit_check(thread_id)):
+        payload = {"messages": [{"role": "user", "content": (
+            f"Resume: the previous attempt ended without finishing. {why}")}]}
     if resume is None and not snapshot.values:
         emit(journal, "run.started", {"goal_len": len(goal), "experiment_budget": experiment_budget,
                                       "backend": backend}, run=thread_id)
     report = RunReport(thread_id, "FAILED", 0)
     error_types: list[str] = []  # journal gets type names only; full text stays in report.errors
-    for attempt in range(1, max_attempts + 1):
-        report.attempts = attempt
+    hard_failures = transient_failures = 0
+    waited, last_transient = 0.0, False
+    while True:
+        report.attempts += 1
+        attempt = report.attempts
         await _record(store, report)
         emit(journal, "run.status", {"status": "RUNNING", "attempt": attempt}, run=thread_id)
         try:
@@ -182,8 +217,21 @@ async def _run_with_recovery(
             report.last_checkpoint_id, step = _checkpoint_of(state)
             emit(journal, "checkpoint", {"checkpoint_id": report.last_checkpoint_id,
                                          "step": step}, run=thread_id)
-            if attempt < max_attempts:
-                await asyncio.sleep(base_delay * 2 ** (attempt - 1))
+            last_transient = is_outage(exc)
+            if last_transient:
+                transient_failures += 1
+                delay = min(base_delay * 2 ** (transient_failures - 1), 60.0) * (0.5 + jitter())
+                if waited + delay > outage_budget_s or transient_failures >= MAX_TRANSIENT_ATTEMPTS:
+                    break
+                emit(journal, "run.status", {"status": "RETRYING", "attempt": attempt,
+                                             "errors": [type(exc).__name__]}, run=thread_id)
+                waited += delay
+                await sleep(delay)
+                continue
+            hard_failures += 1
+            if hard_failures >= max_attempts:
+                break
+            await sleep(base_delay * 2 ** (hard_failures - 1))
             continue
         state = await graph.aget_state(cfg)
         report.last_checkpoint_id, step = _checkpoint_of(state)
@@ -192,8 +240,16 @@ async def _run_with_recovery(
         report.pending = await pending_actions(graph, thread_id)
         report.status = "AWAITING_APPROVAL" if report.pending else "COMPLETED"
         report.result = result
+        if report.status == "COMPLETED" and exit_check is not None:
+            missing = exit_check(thread_id)
+            if missing:
+                report.status = "INCOMPLETE"
+                report.errors.append(f"ended without a gate verdict or abort: {missing}")
+                error_types.append("ExitInvariant")
         _emit_pending(journal, thread_id, report.pending)
         break
+    if report.status == "FAILED" and last_transient:
+        report.status = "FAILED_TRANSIENT"
     await _record(store, report)
     emit(journal, "run.status", {"status": report.status, "attempt": report.attempts,
                                  "errors": error_types}, run=thread_id)
@@ -211,6 +267,7 @@ async def decide(
     base_delay: float = 2.0,
     callbacks: list[Any] | None = None,
     journal: Journal | None = None,
+    exit_check: Callable[[str], str | None] | None = None,
 ) -> RunReport:
     """Approve or reject every pending action of a paused thread, then continue the run."""
     pauses = await _pauses(graph, thread_id)
@@ -230,7 +287,7 @@ async def decide(
                                         "message_len": len(message or "")}, run=thread_id)
     return await run_with_recovery(
         graph, "", thread_id, store=store, max_attempts=max_attempts, base_delay=base_delay,
-        resume=resume, callbacks=callbacks, journal=journal)
+        resume=resume, callbacks=callbacks, journal=journal, exit_check=exit_check)
 
 
 async def history(graph: Any, thread_id: str) -> list[dict[str, Any]]:

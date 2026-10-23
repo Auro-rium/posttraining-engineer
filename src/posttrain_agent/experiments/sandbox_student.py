@@ -38,7 +38,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..config import Settings
-from .sandbox import SandboxUnavailable, _run_sync, contree_client
+from .retry import is_transient, retry_async
+from .sandbox import TRANSPORT_TIMEOUT_S, SandboxUnavailable, _run_sync, contree_client
 
 SERVED_BY = "nebius-sandbox-cpu"
 OUT_MARKER = "POSTTRAIN_OUT:"
@@ -54,18 +55,23 @@ JOB_BASE_TIMEOUT_S = 240.0  # python + torch import + model load, with headroom
 JOB_PER_SAMPLE_TIMEOUT_S = 45.0
 TOTAL_TIMEOUT_S = 3600.0  # one whole generate() call
 TRUNCATE_OUTPUT_AT = 1_000_000  # the SDK default (64 KiB) would cut the JSON result
-TRANSPORT_TIMEOUT_S = 600.0  # SDK default 10 s timed out uploading a LoRA adapter (live)
 ADAPTER_CONFIG = "adapter_config.json"
 ADAPTER_WEIGHTS = ("adapter_model.safetensors", "adapter_model.bin")  # the names peft loads
 END_TOKENS = ("<|im_end|>", "<|endoftext|>")
 
 
 class StudentError(RuntimeError):
-    """Serving failed. ``done``/``total`` count samples generated before the failure."""
+    """Serving failed. ``done``/``total`` count samples generated before the failure.
 
-    def __init__(self, message: str, *, done: int = 0, total: int = 0, stage: str = "inference"):
+    ``partial`` holds one output per input item (None where missing) so completed batches are
+    kept; ``transient`` is True when the failure was a network/timeout one that outlasted retries.
+    """
+
+    def __init__(self, message: str, *, done: int = 0, total: int = 0, stage: str = "inference",
+                 transient: bool = False, partial: list[dict[str, Any] | None] | None = None):
         super().__init__(message)
         self.done, self.total, self.stage = done, total, stage
+        self.transient, self.partial = transient, partial or []
 
 
 # ------------------------------------------------- pure logic (also shipped inside the sandbox)
@@ -347,15 +353,19 @@ class SandboxStudent:
     async def _branch(self, image_ref: str, shell: str, files: dict[str, bytes], timeout: float,
                       strict: bool, what: str) -> str:
         client = self._client()
-        image = await client.images.use(image_ref, strict=strict)
         t = time.monotonic()
-        try:
-            res = await asyncio.wait_for(
+
+        async def attempt() -> Any:
+            image = await client.images.use(image_ref, strict=strict)
+            return await asyncio.wait_for(
                 image.run(shell=shell, files=files, disposable=False, timeout=timeout,
                           truncate_output_at=TRUNCATE_OUTPUT_AT), timeout=timeout + 60)
+
+        try:  # DNS / transport / upload timeouts are retried with backoff before giving up
+            res = await retry_async(attempt)
         except Exception as exc:  # noqa: BLE001 - any SDK/network failure or our backstop
             raise StudentError(f"{what} build failed: {type(exc).__name__}: {str(exc)[:200]}",
-                               stage="image") from exc
+                               stage="image", transient=is_transient(exc)) from exc
         if res.exit_code != 0 or not getattr(res, "uuid", None):
             raise StudentError(f"{what} build failed: exit {res.exit_code}: {_tail(res.stderr)}",
                                stage="image")
@@ -390,7 +400,8 @@ class SandboxStudent:
         try:
             image = self.image_for(adapter)
         except SandboxUnavailable as exc:
-            raise StudentError(str(exc), total=len(items), stage="image") from exc
+            raise StudentError(str(exc), total=len(items), stage="image",
+                               transient=exc.transient) from exc
         payload = [{"messages": it["messages"], "tools": it.get("tools") or None} for it in items]
         return _run_sync(lambda: self._generate(image, payload, adapter is not None))
 
@@ -413,14 +424,19 @@ class SandboxStudent:
 
         async def run_job(chunk: list[dict[str, Any]]) -> dict[str, Any]:
             timeout = self.job_timeout(len(chunk))
-            try:
+
+            async def attempt() -> Any:
                 image = await client.images.use(image_uuid)
-                res = await asyncio.wait_for(
+                return await asyncio.wait_for(
                     image.run(shell=cmd, stdin=json.dumps({"items": chunk}), disposable=True,
                               timeout=timeout, truncate_output_at=TRUNCATE_OUTPUT_AT),
                     timeout=timeout + 30)
+
+            try:  # each batch retries on its own; finished batches are never redone
+                res = await retry_async(attempt)
             except Exception as exc:  # noqa: BLE001 - timeouts, SDK and network failures
-                return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+                return {"error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                        "transient": is_transient(exc)}
             if res.exit_code != 0:
                 return {"error": f"exit {res.exit_code}: {_tail(res.stderr)}"}
             try:
@@ -439,20 +455,26 @@ class SandboxStudent:
                                            timeout=self._total_s)
         except TimeoutError as exc:
             raise StudentError(f"generation exceeded {self._total_s:.0f}s", total=len(items)) from exc
-        outputs: list[dict[str, Any]] = []
-        errors = [p["error"] for p in parts if "error" in p]
-        done = sum(len(p["results"]) for p in parts if "results" in p)
+        errors = [p for p in parts if "error" in p]
         for p in parts:
             if "stats" in p:
                 self.timings.append(p["stats"])
+        partial: list[dict[str, Any] | None] = []
+        for chunk, p in zip(chunks, parts, strict=True):
+            if "results" in p:  # a sample that failed inside the sandbox counts as missing
+                partial.extend(o if isinstance(o, dict) and not o.get("error") else None
+                               for o in p["results"])
+            else:
+                partial.extend([None] * len(chunk))
+        done = sum(o is not None for o in partial)
         if errors:
             raise StudentError(f"{len(errors)} of {len(chunks)} generation batches failed; first: "
-                               f"{errors[0]}", done=done, total=len(items))
-        for p in parts:
-            outputs.extend(p["results"])
-        bad = [o for o in outputs if not isinstance(o, dict) or o.get("error")]
-        if bad:
+                               f"{errors[0]['error']}", done=done, total=len(items),
+                               transient=all(e.get("transient") for e in errors), partial=partial)
+        if done < len(partial):
+            bad = [o for p in parts for o in p["results"]
+                   if not isinstance(o, dict) or o.get("error")]
             first = bad[0].get("error") if isinstance(bad[0], dict) else "malformed result"
-            raise StudentError(f"{len(bad)} of {len(outputs)} samples failed inside the sandbox; "
-                               f"first: {first}", done=len(outputs) - len(bad), total=len(items))
-        return outputs
+            raise StudentError(f"{len(bad)} of {len(partial)} samples failed inside the sandbox; "
+                               f"first: {first}", done=done, total=len(items), partial=partial)
+        return [o for o in partial if o is not None]

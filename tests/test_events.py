@@ -10,7 +10,7 @@ from posttrain_agent.observability.events import CURRENT_RUN, EVENT_TYPES, Journ
 
 
 def test_event_types_are_the_sixteen_in_the_spec():
-    assert len(EVENT_TYPES) == 16  # the 15 of the spec + a2a.message
+    assert len(EVENT_TYPES) == 17  # the 15 of the spec + a2a.message + operator.note
     assert CURRENT_RUN.get() == ""
 
 

@@ -86,10 +86,10 @@ def _suite(tmp_path, n=8):
 
 def _backend(tmp_path, tasks, judge_mode, sandbox=None, right=True):
     suite, _ = tmp_path / "suite", tasks
-    by_prompt = {t["messages"][0]["content"]: t for t in tasks}
+    by_prompt = {t["messages"][-1]["content"]: t for t in tasks}
 
     def handler(req: httpx.Request) -> httpx.Response:
-        task = by_prompt[json.loads(req.content)["messages"][0]["content"]]
+        task = by_prompt[json.loads(req.content)["messages"][-1]["content"]]
         args = task["expected"]["arguments"] if right else {}
         call = {"function": {"name": task["expected"]["name"], "arguments": json.dumps(args)}}
         return httpx.Response(200, json={"choices": [{"message": {"tool_calls": [call]}}]})
@@ -103,15 +103,16 @@ def test_evaluation_uses_the_sandbox_when_available_and_labels_it(tmp_path):
     be = _backend(tmp_path, tasks, "auto", SandboxJudge(Settings(), lambda: FakeSandbox()))
     r = be.evaluate("base", "s", "heldout", 7)
     assert r["judged_by"] == "nebius-sandbox" and r["score"] == 1.0 and r["n"] == 8
-    assert "failures" not in r and set(r["by_game"]) <= {"ttt", "nim", "guess", "rps"}
+    assert r["failures"] == [] and r["parse_rate"] == 1.0 and set(r["by_game"]) <= {"ttt", "nim", "guess", "rps"}
 
 
-def test_auto_falls_back_locally_with_a_visible_note_but_sandbox_mode_does_not(tmp_path):
+def test_judge_fails_closed_when_the_sandbox_judge_fails_in_auto_and_sandbox_modes(tmp_path):
     _, tasks = _suite(tmp_path)
     broken = SandboxJudge(Settings(), lambda: FakeSandbox(fail=True))
     auto = _backend(tmp_path, tasks, "auto", broken).evaluate("base", "s", "heldout", 7)
-    assert auto["judged_by"] == "local-env" and "sandbox failed" in auto["judge_note"]
-    assert auto["score"] == 1.0
+    assert "score" not in auto and auto["stage"] == "judge" and "judged_by" not in auto
+    local = _backend(tmp_path, tasks, "local").evaluate("base", "s", "heldout", 7)  # explicit
+    assert local["judged_by"] == "local-env" and local["score"] == 1.0
     strict = _backend(tmp_path, tasks, "sandbox", broken).evaluate("base", "s", "heldout", 7)
     assert "error" in strict and strict["stage"] == "judge"
     unset = _backend(tmp_path, tasks, "sandbox").evaluate("base", "s", "heldout", 7)
@@ -131,7 +132,7 @@ def test_wrong_moves_score_zero_and_benchmark_reports_the_reason(tmp_path):
 def test_gate_never_compares_results_from_different_judges():
     def res(score, judge):
         return {"score": score, "n": 400, "evidence": "LIVE", "suite": "s", "split": "heldout",
-                "seed": 7, "judged_by": judge}
+                "seed": 7, "judged_by": judge, "parse_rate": 1.0}
     mixed = promotion_gate(res(0.4, "local-env"), res(0.9, "nebius-sandbox"))
     assert mixed["decision"] == "REJECT" and "judged_by differs" in mixed["reasons"][0]
     assert promotion_gate(res(0.4, "nebius-sandbox"), res(0.9, "nebius-sandbox"))["decision"] == "PROMOTE"

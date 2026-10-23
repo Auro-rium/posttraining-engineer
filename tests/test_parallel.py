@@ -133,11 +133,16 @@ async def test_two_paused_launches_are_both_answered_by_one_decision(tmp_path):
                 "name": "task", "arguments":
                 '{"description": "launch", "subagent_type": "training_executor"}'}} for i in range(2)]}
 
-    def launch():
+    launched = []
+
+    def launch():  # distinct hyperparameters: an identical second launch is refused as a duplicate
+        launched.append(1)
+        n = len(launched)
         return {"content": "", "status": "REQUIRES_ACTION", "tool_calls": [
-            {"id": "l1", "type": "function", "function": {
+            {"id": f"l{n}", "type": "function", "function": {
                 "name": "launch_training", "arguments":
-                json.dumps({"hyperparameters": GOOD, "dataset_ref": "d.jsonl"})}}]}
+                json.dumps({"hyperparameters": {**GOOD, "n_epochs": 1 + n},
+                            "dataset_ref": "d.jsonl"})}}]}
 
     def script(kw):
         coordinator = "You are the coordinator" in kw["system_prompt"]

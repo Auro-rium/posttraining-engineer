@@ -23,7 +23,11 @@ from pathlib import Path
 
 from posttrain_agent.config import Settings, load_dotenv
 from posttrain_agent.experiments.nebius import NebiusBackend
-from posttrain_agent.experiments.sandbox_student import SandboxStudent, clean_output, first_tool_call
+from posttrain_agent.experiments.sandbox_student import (
+    SandboxStudent,
+    clean_output,
+    first_tool_call,
+)
 
 
 def _suite(tasks: list[dict]) -> Path:
@@ -48,7 +52,7 @@ def _run(be: NebiusBackend, student: SandboxStudent, checkpoint: str, tasks: lis
     student.generate = orig  # type: ignore[method-assign]
     print(f"\n== {checkpoint[:90]} on {len(tasks)} tasks: {wall:.1f}s wall")
     print(json.dumps(res, indent=1))
-    for task, out in zip(tasks, captured):
+    for task, out in zip(tasks, captured, strict=False):
         print(f"- {task['id']}: expected {json.dumps(task['expected'])}")
         print(f"  raw: {clean_output(out.get('text') or '')[:300]!r}")
         print(f"  parsed: {json.dumps(first_tool_call(out.get('text') or ''))}  "

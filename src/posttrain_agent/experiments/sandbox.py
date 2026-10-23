@@ -24,14 +24,22 @@ from typing import Any
 
 from ..config import Settings
 from . import game_env
+from .retry import is_transient, retry_async
 
 BATCH = 40  # calls per sandbox operation
 PARALLEL = 4  # operations in flight (Beta allows 50 per project)
 TIMEOUT_NOTE = "sandbox operation failed"
+TRANSPORT_TIMEOUT_S = 600.0  # SDK default 10 s timed out uploading a LoRA adapter (live)
 
 
 class SandboxUnavailable(RuntimeError):
-    """The sandbox cannot be used (SDK missing, project not configured, or a call failed)."""
+    """The sandbox cannot be used (SDK missing, project not configured, or a call failed).
+
+    ``transient`` is True when retries were exhausted on a network/timeout failure."""
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 def sandbox_configured(settings: Settings) -> bool:
@@ -89,7 +97,8 @@ class SandboxJudge:
         self._src = base64.b64encode(Path(game_env.__file__).read_bytes()).decode()
 
     def _client(self) -> Any:
-        return self._factory() if self._factory else contree_client(self.s)
+        return self._factory() if self._factory else contree_client(
+            self.s, transport_timeout=TRANSPORT_TIMEOUT_S)
 
     def judge(self, items: list[dict]) -> list[dict]:
         """Verdicts ``[{id, ok, reason}]`` for ``[{id, state, name, arguments}]``, in order."""
@@ -99,7 +108,11 @@ class SandboxJudge:
 
     async def _judge(self, items: list[dict]) -> list[dict]:
         client = self._client()
-        image = await client.images.use(self.s.sandbox_image, strict=True)
+        try:
+            image = await retry_async(lambda: client.images.use(self.s.sandbox_image, strict=True))
+        except Exception as exc:  # noqa: BLE001 - any SDK/network failure
+            raise SandboxUnavailable(f"{TIMEOUT_NOTE}: images.use: {type(exc).__name__}",
+                                     transient=is_transient(exc)) from exc
         gate = asyncio.Semaphore(PARALLEL)
 
         async def one(chunk: list[dict]) -> list[dict]:
@@ -107,10 +120,12 @@ class SandboxJudge:
                 payload = base64.b64encode(json.dumps({"items": chunk}).encode()).decode()
                 shell = (f"printf %s {self._src} | base64 -d > /tmp/game_env.py && "
                          f"printf %s {payload} | base64 -d | python3 /tmp/game_env.py")
-                try:
-                    res = await image.run(shell=shell, disposable=True, timeout=120)
+                try:  # transient transport failures are retried per chunk; verdicts stay pure
+                    res = await retry_async(
+                        lambda: image.run(shell=shell, disposable=True, timeout=120))
                 except Exception as exc:  # noqa: BLE001 - any SDK/network failure
-                    raise SandboxUnavailable(f"{TIMEOUT_NOTE}: {type(exc).__name__}") from exc
+                    raise SandboxUnavailable(f"{TIMEOUT_NOTE}: {type(exc).__name__}",
+                                             transient=is_transient(exc)) from exc
                 if res.exit_code != 0:
                     raise SandboxUnavailable(f"{TIMEOUT_NOTE}: exit {res.exit_code}: "
                                              f"{(res.stderr or '')[:200]}")

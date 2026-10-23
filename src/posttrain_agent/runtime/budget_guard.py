@@ -7,7 +7,8 @@ a run resumed from a checkpoint after a crash gets a fresh budget for the resume
 When a cap is reached the agent is stopped cleanly with a final message in the JSON shape the
 role contracts expect (``status: BUDGET_EXHAUSTED``) instead of raising, so the coordinator can
 re-plan. Shortly before the cap the model is told to answer now, without more tool calls.
-Token counts are a character/4 estimate, not provider usage.
+Token counts are a character/4 estimate of the messages added since the previous call (linear
+in history length, not quadratic), not provider usage.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ WARN_AT = 0.75  # fraction of either cap after which the model is told to wrap u
 class BudgetState(AgentState):
     guard_calls: NotRequired[Annotated[int, UntrackedValue, PrivateStateAttr]]
     guard_tokens: NotRequired[Annotated[int, UntrackedValue, PrivateStateAttr]]
+    guard_seen: NotRequired[Annotated[int, UntrackedValue, PrivateStateAttr]]  # messages already counted
 
 
 def estimate_tokens(messages: list[Any]) -> int:
@@ -115,11 +117,14 @@ class BudgetGuard(AgentMiddleware):
         return self.before_model(state, runtime)
 
     def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        spent = estimate_tokens(state["messages"])
+        messages = state["messages"]
+        seen = min(state.get("guard_seen", 0), len(messages))
+        spent = estimate_tokens(messages[seen:])  # only messages new since the previous call
         if self.ledger:
             self.ledger.add(CURRENT_RUN.get(), spent)
         return {"guard_calls": state.get("guard_calls", 0) + 1,
-                "guard_tokens": state.get("guard_tokens", 0) + spent}
+                "guard_tokens": state.get("guard_tokens", 0) + spent,
+                "guard_seen": len(messages)}
 
     async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         return self.after_model(state, runtime)

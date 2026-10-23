@@ -16,6 +16,7 @@ export const EVENT_TYPES = [
   "approval.resolved",
   "checkpoint",
   "a2a.message",
+  "operator.note",
   "telemetry.snapshot",
 ] as const;
 

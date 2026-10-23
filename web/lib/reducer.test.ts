@@ -60,8 +60,8 @@ describe("golden fixtures", () => {
 });
 
 describe("reducer", () => {
-  it("exposes the 16 event types and exactly the fold.py state keys", () => {
-    expect(EVENT_TYPES).toHaveLength(16);
+  it("exposes the 17 event types and exactly the fold.py state keys", () => {
+    expect(EVENT_TYPES).toHaveLength(17);
     expect(EVENT_TYPES).toContain("a2a.message");
     expect(STATE_KEYS.sort()).toStrictEqual(
       [

@@ -4,8 +4,9 @@ Every task shows a game state and one tool; the correct tool call is computed fr
 never invented. A task has a canonical ``state`` key ("nim:18"). Splits and SFT data are kept
 disjoint by state key, so a held-out state can never be trained on, whatever the phrasing.
 
-Evaluation tasks always use phrasing style 0. SFT rows may also use styles 1 and 2 (paraphrases of
-the same state) so the model learns the rule, not one sentence.
+Evaluation tasks always use phrasing style 0. SFT rows use styles 0-2 (paraphrases) but each
+distinct state appears in at most ONE row, so the model learns the rule, not a memorised state.
+Every prompt (eval task and SFT row) starts with the same system line, so train and serve match.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ ORDER = ["rock", "paper", "scissors"]
 BEATS = {"rock": "paper", "paper": "scissors", "scissors": "rock"}  # key loses to value
 STYLES = 3
 RULE_VERIFIED = "RULE_VERIFIED"  # answer recomputed from the game rule (not a measurement)
+SYSTEM_PROMPT = ("You are a game-playing agent. Answer every request by calling the provided tool "
+                 "exactly once with the correct arguments. Do not reply in prose.")
 SPLIT_FILES = ("train", "heldout", "regression")
 
 
@@ -125,7 +128,8 @@ GAMES: dict[str, Callable[[random.Random], dict]] = {"ttt": ttt, "nim": nim, "gu
 
 def as_task(spec: dict, i: int, style: int = 0) -> dict:
     return {"id": f"{spec['game']}-{i}", "state": spec["key"],
-            "messages": [{"role": "user", "content": spec["render"](style)}],
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                         {"role": "user", "content": spec["render"](style)}],
             "tools": [spec["tool"]],
             "expected": {"name": spec["name"], "arguments": spec["args"]}}
 
@@ -137,6 +141,7 @@ def as_sft_row(spec: dict, style: int) -> dict:
     return {
         "tools": [spec["tool"]],
         "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": spec["render"](style)},
             {"role": "assistant", "tool_calls": [call]},
             {"role": "tool", "tool_call_id": "call_1", "name": spec["name"],
@@ -183,33 +188,82 @@ def suite_states(suite_dir: Path | str) -> set[str]:
 
 
 def generate_sft(n: int, seed: int, exclude: set[str] | frozenset[str],
-                 cap: int = 1200) -> tuple[list[dict], dict[str, int]]:
-    """Up to ``min(n, cap)`` rule-correct SFT rows, balanced over games, never on ``exclude``.
+                 cap: int = 1200, styles: tuple[int, ...] = tuple(range(STYLES))
+                 ) -> tuple[list[dict], dict[str, int]]:
+    """Up to ``min(n, cap)`` rule-correct SFT rows with ONE row per distinct state.
 
-    Fewer rows come back when a game runs out of distinct (state, phrasing) pairs; the per-game
-    counts say which. Rows are deterministic for a given seed.
+    Phrasing styles are rotated across states (never the same state twice). Each game first gets
+    an equal quota (n // games); games that run out of distinct states (rps has ~108, nim ~225)
+    give the unfilled share to the others, round-robin. States in ``exclude`` are never used.
+    Rows are deterministic for a given seed; ``counts`` is rows per game.
     """
     n = max(0, min(n, cap))
     rng = random.Random(seed)
-    names, misses = list(GAMES), dict.fromkeys(GAMES, 0)
-    seen: set[tuple[str, int]] = set()
-    rows: list[dict] = []
-    counts = dict.fromkeys(GAMES, 0)
-    i = 0
-    while len(rows) < n and any(m < 300 for m in misses.values()):
-        game = names[i % len(names)]
-        i += 1
-        if misses[game] >= 300:
-            continue
-        spec = GAMES[game](rng)
-        style = rng.randrange(STYLES)
-        key = (spec["key"], style)
-        if spec["key"] in exclude or key in seen:
-            misses[game] += 1
-            continue
-        misses[game] = 0
-        seen.add(key)
-        rows.append(as_sft_row(spec, style))
-        counts[game] += 1
+    names = list(GAMES)
+    seen: set[str] = set()
+    per_game: dict[str, list[dict]] = {g: [] for g in names}
+    misses = dict.fromkeys(names, 0)
+    quota = n // len(names)
+
+    def draw(game: str) -> bool:
+        """Add one new distinct state of ``game``; False once the game looks exhausted."""
+        while misses[game] < 300:
+            spec = GAMES[game](rng)
+            if spec["key"] in exclude or spec["key"] in seen:
+                misses[game] += 1
+                continue
+            misses[game] = 0
+            seen.add(spec["key"])
+            style = styles[len(per_game[game]) % len(styles)]
+            per_game[game].append(as_sft_row(spec, style))
+            return True
+        return False
+
+    total = 0
+    for game in names:  # pass 1: equal quotas
+        while len(per_game[game]) < quota and draw(game):
+            total += 1
+    active = [g for g in names if misses[g] < 300]
+    while total < n and active:  # pass 2: hand the unfilled share to games with states left
+        for game in list(active):
+            if total >= n:
+                break
+            if draw(game):
+                total += 1
+            else:
+                active.remove(game)
+    rows = [r for g in names for r in per_game[g]]
     rng.shuffle(rows)
-    return rows, counts
+    return rows, {g: len(per_game[g]) for g in names}
+
+
+def _tool_registry() -> dict[str, dict]:
+    rng = random.Random(0)
+    return {spec["name"]: spec["tool"] for spec in (g(rng) for g in GAMES.values())}
+
+
+TOOL_SCHEMAS: dict[str, dict] = _tool_registry()  # tool name -> schema in suite key order
+
+
+def expected_from_state(state: str) -> tuple[str, dict] | None:
+    """Recompute the correct (tool name, arguments) from a canonical state key alone, using the
+    game rules above. ``None`` when the key is not one of ours or is malformed."""
+    game, _, rest = state.partition(":")
+    try:
+        if game == "nim":
+            return "take_stones", {"count": int(rest) % 4}
+        if game == "guess":
+            lo, hi = map(int, rest.split("-"))
+            return "guess_number", {"value": (lo + hi) // 2}
+        if game == "rps":
+            step, start, length = map(int, rest.split(":"))
+            return "play_move", {"move": BEATS[ORDER[(start + step * length) % 3]]}
+        if game == "ttt" and len(rest) == 9 and set(rest) <= set("XO."):
+            board = list(rest)
+            move = _winner_move(board, "X")
+            if move is None:
+                move = _winner_move(board, "O")
+            return ("place_mark", {"cell": move}) if move is not None else None
+    except (ValueError, KeyError):
+        return None
+    return None

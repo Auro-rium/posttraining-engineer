@@ -64,7 +64,7 @@ def test_generate_game_sft_refuses_when_suite_has_no_state_keys(tmp_path):
 
 def _res(score, n, evidence="LIVE"):
     return {"score": score, "n": n, "evidence": evidence, "suite": "s", "split": "heldout",
-            "seed": 7}
+            "seed": 7, "parse_rate": 1.0}
 
 
 def test_gate_rejects_a_gain_that_could_be_sampling_noise():
@@ -76,10 +76,11 @@ def test_gate_rejects_a_gain_that_could_be_sampling_noise():
     assert big["decision"] == "PROMOTE" and big["z"] > 1.645
 
 
-def test_gate_promotes_a_real_win_over_base_and_ignores_z_when_n_is_missing():
+def test_gate_promotes_a_real_win_over_base_and_rejects_when_n_is_missing():
     assert promotion_gate(_res(0.30, 100), _res(0.85, 100))["decision"] == "PROMOTE"
     no_n = {k: v for k, v in _res(0.5, 1).items() if k != "n"}
-    assert promotion_gate(no_n, {**no_n, "score": 0.6})["decision"] == "PROMOTE"  # rules 1-4 only
+    out = promotion_gate(no_n, {**no_n, "score": 0.6})  # fail-closed: no n, no significance
+    assert out["decision"] == "REJECT" and any("n missing" in r for r in out["reasons"])
 
 
 def test_gate_still_requires_verified_evidence_even_with_a_huge_gain():

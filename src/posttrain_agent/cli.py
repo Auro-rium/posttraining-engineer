@@ -11,10 +11,12 @@ from typing import Any
 
 from .agent import build_agent
 from .config import Settings, load_dotenv
+from .experiments import runstate
 from .observability.events import CURRENT_RUN, Journal
 from .observability.fold import a2a_conversation
 from .observability.journal_handler import JournalHandler
 from .observability.telemetry import summarize
+from .runtime.exit_gate import exit_problem
 from .runtime.persistence import open_runtime
 from .runtime.replay import (
     RunReport,
@@ -29,7 +31,7 @@ from .runtime.replay import (
 
 def _show(report: RunReport) -> int:
     final = None
-    if report.result and report.status == "COMPLETED":
+    if report.result and report.status in {"COMPLETED", "INCOMPLETE"}:
         final = report.result["messages"][-1].content
     print(json.dumps({
         "thread": report.thread_id, "status": report.status, "attempts": report.attempts,
@@ -57,6 +59,13 @@ async def _main(args: argparse.Namespace) -> int:
         else:
             print(out)
         return 0
+    if args.cmd == "note":  # stored in state; the coordinator reads it before its next model call
+        if not args.text.strip():
+            print("note text is empty", file=sys.stderr)
+            return 2
+        rec = runstate.add_note(settings.state_dir, args.thread, args.text)
+        print(json.dumps({"stored": True, "thread": args.thread, "note_id": rec["id"]}))
+        return 0
     if args.cmd == "telemetry":  # needs no model or network
         print(json.dumps(summarize(settings.state_dir / "telemetry.jsonl", args.last,
                                    args.errors), indent=2))
@@ -69,13 +78,21 @@ async def _main(args: argparse.Namespace) -> int:
         journal, primary=f"{settings.llm_provider}:{settings.model_name}",
         telemetry_path=settings.state_dir / "telemetry.jsonl")]
     opts = {"max_attempts": settings.max_recovery_attempts, "callbacks": cbs,
-            "journal": journal}
+            "journal": journal,
+            "exit_check": lambda thread: exit_problem(settings.state_dir, thread)}
     backend = "nebius" if settings.nebius_api_key else "stub"  # mirrors agent.default_backend
     async with open_runtime(settings.state_dir) as rt:
         graph = await build_agent(settings, rt, journal=journal)
         if args.cmd == "run":
-            return _show(await run_with_recovery(graph, args.goal, args.thread, store=rt.store,
-                                                 backend=backend, **opts))
+            report = await run_with_recovery(graph, args.goal, args.thread, store=rt.store,
+                                             backend=backend, **opts)
+            # a provider outage that outlasted the retry window is resumable: keep resuming
+            for _ in range(args.max_resumes if args.auto_resume else 0):
+                if report.status != "FAILED_TRANSIENT":
+                    break
+                report = await run_with_recovery(graph, "", args.thread, store=rt.store,
+                                                 backend=backend, **opts)
+            return _show(report)
         if args.cmd == "resume":
             return _show(await run_with_recovery(graph, "", args.thread, store=rt.store,
                                                  backend=backend, **opts))
@@ -105,11 +122,17 @@ def main() -> None:
     run = sub.add_parser("run", help="start (or continue) a run on a thread")
     run.add_argument("goal")
     run.add_argument("--thread", default="default")
+    run.add_argument("--auto-resume", action="store_true",
+                     help="after FAILED_TRANSIENT (provider outage) resume the thread automatically")
+    run.add_argument("--max-resumes", type=int, default=8, help="cap for --auto-resume")
     for name in ("resume", "pending", "approve", "history"):
         sub.add_parser(name).add_argument("--thread", default="default")
     rej = sub.add_parser("reject", help="reject the pending training launch")
     rej.add_argument("--thread", default="default")
     rej.add_argument("-m", "--message", help="reason shown to the agent")
+    n = sub.add_parser("note", help="leave a note the coordinator reads before its next step")
+    n.add_argument("--thread", default="default")
+    n.add_argument("text")
     f = sub.add_parser("fork", help="replay from a past checkpoint")
     f.add_argument("--thread", default="default")
     f.add_argument("checkpoint")

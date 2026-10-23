@@ -32,6 +32,7 @@ const SUMMARY_FIELDS: Record<EventType, readonly string[]> = {
   "approval.resolved": ["decision"],
   checkpoint: ["checkpoint_id", "step"],
   "a2a.message": ["from", "to", "kind"],
+  "operator.note": ["note_id"],
   "telemetry.snapshot": [],
 };
 const A2A_KEYS = ["from", "to", "kind", "text", "ok", "text_len"] as const;
@@ -225,6 +226,7 @@ function apply(s: RunState, type: EventType, data: Record<string, unknown>): Par
       return { telemetry: merge(s.telemetry, data) };
     case "model.call":
     case "tool.call":
+    case "operator.note":
       return {};
   }
 }

@@ -20,7 +20,8 @@ ROW = {"messages": [
 
 
 def ev(score, evidence="LIVE", split="heldout"):
-    return {"score": score, "evidence": evidence, "suite": "s", "split": split, "seed": 7}
+    return {"score": score, "evidence": evidence, "suite": "s", "split": split, "seed": 7,
+            "n": 400, "parse_rate": 1.0}
 
 
 def tools(tmp_path, **kw):

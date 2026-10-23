@@ -18,6 +18,7 @@ from langchain.agents.middleware import AgentMiddleware
 from ..observability.events import CURRENT_RUN, Journal
 
 TASK_TOOL = "task"
+DISABLED_SUBAGENT = "general-purpose"
 
 
 def _reply_text(result: Any) -> str:
@@ -81,9 +82,24 @@ class SubagentConcurrencyMiddleware(AgentMiddleware):
         with contextlib.suppress(Exception):  # journaling must never fail a run
             self.journal.append(self.run or CURRENT_RUN.get(), type, data)
 
+    @staticmethod
+    def _refuse(request: Any) -> Any | None:
+        """The built-in general-purpose subagent is disabled: only the named specialists run."""
+        args = request.tool_call.get("args") or {}
+        if args.get("subagent_type") == DISABLED_SUBAGENT:
+            from langchain_core.messages import ToolMessage
+            return ToolMessage(
+                content=("general-purpose is disabled. Use one of the named specialists: "
+                         "benchmark, failure_analyst, researcher, data_curator, training_designer, "
+                         "training_executor, evaluator, champion_manager."),
+                tool_call_id=request.tool_call["id"], name=TASK_TOOL, status="error")
+        return None
+
     async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
         if request.tool_call["name"] != TASK_TOOL:
             return await handler(request)
+        if (refused := self._refuse(request)) is not None:
+            return refused
         if self._async_sem is None:  # created lazily so it binds to the running loop
             self._async_sem = asyncio.Semaphore(self.limit)
         async with self._async_sem:
@@ -101,6 +117,8 @@ class SubagentConcurrencyMiddleware(AgentMiddleware):
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         if request.tool_call["name"] != TASK_TOOL:
             return handler(request)
+        if (refused := self._refuse(request)) is not None:
+            return refused
         with self._sync_sem:
             self._enter()
             role, slot = self._start(request)

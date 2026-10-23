@@ -5,7 +5,7 @@ from posttrain_agent.tools import dataset
 
 
 def _prompt(t):
-    return t["messages"][0]["content"]
+    return t["messages"][-1]["content"]
 
 
 def _expected_from_state(state: str):
@@ -56,13 +56,17 @@ def test_sft_rows_are_verified_correct_capped_and_never_use_excluded_states():
         meta, msgs = row["metadata"], row["messages"]
         assert meta["state"] not in eval_states
         name, args = _expected_from_state(meta["state"])
-        call = msgs[1]["tool_calls"][0]["function"]
+        call = msgs[2]["tool_calls"][0]["function"]
         assert call["name"] == name and json.loads(call["arguments"]) == args
         assert row["tools"][0]["function"]["name"] == name
-        assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "assistant"]
+        assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "assistant"]
+        assert msgs[0]["content"] == games.SYSTEM_PROMPT
         assert msgs[-1]["content"]  # Nebius: the final message is natural language
     assert {m["metadata"]["style"] for m in rows} == {0, 1, 2}  # paraphrases are used
     assert min(counts["ttt"], counts["nim"], counts["guess"]) > 100  # roughly balanced
+    states = [r["metadata"]["state"] for r in rows]
+    assert len(states) == len(set(states))  # one row per distinct state, never one per phrasing
+    assert counts["rps"] <= 108 and counts["nim"] <= 225  # capped by distinct states
 
 
 def test_sft_generation_is_deterministic_and_honours_a_smaller_n():

@@ -152,7 +152,7 @@ def test_sync_path_journals_and_non_task_calls_do_not(tmp_path):
 
 # --- Task 4: run-controller and domain-tool events ---------------------------------------
 
-from fakes import text
+from fakes import call, text
 from test_approval import LAUNCH, factory
 from test_approval import settings as approval_settings
 
@@ -247,7 +247,7 @@ async def test_journal_failure_does_not_fail_the_run(tmp_path):
     blocker.write_text("x")
     bad = Journal(blocker / "sub" / "e.sqlite")  # parent is a file: unwritable
     s = approval_settings(tmp_path, require_approval=False)
-    seq = [*LAUNCH, text('{"status":"SUCCEEDED"}'), text("done")]
+    seq = [*LAUNCH, text('{"status":"SUCCEEDED"}'), call("abort_experiment", {"reason": "test ends without evaluating"}, id="call_9"), text("done")]
     async with open_runtime(s.state_dir) as rt:
         graph = await build_agent(s, rt, client_factory=factory(seq, []), journal=bad)
         rep = await run_with_recovery(graph, "go", "t", max_attempts=1, journal=bad)
@@ -271,7 +271,7 @@ def test_sample_journal_has_every_event_type_and_only_simulated_evidence(tmp_pat
     rows = [json.loads(line) for line in out.read_text().splitlines()]
     assert {"seq", "ts", "run", "type", "data"} == set(rows[0])
     seen = {r["type"] for r in rows}
-    assert not (EVENT_TYPES - {"job.log", "telemetry.snapshot"} - seen), EVENT_TYPES - seen
+    assert not (EVENT_TYPES - {"job.log", "telemetry.snapshot", "operator.note"} - seen), EVENT_TYPES - seen
     assert seen <= EVENT_TYPES
     assert all(r["run"].startswith("sample") for r in rows)
     evid = [r["data"]["evidence"] for r in rows if "evidence" in r["data"]]

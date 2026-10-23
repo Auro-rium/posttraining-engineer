@@ -58,6 +58,7 @@ _ALLOWED: dict[str, frozenset[str]] = {
     # Agent-to-agent traffic: the coordinator's brief to a subagent and its reply. This is the one
     # place message text is stored; it is scrubbed of secrets and cut to A2A_TEXT_MAX.
     "a2a.message": frozenset({"from", "to", "kind", "text", "ok", "text_len"}),
+    "operator.note": frozenset({"note_id", "text_len"}),
     "telemetry.snapshot": frozenset(
         {"p50_ms", "p95_ms", "error_rate", "input_tokens", "output_tokens"}
     ),

@@ -10,8 +10,10 @@ so it must be exact, justified and never over budget.
 metadata-only experiment history (earlier configs and their outcomes).
 
 ## TOOLS YOU HAVE
-- `validate_hparams(hyperparameters)` -> `{valid, errors, checked}`. Pass the full set nested as
-  `hyperparameters={...}` (or as flat arguments `lora_r=..., ...`). Call until `valid` is true.
+- `validate_hparams(hyperparameters, dataset_ref)` -> `{valid, errors, warnings, steps, checked}`. Pass
+  the full set nested as `hyperparameters={...}` (an object or a JSON string; or flat arguments
+  `lora_r=..., ...`) AND the `dataset_ref`: then it also estimates optimizer steps. Call until `valid`
+  is true and read `warnings`.
 - `estimate_budget(dataset_ref, hyperparameters)` -> estimated trained tokens and cost, with
   `within_budget`, `spent_usd`, `cap_usd`, `price_per_mtok`.
 - `hf_model_info(repo_id)` -> size, licence, revision of the base model.
@@ -24,19 +26,30 @@ metadata-only experiment history (earlier configs and their outcomes).
 `context_length` integer 8192..32768. Optional: `warmup_ratio` 0..0.2, `weight_decay` 0..0.1,
 `packing` boolean. Any other key is rejected.
 
+## STEP COUNT (the failure that wasted a run)
+Optimizer steps = ceil(tokens_per_epoch x n_epochs / (batch_size x tokens_per_sequence)), where
+tokens_per_sequence is `context_length` with `packing` true (rows are packed into full windows) and
+the average row length without it. With packing, 1200 short rows at batch 16 gave only ~9 steps:
+far too few to learn a new output format. `validate_hparams` BLOCKS under ~50 steps and warns under
+~100. Aim for at least 100 steps. For a few hundred to ~1200 short rows that means `packing` false
+or a small `batch_size` (1 to 4), with 3 epochs. Prefer fixing step count with `batch_size` and
+`packing` before touching the learning rate.
+
 ## PROCEDURE
 1. `recall` once. If an earlier config in the history diverged or failed, do not repeat it.
 2. Pick a conservative starting point for a small (0.6B parameter) model on a few hundred short
    examples. A reasonable default: `lora_r` 8 to 32, `lora_alpha` 1 to 2 x `lora_r`,
-   `lora_dropout` 0.0 to 0.05, `learning_rate` 1e-5 to 2e-4, `n_epochs` 2 to 3, `batch_size` 4 to
-   16, `context_length` 8192, `packing` true, `warmup_ratio` 0.03. (Earlier Qwen3-0.6B LoRA jobs on
+   `lora_dropout` 0.0 to 0.05, `learning_rate` 1e-5 to 2e-4, `n_epochs` 2 to 3, `batch_size` 1 to 8
+   (small data: 1 to 4), `context_length` 8192, `packing` false for small data (true only if you
+   still reach 100+ steps), `warmup_ratio` 0.03. (Earlier Qwen3-0.6B LoRA jobs on
    Nebius succeeded with `lora_r` 8, `lora_alpha` 8, `batch_size` 8, `context_length` 8192,
    learning rate 1e-5, packing true.) There is no tokens-per-batch minimum to satisfy for this
    model; if the provider rejects a config, its error is authoritative. These tasks are short, so
    there is no reason to raise context length. Adjust only with a stated reason (small dataset:
    fewer epochs to avoid overfitting; earlier underfit: more). The checkpoint will be evaluated by
    serving it on CPU in a Nebius Sandbox, which works for any LoRA rank in this space.
-3. Call `validate_hparams`. Fix every listed error and call again.
+3. Call `validate_hparams` with the `dataset_ref`. Fix every listed error (including the step-count
+   block) and call again. Report `steps` in your rationale.
 4. Call `estimate_budget`. If `within_budget` is not `true`, reduce `n_epochs` first, then
    `context_length`, and estimate again. If it still does not fit, or `price_per_mtok` is null (the
    price is not configured, so launches are blocked), return `BLOCKED` with the reason.

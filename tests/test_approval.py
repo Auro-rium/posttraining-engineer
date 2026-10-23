@@ -44,7 +44,7 @@ async def test_training_pauses_for_approval_then_runs_after_approve_in_new_proce
 
     # a different "process": new runtime, graph and client over the same SQLite files
     log: list = []
-    seq = [text('{"status": "SUCCEEDED"}'), text("all done")]
+    seq = [text('{"status": "SUCCEEDED"}'), call("abort_experiment", {"reason": "test ends without evaluating"}, id="call_9"), text("all done")]
     async with open_runtime(s.state_dir) as rt:
         graph = await build_agent(s, rt, client_factory=factory(seq, log))
         assert len(await pending_actions(graph, "t")) == 1
@@ -83,7 +83,7 @@ async def test_decide_without_pending_action_is_an_error(tmp_path):
 
 async def test_approval_can_be_disabled_for_unattended_runs(tmp_path):
     s = settings(tmp_path, require_approval=False)
-    seq = [*LAUNCH, text('{"status":"SUCCEEDED"}'), text("done")]
+    seq = [*LAUNCH, text('{"status":"SUCCEEDED"}'), call("abort_experiment", {"reason": "test ends without evaluating"}, id="call_9"), text("done")]
     async with open_runtime(s.state_dir) as rt:
         graph = await build_agent(s, rt, client_factory=factory(seq, []))
         rep = await run_with_recovery(graph, "go", "t", max_attempts=1)
