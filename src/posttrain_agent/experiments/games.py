@@ -4,8 +4,12 @@ Every task shows a game state and one tool; the correct tool call is computed fr
 never invented. A task has a canonical ``state`` key ("nim:18"). Splits and SFT data are kept
 disjoint by state key, so a held-out state can never be trained on, whatever the phrasing.
 
-Evaluation tasks always use phrasing style 0. SFT rows use styles 0-2 (paraphrases) but each
+Evaluation tasks use phrasing style 0. SFT rows use styles 0-2 (paraphrases) but each
 distinct state appears in at most ONE row, so the model learns the rule, not a memorised state.
+Styles 3-4 (``HELDOUT_STYLES``) are NEVER used by SFT: the ``heldout_phrasing`` split uses them
+to measure generalisation to unseen wording (reported separately from the gate's main n).
+State spaces (so 300/150/phrasing splits stay balanced AND leave SFT states): ttt thousands,
+guess ~6000, nim 5..1000 not divisible by 4 (746), rps step x start x history length 3..60 (348).
 Every prompt (eval task and SFT row) starts with the same system line, so train and serve match.
 """
 
@@ -19,11 +23,12 @@ from pathlib import Path
 LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
 ORDER = ["rock", "paper", "scissors"]
 BEATS = {"rock": "paper", "paper": "scissors", "scissors": "rock"}  # key loses to value
-STYLES = 3
+STYLES = 3  # SFT phrasing styles 0..STYLES-1
+HELDOUT_STYLES = (3, 4)  # phrasing never used in SFT
 RULE_VERIFIED = "RULE_VERIFIED"  # answer recomputed from the game rule (not a measurement)
 SYSTEM_PROMPT = ("You are a game-playing agent. Answer every request by calling the provided tool "
                  "exactly once with the correct arguments. Do not reply in prose.")
-SPLIT_FILES = ("train", "heldout", "regression")
+SPLIT_FILES = ("train", "heldout", "regression", "heldout_phrasing")
 
 
 def _tool(name: str, desc: str, props: dict, required: list[str]) -> dict:
@@ -65,7 +70,11 @@ def ttt(rng: random.Random) -> dict:
             "You are X in tic-tac-toe. Cells are numbered 0-8, left to right, top to bottom.\n" +
             grid + "\nIf you can win this turn, do it; otherwise stop O from winning.",
             "Board:\n" + grid + "\nX to move. Call place_mark with the cell that wins "
-            "immediately, or else blocks O."]
+            "immediately, or else blocks O.",
+            "Noughts and crosses: you play X, cells 0-8 in reading order.\n" + grid +
+            "\nTake the winning cell if one exists; if not, occupy the cell where O would win.",
+            "X's turn.\n" + grid + "\nPick the single cell that ends the game in your favour, "
+            "falling back to preventing an O line."]
         tool = _tool("place_mark", "Place X on a cell, index 0-8 row by row.",
                      {"cell": {"type": "integer"}}, ["cell"])
         return _spec("ttt", "".join(board), lambda s, t=texts: t[s], tool, "place_mark",
@@ -74,13 +83,17 @@ def ttt(rng: random.Random) -> dict:
 
 def nim(rng: random.Random) -> dict:
     """Take 1-3 stones; whoever takes the last stone wins. Leave a multiple of 4."""
-    pile = rng.choice([p for p in range(5, 301) if p % 4])
+    pile = rng.choice([p for p in range(5, 1001) if p % 4])
     texts = [
         f"Nim: the pile has {pile} stones. Each turn you take 1, 2 or 3; taking the last stone "
         "wins. Make the winning move.",
         f"There are {pile} stones in a pile. Players alternate removing 1, 2 or 3 stones; whoever "
         "removes the last stone wins. It is your turn. Remove the number that forces a win.",
-        f"Nim game, {pile} stones left, take 1-3 per turn, last stone wins. Your move."]
+        f"Nim game, {pile} stones left, take 1-3 per turn, last stone wins. Your move.",
+        f"{pile} stones remain. You may remove one, two or three; the player who removes the "
+        "final stone wins. Which number do you take to guarantee the win?",
+        f"Subtraction game: start from {pile}, subtract 1-3 each turn, reaching zero first wins. "
+        "Choose your subtraction now."]
     tool = _tool("take_stones", "Remove 1 to 3 stones from the pile.",
                  {"count": {"type": "integer"}}, ["count"])
     return _spec("nim", str(pile), lambda s, t=texts: t[s], tool, "take_stones",
@@ -96,7 +109,11 @@ def guess(rng: random.Random) -> dict:
         "guess that halves the range (round down).",
         f"I am thinking of a whole number from {lo} to {hi}, both included. Guess the middle "
         "value, rounding down, to cut the possibilities in half.",
-        f"Secret number in [{lo}, {hi}]. Best first guess for binary search (floor of the middle)?"]
+        f"Secret number in [{lo}, {hi}]. Best first guess for binary search (floor of the middle)?",
+        f"Pick the bisecting guess for a hidden integer anywhere from {lo} through {hi}: the "
+        "midpoint, rounded down.",
+        f"Range {lo}..{hi} (inclusive) holds the answer. To eliminate half of it, which number "
+        "should you name? Floor the midpoint."]
     tool = _tool("guess_number", "Guess the secret number.", {"value": {"type": "integer"}},
                  ["value"])
     mid = (lo + hi) // 2
@@ -107,7 +124,7 @@ def guess(rng: random.Random) -> dict:
 def rps(rng: random.Random) -> dict:
     """The opponent cycles rock->paper->scissors (or the reverse); beat its next move."""
     step, start = rng.choice([1, -1]), rng.randrange(3)
-    history = [ORDER[(start + step * k) % 3] for k in range(rng.randint(3, 20))]
+    history = [ORDER[(start + step * k) % 3] for k in range(rng.randint(3, 60))]
     nxt = ORDER[(start + step * len(history)) % 3]
     listing = ", ".join(history)
     texts = [
@@ -115,7 +132,11 @@ def rps(rng: random.Random) -> dict:
         f"{listing}. Predict their next move and play the move that beats it.",
         f"Your opponent plays rock-paper-scissors in a repeating cycle. History: {listing}. "
         "Work out what they will play next and counter it.",
-        f"Opponent moves: {listing} (a fixed cycle). Play the move that beats their next one."]
+        f"Opponent moves: {listing} (a fixed cycle). Play the move that beats their next one.",
+        f"Watch this rock-paper-scissors opponent loop through a pattern: {listing}. What do you "
+        "throw to defeat the throw that comes next?",
+        f"The other player's sequence so far is {listing}; it repeats cyclically. Choose the "
+        "winning counter to their upcoming move."]
     tool = _tool("play_move", "Play rock, paper or scissors.",
                  {"move": {"type": "string", "enum": ORDER}}, ["move"])
     return _spec("rps", f"{step}:{start}:{len(history)}", lambda s, t=texts: t[s], tool,
@@ -153,23 +174,34 @@ def as_sft_row(spec: dict, style: int) -> dict:
     }
 
 
-def make_split(seed: int, n: int, exclude: set[str] | frozenset[str] = frozenset()) -> list[dict]:
-    """``n`` tasks (style 0) over all games, balanced, with distinct states not in ``exclude``."""
+def make_split(seed: int, n: int, exclude: set[str] | frozenset[str] = frozenset(),
+               styles: tuple[int, ...] = (0,)) -> list[dict]:
+    """``n`` tasks over all games, balanced, with distinct states not in ``exclude``. Phrasing
+    styles rotate per game (default: style 0 only)."""
     rng, out, seen = random.Random(seed), [], set(exclude)
     names, misses = list(GAMES), dict.fromkeys(GAMES, 0)
+    done: set[str] = set()  # games whose distinct states ran out
     i = 0
-    while len(out) < n and any(m < 300 for m in misses.values()):
+    while len(out) < n and len(done) < len(names):
         game = names[i % len(names)]
         i += 1
-        if misses[game] >= 300:
+        if game in done:
             continue
-        spec = GAMES[game](rng)
-        if spec["key"] in seen:
+        while True:  # a turn ends on a new state (a miss never costs the game its turn)
+            spec = GAMES[game](rng)
+            if spec["key"] not in seen:
+                break
             misses[game] += 1
+            if misses[game] >= 2000:
+                done.add(game)
+                spec = None
+                break
+        if spec is None:
             continue
         misses[game] = 0
         seen.add(spec["key"])
-        out.append(as_task(spec, len(out)))
+        mine = sum(t["id"].startswith(game + "-") for t in out)
+        out.append(as_task(spec, len(out), styles[mine % len(styles)]))
     return out
 
 
@@ -193,7 +225,7 @@ def generate_sft(n: int, seed: int, exclude: set[str] | frozenset[str],
     """Up to ``min(n, cap)`` rule-correct SFT rows with ONE row per distinct state.
 
     Phrasing styles are rotated across states (never the same state twice). Each game first gets
-    an equal quota (n // games); games that run out of distinct states (rps has ~108, nim ~225)
+    an equal quota (n // games); games that run out of distinct states (rps has 348, nim 746)
     give the unfilled share to the others, round-robin. States in ``exclude`` are never used.
     Rows are deterministic for a given seed; ``counts`` is rows per game.
     """
@@ -207,7 +239,7 @@ def generate_sft(n: int, seed: int, exclude: set[str] | frozenset[str],
 
     def draw(game: str) -> bool:
         """Add one new distinct state of ``game``; False once the game looks exhausted."""
-        while misses[game] < 300:
+        while misses[game] < 2000:
             spec = GAMES[game](rng)
             if spec["key"] in exclude or spec["key"] in seen:
                 misses[game] += 1
@@ -223,7 +255,7 @@ def generate_sft(n: int, seed: int, exclude: set[str] | frozenset[str],
     for game in names:  # pass 1: equal quotas
         while len(per_game[game]) < quota and draw(game):
             total += 1
-    active = [g for g in names if misses[g] < 300]
+    active = [g for g in names if misses[g] < 2000]
     while total < n and active:  # pass 2: hand the unfilled share to games with states left
         for game in list(active):
             if total >= n:

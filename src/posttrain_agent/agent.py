@@ -10,7 +10,7 @@ from typing import Any
 from deepagents import create_deep_agent
 
 from .config import Settings
-from .experiments.domain import ExperimentBackend, LocalStubBackend, make_tools
+from .experiments.domain import ExperimentBackend, LocalStubBackend, cost_summary, make_tools
 from .experiments.nebius import NebiusBackend
 from .llm.backboard_model import Cassette
 from .llm.memory import ensure_assistant, memory_tools
@@ -134,7 +134,12 @@ def approval_description(settings: Settings) -> Callable[..., str]:
                         f"({est.get('spent_trained_tokens')} already used + "
                         f"{est.get('estimated_trained_tokens')} for this job, cap "
                         f"{est.get('max_trained_tokens')}).\n")
-        return ("Approve launching a fine-tuning job?\n" + unpriced +
+        try:
+            cost = cost_summary(settings, args.get("dataset_ref", ""),
+                                hp if isinstance(hp, dict) else {})["cost_line"]
+        except Exception as exc:  # noqa: BLE001
+            cost = f"cost UNKNOWN: {exc}"
+        return ("Approve launching a fine-tuning job?\n" + unpriced + f"COST: {cost}\n" +
                 f"base model: {args.get('base_model') or settings.base_model}\n"
                 f"dataset: {args.get('dataset_ref')}\n"
                 f"hyperparameters: {json.dumps(hp, sort_keys=True)}\n"

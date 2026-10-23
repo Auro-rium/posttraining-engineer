@@ -82,6 +82,15 @@ def run_states(state_dir: Path | str, run: str | None = None) -> list[dict[str, 
             merged[rec["job_id"]] = {**merged.pop(rec["key"]), **rec}
             continue
         merged[ident] = {**merged.get(ident, {}), **rec}
+    firsts: dict[str, float] = {}  # earliest record per job/key: when the candidate was launched
+    for rec in _read(_rs(state_dir)):
+        for k in (rec.get("key"), rec.get("job_id")):
+            if k:
+                firsts.setdefault(k, float(rec.get("ts", 0)))
+    for rec in merged.values():
+        ts = [firsts[k] for k in (rec.get("key"), rec.get("job_id")) if k in firsts]
+        if ts:
+            rec["first_ts"] = min(ts)
     return list(merged.values())
 
 

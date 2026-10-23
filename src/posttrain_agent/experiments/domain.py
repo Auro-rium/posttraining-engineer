@@ -135,6 +135,33 @@ def step_findings(config: dict[str, Any], total_tokens: float,
     return steps, [], []
 
 
+def cost_summary(settings: Settings, dataset_ref: str, hyperparameters: dict[str, Any],
+                 est: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Human-facing cost facts for one job: estimated trained tokens vs the cap, optimizer steps and
+    an explicit UNPRICED / known-USD line. Display only; it changes no gate or approval logic."""
+    est = est if est is not None else budget_mod.estimate(settings, dataset_ref, hyperparameters)
+    if "error" in est:
+        return {"error": est["error"], "cost_line": f"cost UNKNOWN: {est['error']}"}
+    info = budget_mod.training_token_info(settings, dataset_ref)
+    steps = None
+    if "error" not in info:
+        steps = estimate_steps(hyperparameters, info["total_tokens"], info["avg_row_tokens"])
+    tokens, spent_t = est.get("estimated_trained_tokens"), est.get("spent_trained_tokens", 0)
+    cap = est.get("max_trained_tokens")
+    if est.get("price_per_mtok") is None:
+        usd = "UNPRICED: dollar cost UNKNOWN (no price configured)"
+        cap_txt = (f"{tokens} of cap {cap} (cumulative {spent_t} + {tokens} = {spent_t + tokens})"
+                   if cap is not None else f"{tokens} (no token cap: launch needs a price or opt-in)")
+    else:
+        usd = (f"known USD: ~${est.get('estimated_cost_usd')} for this job; spent "
+               f"${est.get('spent_usd')} of ${est.get('cap_usd')} cap")
+        cap_txt = f"{tokens}"
+    return {"estimated_trained_tokens": tokens, "max_trained_tokens": cap,
+            "spent_trained_tokens": spent_t, "estimated_steps": steps,
+            "epochs": est.get("epochs"), "usd": usd,
+            "cost_line": f"trained tokens: {cap_txt}; optimizer steps: ~{steps}; {usd}"}
+
+
 def validate_hparams(config: dict[str, Any], *, total_tokens: float | None = None,
                      avg_row_tokens: float | None = None) -> list[str]:
     """Violations of the fixed search space (empty list means valid).
@@ -373,7 +400,8 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
             _budget({**est, "spent_usd": round(est["spent_usd"] + cost, 4)})
         _job(result)
         return {**result, "dataset_sha256": report["sha256"], "estimate": est,
-                "trained_file": train_path.name, "estimated_steps": steps}
+                "trained_file": train_path.name, "estimated_steps": steps,
+                "cost": cost_summary(settings, dataset_ref, hyperparameters, est)}
 
     def get_training_status(job_id: str) -> dict[str, Any]:
         """Poll a training job: status, steps, trained tokens and (when done) the checkpoint name."""

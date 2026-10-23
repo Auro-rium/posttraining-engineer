@@ -66,7 +66,7 @@ def test_sft_rows_are_verified_correct_capped_and_never_use_excluded_states():
     assert min(counts["ttt"], counts["nim"], counts["guess"]) > 100  # roughly balanced
     states = [r["metadata"]["state"] for r in rows]
     assert len(states) == len(set(states))  # one row per distinct state, never one per phrasing
-    assert counts["rps"] <= 108 and counts["nim"] <= 225  # capped by distinct states
+    assert counts["rps"] <= 348 and counts["nim"] <= 746  # capped by distinct states
 
 
 def test_sft_generation_is_deterministic_and_honours_a_smaller_n():

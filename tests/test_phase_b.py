@@ -156,7 +156,8 @@ def seed_candidate(s, status="succeeded", ckpt="ckpt-1", run="r"):
 
 def test_exit_problem_walks_the_missing_steps(tmp_path):
     s = Settings(state_dir=tmp_path)
-    assert exit_problem(s.state_dir, "r") is None  # nothing launched: no obligation
+    assert "no training job was ever launched" in exit_problem(s.state_dir, "r")
+    assert exit_problem(s.state_dir, "r", require_launch=False) is None  # live gate default
     seed_candidate(s, "running")
     assert "wait_for_training" in exit_problem(s.state_dir, "r") and "ftjob-1" in exit_problem(s.state_dir, "r")
     seed_candidate(s)

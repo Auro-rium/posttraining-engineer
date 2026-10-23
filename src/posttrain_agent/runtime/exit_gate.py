@@ -4,7 +4,8 @@
 run may end: once a candidate training job exists in the run, the run may only end after a gate
 verdict for that candidate or a recorded ``abort_experiment``. ``ExitGate`` enforces it on a
 no-tool-call model message (re-prompting up to ``max_reprompts`` times); ``replay`` re-checks it to
-decide COMPLETED vs INCOMPLETE.
+decide COMPLETED vs INCOMPLETE. ``require_launch`` (the replay/CLI check) also makes a run that
+never launched a job and has no abort INCOMPLETE; the live ExitGate leaves it off by default.
 """
 
 from __future__ import annotations
@@ -24,12 +25,9 @@ from ..experiments import runstate as rs
 from ..observability.events import CURRENT_RUN, Journal, emit
 
 
-def exit_problem(state_dir: Path | str, run: str) -> str | None:
-    """None when the run may end; otherwise the missing step, phrased as an instruction."""
-    cand = rs.current_candidate(state_dir, run or None)
-    if cand is None:
-        return None
-    since = float(cand.get("ts", 0))
+def _candidate_problem(state_dir: Path | str, run: str, cand: dict) -> str | None:
+    """What is missing for ONE launched candidate job (None when it is gated or aborted)."""
+    since = float(cand.get("first_ts", cand.get("ts", 0)))
     if any(float(a.get("ts", 0)) >= since for a in rs.abort_records(state_dir, run)):
         return None
     job, ckpt = cand.get("job_id"), cand.get("checkpoint")
@@ -55,11 +53,31 @@ def exit_problem(state_dir: Path | str, run: str) -> str | None:
                                         if bad else "no evaluation recorded"))
     if errs:
         return (f"candidate {ckpt} (job {job}) has no valid evaluation ({'; '.join(errs)}). A BLOCKED "
-                f"or FAILED eval is not an outcome: re-dispatch the evaluator with the job id {job} "
-                "(or 'candidate'), or call abort_experiment(reason).")
+                f"or FAILED eval is not an outcome: re-dispatch the evaluator with the job id {job}, "
+                "or call abort_experiment(reason).")
     return (f"candidate {ckpt} (job {job}) is evaluated on both splits but has no gate verdict. "
-            "Dispatch champion_manager to call run_gate(champion, 'candidate'), or call "
+            f"Dispatch champion_manager to call run_gate(champion, '{job or ckpt}'), or call "
             "abort_experiment(reason).")
+
+
+def exit_problem(state_dir: Path | str, run: str, require_launch: bool = True) -> str | None:
+    """None when the run may end; otherwise the missing step, phrased as an instruction.
+
+    EVERY candidate job launched by the run needs its own gate verdict (keyed by job id or
+    checkpoint) or a later ``abort_experiment``; the first unsatisfied candidate is reported. A
+    run that never launched a job and has no abort is not finished either (``require_launch``):
+    it must launch a candidate or call ``abort_experiment(reason)`` explaining why not."""
+    cands = rs.run_states(state_dir, run or None)
+    if not cands:
+        if not require_launch or rs.abort_records(state_dir, run):
+            return None
+        return ("no training job was ever launched in this run and no abort is recorded. Either "
+                "launch a candidate (needs approval) and take it through evaluation and run_gate, "
+                "or call abort_experiment(reason) stating why no candidate was trained.")
+    for cand in cands:
+        if problem := _candidate_problem(state_dir, run, cand):
+            return problem
+    return None
 
 
 class ExitState(AgentState):
@@ -71,9 +89,11 @@ class ExitGate(AgentMiddleware):
 
     state_schema = ExitState
 
-    def __init__(self, state_dir: Path | str, max_reprompts: int = 3) -> None:
+    def __init__(self, state_dir: Path | str, max_reprompts: int = 3,
+                 require_launch: bool = False) -> None:
         super().__init__()
         self.state_dir, self.max_reprompts = Path(state_dir), max_reprompts
+        self.require_launch = require_launch
 
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
@@ -81,7 +101,7 @@ class ExitGate(AgentMiddleware):
         last = msgs[-1] if msgs else None
         if last is None or getattr(last, "type", "") != "ai" or getattr(last, "tool_calls", None):
             return None
-        problem = exit_problem(self.state_dir, CURRENT_RUN.get())
+        problem = exit_problem(self.state_dir, CURRENT_RUN.get(), self.require_launch)
         n = state.get("exit_reprompts", 0)
         if problem is None or n >= self.max_reprompts:
             return None
