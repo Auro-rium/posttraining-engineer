@@ -243,6 +243,8 @@ class NebiusBackend:
         waited = 0.0
         while waited < DATASET_VALIDATION_WAIT_S:
             st = self._req("GET", f"/fine_tuning/jobs/{job_id}", tries=1)
+            if "error" in st and "status" not in st:
+                return None  # cannot observe the job: never block or delay a launch on the watch
             status = str(st.get("status") or "").lower()
             if status in {"failed", "cancelled"}:
                 msg = str((st.get("error") or {}).get("message") or "")
