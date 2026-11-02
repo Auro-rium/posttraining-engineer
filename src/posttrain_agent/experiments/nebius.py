@@ -249,7 +249,9 @@ class NebiusBackend:
             if status in {"failed", "cancelled"}:
                 msg = str((st.get("error") or {}).get("message") or "")
                 return msg if "supported formats" in msg or "dataset" in msg.lower() else None
-            if status in {"running", "succeeded"} or st.get("trained_steps"):
+            # `running` is NOT proof of a valid dataset: live, Nebius reported `running` and failed
+            # the format check ~40s later. Only real training progress ends the watch.
+            if status == "succeeded" or st.get("trained_steps"):
                 return None
             self._sleep(DATASET_VALIDATION_POLL_S)
             waited += DATASET_VALIDATION_POLL_S

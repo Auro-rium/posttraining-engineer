@@ -67,6 +67,21 @@ def test_async_dataset_rejection_resubmits_once_with_the_other_key(tmp_path):
     assert b'"token_ids"' in uploads[0] and b'"input_ids"' in uploads[1]
 
 
+def test_a_running_status_does_not_end_the_watch_before_the_rejection_arrives(tmp_path):
+    running = httpx.Response(200, json={"status": "running", "trained_steps": None})
+    first = httpx.Response(200, json={"id": "ftjob-1", "status": "queued"})
+    second = httpx.Response(200, json={"id": "ftjob-2", "status": "queued"})
+    out, uploads, creates = _train(tmp_path, [first, second], [running, running, _rejected()])
+    assert out["provider_job_id"] == "ftjob-2" and len(creates) == 2
+
+
+def test_training_progress_ends_the_watch(tmp_path):
+    progress = httpx.Response(200, json={"status": "running", "trained_steps": 3})
+    first = httpx.Response(200, json={"id": "ftjob-1", "status": "queued"})
+    out, uploads, creates = _train(tmp_path, [first], [progress])
+    assert out["provider_job_id"] == "ftjob-1" and len(creates) == 1
+
+
 def test_async_rejection_of_both_key_names_stops_and_reports_the_provider_message(tmp_path):
     job = httpx.Response(200, json={"id": "ftjob-1", "status": "queued"})
     out, uploads, creates = _train(tmp_path, [job, job], [_rejected(), _rejected()])
