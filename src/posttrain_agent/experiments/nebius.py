@@ -44,6 +44,8 @@ SERVED_BY_SERVERLESS = "nebius-serverless"
 MAX_JOBS_SCANNED = 30  # succeeded jobs searched when resolving a checkpoint name
 CHECKPOINT_TRIES = 5  # a succeeded job's checkpoint list can lag (seen live: empty, then 3)
 CHECKPOINT_BASE_DELAY_S = 1.0
+DATASET_VALIDATION_WAIT_S = 150.0  # live: format rejection arrived ~40s after submit
+DATASET_VALIDATION_POLL_S = 10.0
 CHECKPOINT_MAX_DELAY_S = 8.0
 _STUDENT_LOCK = threading.Lock()
 
@@ -208,7 +210,8 @@ class NebiusBackend:
         and ``input_ids``; if the provider rejects the file or job with a 4xx naming the key,
         re-upload ONCE with the other name. A rejected creation made no job, so no double launch."""
         data = _provider_jsonl(dataset_path)
-        for attempt in (1, 2):
+        swaps = 0
+        while True:
             up = self._req("POST", "/files", data={"purpose": "fine-tune"},
                            files={"file": (dataset_path.name, data)})
             job = up if "error" in up else self._req("POST", "/fine_tuning/jobs", json={
@@ -216,15 +219,39 @@ class NebiusBackend:
                 "suffix": dataset_path.stem[:64],
                 "hyperparameters": {**config, "lora": True},
             }, tries=1)  # never auto-retry job creation: a lost response could double-launch
-            if not (job.get("error") and "id" not in job):
+            if job.get("error") and "id" not in job:
+                swapped = _swap_token_key(data, job)  # synchronous 4xx naming the key
+            elif (reason := self._dataset_rejected(job["id"])) is not None:
+                # Nebius accepted the upload and validates it asynchronously: the job then ends
+                # `failed` with 0 trained tokens. That job cost nothing, so one resubmit is safe.
+                swapped = _swap_token_key(data, {"error": f"HTTP 4 token_ids/input_ids: {reason}"})
+                job = {"error": reason, "provider_job_id": job["id"]}  # no "id": not launched
+                if swaps or swapped is None:
+                    return {**job, "status": "BLOCKED", "stage": "dataset_validation"}
+            else:
                 break
-            swapped = _swap_token_key(data, job)
-            if attempt == 2 or swapped is None:
+            if swaps or swapped is None:
                 stage = "upload" if "error" in up else "create_job"
                 return {**job, "status": "BLOCKED", "stage": stage}
-            data = swapped
+            swaps, data = swaps + 1, swapped
         return {"evidence": "LIVE", "status": job.get("status", "queued"),
                 "provider_job_id": job["id"], "training_file": up["id"], "checkpoint": None}
+
+    def _dataset_rejected(self, job_id: str) -> str | None:
+        """Watch a fresh job through provider-side dataset validation. Returns the provider's
+        message when it fails the dataset format check (0 tokens trained), else None."""
+        waited = 0.0
+        while waited < DATASET_VALIDATION_WAIT_S:
+            st = self._req("GET", f"/fine_tuning/jobs/{job_id}", tries=1)
+            status = str(st.get("status") or "").lower()
+            if status in {"failed", "cancelled"}:
+                msg = str((st.get("error") or {}).get("message") or "")
+                return msg if "supported formats" in msg or "dataset" in msg.lower() else None
+            if status in {"running", "succeeded"} or st.get("trained_steps"):
+                return None
+            self._sleep(DATASET_VALIDATION_POLL_S)
+            waited += DATASET_VALIDATION_POLL_S
+        return None
 
     def job_status(self, job_id: str) -> dict[str, Any]:
         job = self._req("GET", f"/fine_tuning/jobs/{job_id}")
