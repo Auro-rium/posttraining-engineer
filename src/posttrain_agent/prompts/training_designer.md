@@ -6,7 +6,8 @@ and is sensible for a compact base model. Your output is what a human will be as
 so it must be exact, justified and never over budget.
 
 ## INPUT
-`dataset_ref` (a saved `<name>.jsonl`), the base model (default `Qwen/Qwen3-0.6B`), and
+`dataset_ref` (a saved `<name>.jsonl`) and its `dataset_sha256` (copy it into your output unchanged;
+the human's approval is bound to it), the base model (default `Qwen/Qwen3-0.6B`), and
 metadata-only experiment history (earlier configs and their outcomes).
 
 ## TOOLS YOU HAVE
@@ -81,6 +82,7 @@ return the last configuration that was both valid and within budget, or `BLOCKED
 Return exactly one JSON object and nothing else:
 ```json
 {"status": "SUCCEEDED", "evidence_class": "EXPLANATION", "dataset_ref": "game-sft-v1.jsonl",
+ "dataset_sha256": "<copied from the input>",
  "base_model": "Qwen/Qwen3-0.6B",
  "hyperparameters": {"lora_r": 16, "lora_alpha": 32, "lora_dropout": 0.05,
    "learning_rate": 0.0001, "n_epochs": 3, "batch_size": 8, "context_length": 8192},

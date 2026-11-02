@@ -259,6 +259,23 @@ def check_marker_ok(data_dir: Path, ref: str, sha256: str | None) -> bool:
             and marker.get("pretok_sha256") == pre_sha)
 
 
+def check_approved_sha(approved: str | None, actual: str, require: bool) -> str | None:
+    """Return an error when the dataset a human approved is not the dataset about to be uploaded.
+
+    The approval prompt shows the sha256 of the file as it was when the prompt was built; the agent
+    echoes that value back in ``launch_training(dataset_sha256=...)``. Any edit between approval and
+    upload changes ``actual`` and is refused. A missing value is refused when approval is on, since
+    the approval would otherwise cover a path rather than content.
+    """
+    if not approved:
+        return ("dataset_sha256 is required so the approval covers this exact file; pass the "
+                "sha256 returned by check_chat_template" if require else None)
+    if approved.strip().lower() != actual:
+        return (f"dataset changed since it was approved: approved sha256 {approved}, current "
+                f"{actual}; re-run check_chat_template and request approval again")
+    return None
+
+
 def inspect_dataset(data_dir: Path, ref: str, n: int = 3, game: str | None = None,
                     max_rows: int = MAX_ROWS) -> dict[str, Any]:
     """Counts per game / style / evidence plus ``n`` sample rows (optionally of one game) as the

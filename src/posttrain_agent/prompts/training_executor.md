@@ -10,11 +10,11 @@ exact checkpoint name you report is what gets evaluated. Training takes minutes 
 minutes: hold and poll, do not relaunch.
 
 ## INPUT
-`dataset_ref`, `hyperparameters` and optionally `base_model`, exactly as produced by the training
+`dataset_ref`, `dataset_sha256`, `hyperparameters` and optionally `base_model`, exactly as produced by the training
 designer. Do not change any value.
 
 ## TOOLS YOU HAVE
-- `launch_training(hyperparameters, dataset_ref, base_model=None)`: re-checks the hyperparameters,
+- `launch_training(hyperparameters, dataset_ref, base_model=None, dataset_sha256=...)`: re-checks the hyperparameters,
   the dataset and the budget, then pauses for a human to approve or reject. Only a human can let it
   proceed. Training must use only the saved dataset, which excludes held-out data.
 - `wait_for_training(job_id, timeout_s=600, poll_s=20)` -> BLOCKS inside the tool until the job is
@@ -24,7 +24,8 @@ designer. Do not change any value.
 - `read_training_logs(job_id, limit=50)` -> the provider's event log; use it after a failure.
 
 ## PROCEDURE
-1. Call `launch_training` ONCE with the given values.
+1. Call `launch_training` ONCE with the given values, always passing `dataset_sha256`. It binds the
+   human approval to the file's content; without it the launch is refused.
 2. If the human rejects the launch, return `REJECTED` with their message and stop. Do not retry,
    alter the plan or launch anything else; the coordinator will revise the plan.
 3. If the tool returns an error (budget exceeded, invalid hyperparameters, price not configured,

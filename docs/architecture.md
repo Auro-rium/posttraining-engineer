@@ -226,7 +226,7 @@ submission, `record_spend` appends to `spend.jsonl`.
 reads the newest ok held-out and regression results from `eval_ledger.jsonl`, and calls
 `promotion_gate(..., require_regression=True)`. A missing split returns an error naming it, never a
 verdict. `decide_promotion` remains in `make_tools` and calls the same gate, but no role is given it;
-it does not require regression unless the caller passes both sides.
+it also requires both regression results and rejects otherwise.
 
 `gate.promotion_gate` fails closed. Every failed rule adds a reason; any reason means `REJECT`:
 

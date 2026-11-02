@@ -163,8 +163,8 @@ def emit(journal: Journal | None, type: str, data: dict, run: str | None = None)
         return
     try:
         journal.append(run or CURRENT_RUN.get(), type, data)
-    except Exception:  # noqa: BLE001 - emission must never fail a run or tool
-        pass
+    except Exception:  # emission must never fail a run or tool, but a lost event must be visible
+        log.warning("journal append of %r failed; event dropped", type, exc_info=True)
 
 
 class Journal:

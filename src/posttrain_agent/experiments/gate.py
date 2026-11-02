@@ -134,6 +134,10 @@ def _regression_reasons(base: Any, cand: Any) -> list[str]:
     for key in ("suite", "split", "seed", "judged_by", "served_by"):
         if base.get(key) != cand.get(key):
             out.append(f"regression {key} differs between champion and candidate")
+    sa, sb = base.get("tasks_sha256"), cand.get("tasks_sha256")
+    if sa and sb and sa != sb:
+        out.append("regression tasks_sha256 differs: the two results were not computed on the "
+                   "same regression tasks")
     if cand.get("split") != "regression":
         out.append("regression results must come from the regression split")
     if problem := _parse_problem("candidate regression", base, cand):

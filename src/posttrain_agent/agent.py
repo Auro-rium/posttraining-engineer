@@ -23,6 +23,7 @@ from .runtime.exit_gate import ExitGate, NotesInjector
 from .runtime.persistence import SEED_MEMORY, Runtime
 from .subagents import ROLES, build_subagents, load_prompt
 from .tools import budget
+from .tools import dataset as dataset_mod
 from .tools.hf import hf_tools
 from .tools.web import web_tools
 
@@ -34,7 +35,9 @@ promote a candidate when the deterministic gate says PROMOTE.
 Loop per experiment (delegate each step with the `task` tool, one specialist at a time):
 1. benchmark -> 2. failure_analyst -> 3. researcher -> 4. data_curator ->
 5. training_designer (must call estimate_budget) -> 6. training_executor (a human approves the
-job before it launches; if rejected, revise the plan, do not retry unchanged) ->
+job before it launches; if rejected, revise the plan, do not retry unchanged). Pass the
+data_curator's `dataset_ref` AND `sha256` on to the designer and the executor unchanged: the
+approval is bound to that sha256, and a launch without it (or after the file changed) is refused. ->
 7. evaluator (champion AND candidate on the same split) -> 8. champion_manager.
 
 Parallelism: at most 2 subagents run at once. Issue independent `task` calls together in ONE
@@ -118,6 +121,15 @@ def default_backend(settings: Settings) -> ExperimentBackend:
     return NebiusBackend(settings) if settings.nebius_api_key else LocalStubBackend()
 
 
+def _live_dataset_sha(settings: Settings, ref: str) -> str:
+    """sha256 of the dataset as it is on disk right now, or a readable reason it is unavailable."""
+    try:
+        report = dataset_mod.verify_file(settings.data_dir, ref, settings.max_dataset_rows)
+        return report["sha256"] or f"UNAVAILABLE ({'; '.join(report['errors'][:1])})"
+    except Exception as exc:  # noqa: BLE001 - never block the prompt on a formatting error
+        return f"UNAVAILABLE ({exc})"
+
+
 def approval_description(settings: Settings) -> Callable[..., str]:
     """Text a human sees before approving a training job, including the cost estimate."""
 
@@ -145,9 +157,18 @@ def approval_description(settings: Settings) -> Callable[..., str]:
                                 hp if isinstance(hp, dict) else {})["cost_line"]
         except Exception as exc:  # noqa: BLE001
             cost = f"cost UNKNOWN: {exc}"
+        live_sha = _live_dataset_sha(settings, args.get("dataset_ref", ""))
+        claimed = args.get("dataset_sha256")
+        if not claimed:
+            bind = "NOT BOUND: the call carries no dataset_sha256, so the launch will be refused"
+        elif claimed.strip().lower() != live_sha:
+            bind = f"MISMATCH: the call claims {claimed}, the file on disk is {live_sha}; REJECT"
+        else:
+            bind = "bound: the launch is refused if the file changes after approval"
         return ("Approve launching a fine-tuning job?\n" + unpriced + f"COST: {cost}\n" +
                 f"base model: {args.get('base_model') or settings.base_model}\n"
                 f"dataset: {args.get('dataset_ref')}\n"
+                f"dataset sha256 (live, {bind}): {live_sha}\n"
                 f"hyperparameters: {json.dumps(hp, sort_keys=True)}\n"
                 f"budget estimate: {json.dumps(est, sort_keys=True)}")
 

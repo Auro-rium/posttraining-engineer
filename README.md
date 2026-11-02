@@ -582,9 +582,11 @@ billing before relying on the cap.
     `z >= 1.645`;
   - the regression split is supplied for both sides and passes the same validity, parse-rate and
     `<= 0.05` drop checks (`run_gate` passes `require_regression=True`);
-  - differing `tasks_sha256` values reject as "not computed on the same tasks".
-  `decide_promotion` is still available to code and defaults to not requiring regression, but no
-  agent role gets it. Only deterministic code decides; no agent can set a decision. The gate does
+  - differing `tasks_sha256` values reject as "not computed on the same tasks", on the held-out
+    split and on the regression split.
+  `decide_promotion` is still available to code, takes caller-supplied scores, and now also
+  requires both regression results (otherwise REJECT); no agent role gets it, and only `run_gate`
+  records the verdict the exit gate accepts. Only deterministic code decides; no agent can set a decision. The gate does
   not itself require the split to be `heldout`; it requires the two inputs to match.
   The verdict also reports `mde_80pct_power`, `power_note` and a `power` block (observed gain,
   adequacy, recommended n=300) at 80% power and one-sided 5%.
@@ -878,13 +880,18 @@ Read this before relying on the system.
   result comes from `LocalStubBackend`. These results are labelled `EXPLANATION`, and the gate
   always rejects them.
 - **Subagent outputs are not schema-checked.** The OUTPUT CONTRACT blocks in the prompt files
-  describe JSON shapes. The code does not validate them. Some prompt inputs, such as `run_id` and
-  `manifest_hash`, are not supplied by any tool. Treat the prompts as guidance.
+  describe JSON shapes. The code does not validate them, so a malformed hand-off is caught only
+  by the next tool's own checks. Treat the prompts as guidance. (The prompts no longer ask for
+  inputs that no tool supplies; `dataset_sha256` is passed from `data_curator` through to
+  `launch_training`.)
 - **No champion store or deployment.** `run_gate` returns a decision. The code does not record a
   champion, deploy a checkpoint, or pick the next candidate.
-- **Approval shows the dataset reference, not its hash.** The dataset could change between approval
-  and submission. `launch_training` re-verifies the file and the suite overlap before upload, and
-  its result reports the SHA-256, but the approval text does not include the hash.
+- **Approval is bound to the dataset hash, but only as strongly as the human reads it.** The approval
+  prompt shows the SHA-256 of the file as it is on disk at that moment and flags `NOT BOUND` or
+  `MISMATCH` when the call's `dataset_sha256` is missing or differs. `launch_training` refuses to
+  upload (`stage: approval_binding`) when `dataset_sha256` is missing (approval on) or differs from
+  the file's current hash, so an edit after approval cannot be uploaded. With
+  `POSTTRAIN_REQUIRE_APPROVAL=0` no hash is demanded.
 - **Crash between submit and spend record.** See [Recovering from crashes](#recovering-from-crashes).
 - **Replay re-executes tools.** See [Replaying offline with the cassette](#replaying-offline-with-the-cassette).
 - **Approval can be turned off.** `POSTTRAIN_REQUIRE_APPROVAL=0` removes the only human check on

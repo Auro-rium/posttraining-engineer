@@ -335,11 +335,13 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         return est
 
     def launch_training(hyperparameters: dict[str, Any] | str, dataset_ref: str,
-                        base_model: str | None = None) -> dict[str, Any]:
+                        base_model: str | None = None,
+                        dataset_sha256: str | None = None) -> dict[str, Any]:
         """Launch ONE LoRA fine-tuning job (needs human approval). Re-checks hyperparameters, dataset,
         train/eval state disjointness (against the CURRENT suite), the chat-template check
         (check_chat_template must have passed for this exact dataset), the optimizer-step floor and
-        the budget. Trains on the pretokenized file."""
+        the budget. Trains on the pretokenized file. ``dataset_sha256`` binds the human approval to
+        the file's content: a different current hash blocks the launch."""
         hyperparameters = _hp(hyperparameters)
         if not isinstance(hyperparameters, dict):
             return {"status": "BLOCKED", "stage": "hyperparameters",
@@ -349,6 +351,9 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         report = dataset_mod.verify_file(settings.data_dir, dataset_ref, settings.max_dataset_rows)
         if not report["ok"]:
             return {"status": "BLOCKED", "stage": "dataset", "errors": report["errors"]}
+        if bind_err := dataset_mod.check_approved_sha(dataset_sha256, report["sha256"],
+                                                      settings.require_approval):
+            return {"status": "BLOCKED", "stage": "approval_binding", "errors": [bind_err]}
         # Re-read the suite and dataset on every launch: a suite edit or dataset swap after the
         # template check must not turn contaminated data into a job.
         overlap = dataset_mod.check_suite_overlap(settings.data_dir, dataset_ref,
@@ -507,9 +512,12 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
                          champion_regression: dict[str, Any] | None = None,
                          candidate_regression: dict[str, Any] | None = None) -> dict[str, Any]:
         """Run the deterministic promotion gate over two held-out evaluate_checkpoint results;
-        pass both regression-split results too so forgetting is checked."""
+        pass both regression-split results too: without them forgetting was not checked and the
+        verdict is REJECT, the same fail-closed rule run_gate applies. Prefer run_gate, which reads
+        the ledger instead of caller-supplied scores."""
         verdict = promotion_gate(champion, candidate, champion_regression=champion_regression,
-                                 candidate_regression=candidate_regression)
+                                 candidate_regression=candidate_regression,
+                                 require_regression=True)
         emit(journal, "gate.verdict", verdict)
         return verdict
 

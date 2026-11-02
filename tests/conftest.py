@@ -17,6 +17,7 @@ def _bypass_launch_gates(request, monkeypatch):
     if request.node.get_closest_marker("real_gate"):
         return
     monkeypatch.setattr(dataset_mod, "check_marker_ok", lambda *a, **k: True)
+    monkeypatch.setattr(dataset_mod, "check_approved_sha", lambda *a, **k: None)
     real = budget_mod.training_token_info
     monkeypatch.setattr(
         budget_mod, "training_token_info",
