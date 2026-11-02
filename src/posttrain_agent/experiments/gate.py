@@ -17,7 +17,14 @@ Rules (every failed rule adds a reason; any reason means REJECT):
    turns that into a rejection.
 
 The verdict reports the minimum detectable effect (80% power, one-sided 5%) so an underpowered
-comparison is visible instead of being read as "no effect".
+comparison is visible instead of being read as "no effect". When both sides have a usable ``n`` the
+verdict also carries a compact machine-readable ``power`` block:
+
+``{"mde_80pct_power", "observed_gain", "adequately_powered", "recommended_n", "n"}``
+
+where ``adequately_powered`` is true only when the observed gain reaches the MDE. A small but real
+gain can therefore be REJECTED: that is the gate reporting an underpowered comparison, not evidence
+that training had no effect.
 """
 
 from __future__ import annotations
@@ -199,11 +206,22 @@ def promotion_gate(champion: dict[str, Any], candidate: dict[str, Any], *,
         out["power_note"] = (f"with n={min(n1, n2)} per side only a gain of about {mde:.3f} "
                              "absolute or more is detectable at 80% power (one-sided 5%, "
                              "unpaired approximation)")
+        # Machine-readable counterpart of power_note/mde_80pct_power. adequately_powered means
+        # "the observed gain is at least the MDE", not "the candidate is good"; a negative gain
+        # is never adequate evidence of improvement.
+        out["power"] = {
+            "mde_80pct_power": round(mde, 4),
+            "observed_gain": round(delta, 4),
+            "adequately_powered": delta >= mde,
+            "recommended_n": RECOMMENDED_N,
+            "n": min(n1, n2),
+        }
         if 0 < delta < mde:
             warnings.append("observed gain is below the minimum detectable effect: the "
                             "comparison is underpowered")
         if min(n1, n2) < RECOMMENDED_N:
-            warnings.append(f"n={min(n1, n2)} is below the recommended {RECOMMENDED_N} held-out tasks")
+            warnings.append(f"n={min(n1, n2)} is below the recommended {RECOMMENDED_N} "
+                            "held-out tasks")
 
     have = (champion_regression is not None, candidate_regression is not None)
     if all(have):

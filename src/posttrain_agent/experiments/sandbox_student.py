@@ -54,6 +54,7 @@ ADAPTER_TIMEOUT_S = 600.0
 JOB_BASE_TIMEOUT_S = 240.0  # python + torch import + model load, with headroom
 JOB_PER_SAMPLE_TIMEOUT_S = 45.0
 TOTAL_TIMEOUT_S = 3600.0  # one whole generate() call
+UPLOAD_TRIES = 5  # adapter file uploads timed out live; a non-disposable layer build is idempotent
 TRUNCATE_OUTPUT_AT = 1_000_000  # the SDK default (64 KiB) would cut the JSON result
 ADAPTER_CONFIG = "adapter_config.json"
 ADAPTER_WEIGHTS = ("adapter_model.safetensors", "adapter_model.bin")  # the names peft loads
@@ -72,6 +73,20 @@ class StudentError(RuntimeError):
         super().__init__(message)
         self.done, self.total, self.stage = done, total, stage
         self.transient, self.partial = transient, partial or []
+
+
+_UPLOAD_TRANSPORT_NAMES = frozenset({"ApiTransportError", "ContreeTransportError"})
+
+
+def _upload_transient(exc: BaseException) -> bool:
+    """Transient upload failures: the shared classifier plus the SDK's transport-error classes.
+
+    ``retry.is_transient`` matches ``ApiTimeoutError`` by name but not every SDK transport class,
+    so the adapter upload classifies those here too. A deterministic build/script failure is
+    never retried.
+    """
+    return is_transient(exc) or any(c.__name__ in _UPLOAD_TRANSPORT_NAMES
+                                    for c in type(exc).__mro__)
 
 
 # ------------------------------------------------- pure logic (also shipped inside the sandbox)
@@ -95,9 +110,9 @@ def adapter_load_problem(state_keys: Sequence[str], unexpected_keys: Sequence[st
     if not state_keys or n_lora == 0:
         return f"adapter has no LoRA tensors ({len(state_keys)} tensors in the file)"
     if unexpected or lora_missing:
-        return ("adapter weights did not load cleanly: %d tensors, %d unexpected keys, %d missing "
-                "lora keys; e.g. %s" % (len(state_keys), len(unexpected), len(lora_missing),
-                                        (unexpected + lora_missing)[:3]))
+        return (f"adapter weights did not load cleanly: {len(state_keys)} tensors, "
+                f"{len(unexpected)} unexpected keys, {len(lora_missing)} missing lora keys; "
+                f"e.g. {(unexpected + lora_missing)[:3]}")
     return None
 
 
@@ -222,8 +237,8 @@ def parse_output(stdout: str) -> dict[str, Any]:
 
 # ------------------------------------------------- tool-call parsing (host side)
 
-_THINK = re.compile(r"<think>.*?(?:</think>|$)", re.S | re.I)
-_TOOL_CALL = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.S)
+_THINK = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL | re.IGNORECASE)
+_TOOL_CALL = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.DOTALL)
 
 
 def clean_output(text: str) -> str:
@@ -354,18 +369,23 @@ class SandboxStudent:
                       strict: bool, what: str) -> str:
         client = self._client()
         t = time.monotonic()
+        attempts = 0
 
         async def attempt() -> Any:
+            nonlocal attempts
+            attempts += 1
             image = await client.images.use(image_ref, strict=strict)
             return await asyncio.wait_for(
                 image.run(shell=shell, files=files, disposable=False, timeout=timeout,
                           truncate_output_at=TRUNCATE_OUTPUT_AT), timeout=timeout + 60)
 
-        try:  # DNS / transport / upload timeouts are retried with backoff before giving up
-            res = await retry_async(attempt)
-        except Exception as exc:  # noqa: BLE001 - any SDK/network failure or our backstop
-            raise StudentError(f"{what} build failed: {type(exc).__name__}: {str(exc)[:200]}",
-                               stage="image", transient=is_transient(exc)) from exc
+        try:  # DNS / transport / upload timeouts: bounded exponential backoff
+            res = await retry_async(attempt, tries=UPLOAD_TRIES, retry_on=_upload_transient)
+        except Exception as exc:  # any SDK/network failure or our backstop
+            raise StudentError(
+                f"{what} build failed on attempt {attempts}/{UPLOAD_TRIES}: "
+                f"{type(exc).__name__}: {str(exc)[:200]}", stage="image",
+                transient=_upload_transient(exc)) from exc
         if res.exit_code != 0 or not getattr(res, "uuid", None):
             raise StudentError(f"{what} build failed: exit {res.exit_code}: {_tail(res.stderr)}",
                                stage="image")

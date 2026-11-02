@@ -39,6 +39,10 @@ def _split_models(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
+_DEFAULT_STATE_DIR = Path("state")
+_DEFAULT_SUITE_DIR = _DEFAULT_STATE_DIR / "suite_v2"
+
+
 @dataclass(frozen=True)
 class Settings:
     backboard_api_key: str = ""
@@ -63,7 +67,7 @@ class Settings:
     max_cost_usd: float = 25.0  # total estimated spend across all launched jobs
     price_per_mtok: float | None = None  # USD per 1M trained tokens; Nebius publishes none
     data_dir: Path = Path("state/data")
-    suite_dir: Path = Path("state/suite")  # <split>.jsonl task files (train/heldout/regression)
+    suite_dir: Path = _DEFAULT_SUITE_DIR  # <split>.jsonl task files (all four eval splits)
     require_approval: bool = True  # human approval before every training job
     seed: int = 7
     max_parallel_subagents: int = 2
@@ -85,6 +89,15 @@ class Settings:
     # how the evaluated model is served: auto (serverless if /models lists the base model, else
     # sandbox CPU) | serverless (Token Factory /chat/completions) | sandbox (transformers in a sandbox)
     serve: str = "auto"
+
+    def __post_init__(self) -> None:
+        """Keep the default suite under a caller-supplied state root.
+
+        ``from_env`` derives ``<state>/suite_v2`` itself; direct ``Settings(state_dir=...)`` calls
+        get the same treatment so a relocated run cannot silently read another directory's suite.
+        """
+        if self.suite_dir == _DEFAULT_SUITE_DIR and self.state_dir != _DEFAULT_STATE_DIR:
+            object.__setattr__(self, "suite_dir", Path(self.state_dir) / "suite_v2")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -111,7 +124,9 @@ class Settings:
             max_cost_usd=float(e("POSTTRAIN_MAX_COST_USD", "25")),
             price_per_mtok=float(e("POSTTRAIN_PRICE_PER_MTOK")) if e("POSTTRAIN_PRICE_PER_MTOK") else None,
             data_dir=Path(e("POSTTRAIN_DATA_DIR", str(Path(e("POSTTRAIN_STATE_DIR", "state")) / "data"))),
-            suite_dir=Path(e("POSTTRAIN_SUITE_DIR", str(Path(e("POSTTRAIN_STATE_DIR", "state")) / "suite"))),
+            suite_dir=Path(e(
+                "POSTTRAIN_SUITE_DIR",
+                str(Path(e("POSTTRAIN_STATE_DIR", "state")) / "suite_v2"))),
             require_approval=e("POSTTRAIN_REQUIRE_APPROVAL", "1").lower() not in {"0", "false", "no"},
             seed=int(e("POSTTRAIN_SEED", "7")),
             max_parallel_subagents=max(1, int(e("POSTTRAIN_MAX_PARALLEL", "2"))),

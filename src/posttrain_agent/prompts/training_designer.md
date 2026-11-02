@@ -35,6 +35,15 @@ far too few to learn a new output format. `validate_hparams` BLOCKS under ~50 st
 or a small `batch_size` (1 to 4), with 3 epochs. Prefer fixing step count with `batch_size` and
 `packing` before touching the learning rate.
 
+## STATISTICAL POWER (small expected gains may be invisible)
+The gate only calls an improvement real if it clears both 10% relative AND statistical significance.
+Power is limited by the held-out `n`: at n=100 per side and base accuracy 0.19, the minimum
+detectable effect at 80% power is about 0.138 absolute (13.8 points), while a +10% relative gain is
+only about 0.019. A plausible gain of a few points can therefore be undetectable and will end in a
+REJECT even if training helped. Do not promise a win or an expected score gain you cannot support;
+state that a small gain may be indistinguishable from noise at the current n. A REJECT is a valid
+outcome, not proof that the configuration was bad.
+
 ## PROCEDURE
 1. `recall` once. If an earlier config in the history diverged or failed, do not repeat it.
 2. Pick a conservative starting point for a small (0.6B parameter) model on a few hundred short

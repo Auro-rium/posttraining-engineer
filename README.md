@@ -26,9 +26,10 @@ runs survive crashes and can be resumed, forked, or replayed offline from a reco
 - [Budget model](#budget-model)
 - [Safety model](#safety-model)
 - [Operating guide](#operating-guide)
+- [Live dashboard](#live-dashboard)
 - [Extending](#extending)
 - [Testing](#testing)
-- [Status and limitations](#status-and-limitations)
+- [Known limitations / honest status](#known-limitations--honest-status)
 - [More detail](#more-detail)
 
 ---
@@ -54,11 +55,12 @@ coordinator (deepagents + Backboard LLM)           tools: remember, recall, web_
   |  4 data_curator ......... verify_dataset, save_dataset, hf_dataset_info
   |  5 training_designer .... validate_hparams, estimate_budget, web_search, hf_model_info
   |  6 training_executor .... launch_training  <== HUMAN APPROVAL GATE
-  |                           get_training_status, read_training_logs
-  |  7 evaluator ............ evaluate_checkpoint      (heldout | regression, scores only)
-  |  8 champion_manager ..... decide_promotion         (deterministic gate)
+  |                           wait_for_training, read_training_logs
+  |  7 evaluator ............ evaluate_checkpoint      (sealed splits, scores only)
+  |  8 champion_manager ..... run_gate                 (deterministic gate)
   v
-PROMOTE or REJECT, with an evidence label on every number (LIVE | PRIOR_VERIFIED_RUN | EXPLANATION)
+PROMOTE or REJECT, with an evidence label on every number
+(LIVE | PRIOR_VERIFIED_RUN | RULE_VERIFIED | EXPLANATION)
 ```
 
 ### The eight subagent roles
@@ -68,15 +70,20 @@ PROMOTE or REJECT, with an evidence label on every number (LIVE | PRIOR_VERIFIED
 | `benchmark` | `run_benchmark` | recall |
 | `failure_analyst` | `read_training_logs` | recall |
 | `researcher` | `web_search`, `web_extract`, `hf_search`, `hf_model_info`, `hf_dataset_info` | recall, remember |
-| `data_curator` | `verify_dataset`, `save_dataset`, `hf_dataset_info` | recall |
+| `data_curator` | `generate_game_sft`, `verify_dataset`, `save_dataset`, `inspect_dataset`, `check_chat_template`, `hf_dataset_info` | recall |
 | `training_designer` | `validate_hparams`, `estimate_budget`, `web_search`, `hf_model_info` | recall |
-| `training_executor` | `launch_training`, `get_training_status`, `read_training_logs` | recall |
+| `training_executor` | `launch_training`, `wait_for_training`, `read_training_logs` | recall |
 | `evaluator` | `evaluate_checkpoint` | recall |
-| `champion_manager` | `decide_promotion` | recall |
+| `champion_manager` | `run_gate` | recall |
 
 Each role's system prompt is a file in `src/posttrain_agent/prompts/`, prefixed by a shared
 preamble in `subagents.py`. Most tools are deterministic Python (`experiments/domain.py`, `tools/dataset.py`,
 `tools/budget.py`, `experiments/nebius.py`). `web_*` and `hf_*` are read-only lookups against external services.
+
+`decide_promotion` still exists in the deterministic tool set, but no role is given it: the
+`champion_manager` calls `run_gate`, which reads the evaluation ledger itself. `abort_experiment` is
+a coordinator tool, not a role tool. `run_gate` requires the regression split; a missing split
+returns an error naming it rather than a verdict.
 
 ### Parallel subagents
 
@@ -145,7 +152,7 @@ See [docs/architecture.md](docs/architecture.md) for the data flow and internals
 - [uv](https://docs.astral.sh/uv/) for installation and running.
 - A Backboard API key. This is required for every run except cassette replay.
 - A Nebius Token Factory API key for real training and evaluation. Without it the backend is a
-  labelled simulation (see [Status and limitations](#status-and-limitations)).
+  labelled simulation (see [Known limitations / honest status](#known-limitations--honest-status)).
 - Optional: a Tavily API key (web tools), a Hugging Face token (authenticated Hub requests and
   gated repositories).
 - Network access to `app.backboard.io`, `api.tokenfactory.nebius.com`, `api.tavily.com` and
@@ -170,7 +177,8 @@ This creates `.venv/` and installs the `posttrain` console script into it. Run c
 
 ```bash
 cp .env.example .env
-# edit .env, then load it into your shell (the CLI does not read .env files itself)
+# edit .env; the `posttrain` CLI loads ./.env at startup without overriding variables
+# already exported. To load it into your shell as well:
 set -a; . ./.env; set +a
 ```
 
@@ -180,28 +188,45 @@ At minimum set:
 |----------|-----|
 | `BACKBOARD_API_KEY` | Required for every run. |
 | `NEBIUS_API_KEY` | Required for real training and evaluation. Leave empty only for the simulation. |
-| `POSTTRAIN_PRICE_PER_MTOK` | **Required for any launch.** Nebius publishes no per-token fine-tuning price, so you supply one. Find your rate in your Nebius Token Factory account or billing console, or in your contract or quote. Enter the USD cost per 1 million trained tokens. Without it every launch is blocked at the budget stage. |
+| `POSTTRAIN_PRICE_PER_MTOK` | **Required to launch unless you opt into unpriced mode.** Nebius publishes no per-token fine-tuning price, so you supply one: USD per 1 million trained tokens. Without a price, `POSTTRAIN_ALLOW_UNPRICED=1` permits launches under a cumulative `POSTTRAIN_MAX_TRAINED_TOKENS` cap instead; otherwise every launch is blocked at the budget stage. |
 
 `TAVILY_API_KEY` and `HF_TOKEN` are optional. Without Tavily the web tools return an
 "unavailable" error and the researcher continues without them.
 
 **3. Create the evaluation task files.**
 
-The default suite directory is `state/suite` (`POSTTRAIN_SUITE_DIR` overrides it). The bundled
-generator writes three splits from four deterministic mini-games (tic-tac-toe, Nim, number
-guessing, rock-paper-scissors): 200 train, 100 held-out and 60 regression tasks, disjoint by game
-state.
+The default suite is `state/suite_v2` (`POSTTRAIN_SUITE_DIR` selects the directory; the code's
+fallback is `<STATE_DIR>/suite_v2`). The bundled generator writes four splits from four
+deterministic mini-games (tic-tac-toe, Nim, number guessing, rock-paper-scissors): 200 train, 300
+held-out, 150 regression and 120 `heldout_phrasing` tasks, disjoint by game state. The phrasing
+split uses wording styles that SFT never sees and is reported separately; it is not part of the
+gate's main `n`.
 
 ```bash
-python scripts/make_game_suites.py state/suite
+python scripts/make_game_suites.py state/suite_v2
 ```
+
+`state/suite` is the legacy v1 suite (200 train / 100 held-out / 60 regression). Keep it only for
+old results; do not mix v1 data with v2.
 
 **What we fine-tune on.** Supervised fine-tuning (LoRA) of `Qwen/Qwen3-0.6B` on at most **1200**
 chat-format rows (game state and tool schema in, the correct tool call out, then a tool result and a
 short reply, the format Nebius requires). The rows are generated by code from the game rules
-(`generate_game_sft`), so every answer is correct by construction; three paraphrases per state teach
-the rule rather than one sentence. No state from any evaluation split is ever used for training, and
-the verifier rejects datasets over 1200 rows (`POSTTRAIN_MAX_DATASET_ROWS` can only lower the cap).
+(`generate_game_sft`), so every answer is correct by construction; one row per distinct state, with
+phrasing styles rotated across states. No state from any evaluation split, including
+`heldout_phrasing`, is ever used for training, and the verifier rejects datasets over 1200 rows
+(`POSTTRAIN_MAX_DATASET_ROWS` can only lower the cap).
+
+Generate a fresh dataset against the suite you will evaluate on:
+
+```bash
+python scripts/make_sft.py --suite state/suite_v2 --out state/data/game-sft-v2.jsonl
+```
+
+`generate_game_sft` inside the agent does the same thing. The old
+`state/data/exp1_data_n1200.jsonl` is a v1 dataset and must not be reused with `suite_v2`: it shares
+91 states with v2 (15 train, 40 held-out, 18 regression, 18 held-out-phrasing), so the state-overlap
+check blocks it at `check_chat_template` and `launch_training`.
 
 **How we prove it beat the base model.** Training runs on Nebius Token Factory, but its serverless
 `/chat/completions` serves neither `Qwen/Qwen3-0.6B` nor `ft:` LoRA checkpoints. So both the base
@@ -214,14 +239,28 @@ merged; greedy generation (`max_new_tokens` 160, thinking off) runs in at most 4
 at a time, and the first `<tool_call>{json}</tool_call>` is the model's answer. Expect minutes per
 evaluation (the first one also builds the image). `POSTTRAIN_SERVE=auto` keeps serverless for a base
 model that `/models` lists. The tool call is then executed against the real game rules by a judge
-inside a **Nebius Sandbox** (an isolated VM), and counted only if the move is legal and optimal. The first champion is the
-untouched base model; the gate promotes a candidate only if, scored by the same judge on the same
-suite, split and seed, it beats the champion by at least 10% relative, the gain is statistically
-significant (one-sided two-proportion z of at least 1.645, so 100 held-out tasks can reject luck),
-and it loses at most 0.05 absolute on the regression split. Results carry `judged_by`
-(`nebius-sandbox`, or `local-env` if the sandbox was unavailable, with a note), `served_by`
-(`nebius-sandbox-cpu` or `nebius-serverless`; the gate never compares the two) and per-game accuracy.
-A serving failure returns an `error` with `n_tasks`/`n_generated`, never a score.
+inside a **Nebius Sandbox** (an isolated VM), and counted only if the move is legal and optimal.
+
+The first champion is the untouched base model. `run_gate` promotes a candidate only if all of these
+hold (see [Safety model](#safety-model) for the exact list):
+
+- both results have verified evidence (`LIVE` or `PRIOR_VERIFIED_RUN`) and identical
+  `suite`, `split`, `seed`, `judged_by` and `served_by`;
+- both report an integer `n > 0`;
+- the candidate's `parse_rate` is at least `max(0.90, base parse_rate - 0.02)`;
+- the candidate gains at least 10% relative and does not drop more than 0.05 absolute;
+- the gain is statistically significant: an exact paired McNemar test when both sides carry
+  per-task `verdicts` over the same `tasks_sha256`, otherwise a one-sided two-proportion z-test with
+  `z >= 1.645`;
+- the regression split is present and passes the same checks (`run_gate` requires it).
+
+The verdict also reports the minimum detectable effect (MDE) at 80% power and flags an underpowered
+comparison. At a 0.19 base score and n=100, the MDE is about 0.138 absolute (13.8 points), so a 10%
+relative gain (about 1.9 points) is not detectable; the default 300-task held-out split is sized for
+that. Results carry `judged_by` (`nebius-sandbox`, or `local-env` if the sandbox was unavailable,
+with a note), `served_by` (`nebius-sandbox-cpu` or `nebius-serverless`; the gate never compares the
+two) and per-game accuracy. A serving failure returns an `error` with `n_tasks`/`n_generated`, never
+a score.
 
 Sandboxes are a Nebius Beta product. Set `NEBIUS_PROJECT_ID` (Token Factory, Project settings), ask
 contree@nebius.com for access if the project is not activated, and `pip install ".[sandbox]"`. The
@@ -232,7 +271,7 @@ script, task prompts and adapter bytes do. Live smoke: `scripts/smoke_sandbox_se
 The task files, if you write your own, are JSONL:
 
 ```bash
-mkdir -p state/suite
+mkdir -p state/suite_v2
 ```
 
 | File | Used by | Visible to agents |
@@ -240,6 +279,7 @@ mkdir -p state/suite
 | `train.jsonl` | `run_benchmark` | Scores and up to 20 failures, including expected and got values |
 | `heldout.jsonl` | `evaluate_checkpoint(split="heldout")` | Scores only |
 | `regression.jsonl` | `evaluate_checkpoint(split="regression")` | Scores only |
+| `heldout_phrasing.jsonl` | `evaluate_checkpoint(split="heldout_phrasing")` | Scores only; informational, never gates |
 
 Each line of each file is one task object:
 
@@ -264,13 +304,13 @@ Each line of each file is one task object:
 
 Scoring: the model is called with `temperature: 0`. A task scores 1 only if the model's **first**
 tool call has exactly this `name` and `arguments` (a parsed JSON object compared for equality).
-Otherwise it scores 0. At most 200 tasks per split are read. Use the same six tool names the
-dataset verifier allows (`get_logs`, `inspect_service`, `read_config`, `edit_config`,
-`restart_service`, `run_healthcheck`) so that the behaviour you train and the behaviour you measure
-are the same.
+Otherwise it scores 0. At most 1000 tasks per split are read. Use the same tool names the dataset
+verifier allows: the four game tools (`place_mark`, `take_stones`, `guess_number`, `play_move`) and
+the six ops tools (`get_logs`, `inspect_service`, `read_config`, `edit_config`, `restart_service`,
+`run_healthcheck`) so that the behaviour you train and the behaviour you measure are the same.
 
-The held-out and regression files are sealed. Agents receive only `{evidence, score, n}` for them.
-Task contents never leave `experiments/nebius.py`.
+The held-out, regression and phrasing files are sealed. Agents receive only
+`{evidence, score, n}` for them. Task contents never leave `experiments/nebius.py`.
 
 **4. Start a run.**
 
@@ -286,10 +326,10 @@ The command prints a JSON status. Exit code `3` means the run is paused for appr
 uv run posttrain pending --thread demo
 ```
 
-The `description` field shows the base model, dataset ref, hyperparameters and the budget
-estimate (`estimated_trained_tokens`, `estimated_cost_usd`, `within_budget`, `spent_usd`, `cap_usd`).
-The description does not include the dataset hash. The hash is returned in the tool result after
-launch.
+The `description` field shows the base model, dataset ref, hyperparameters, a cost line and the
+budget estimate (`estimated_trained_tokens`, `estimated_cost_usd`, `within_budget`, `spent_usd`,
+`cap_usd`; in unpriced mode the token cap instead). The description does not include the dataset
+hash. The hash is returned in the tool result after launch.
 
 **6. Approve or reject.**
 
@@ -324,24 +364,28 @@ ls state/data/                              # verified datasets
 
 Look for `"evidence": "LIVE"` on measurements. Only results labelled `LIVE` (or
 `PRIOR_VERIFIED_RUN`) can produce `PROMOTE`. `EXPLANATION` results are simulated or inferred.
+`RULE_VERIFIED` marks dataset rows whose answer was recomputed from the game rule; it is valid
+training provenance, not measured model evidence, and the promotion gate does not accept it.
 
 ---
 
 ## CLI reference
 
-Entry point: `posttrain` (`posttrain_agent.cli:main`). Every command except `telemetry` needs
-`BACKBOARD_API_KEY`, or `POSTTRAIN_CASSETTE_MODE=replay`.
+Entry point: `posttrain` (`posttrain_agent.cli:main`). Every command except `telemetry`, `a2a` and
+`note` needs `BACKBOARD_API_KEY`, or `POSTTRAIN_CASSETTE_MODE=replay`.
 
 | Command | Arguments | What it does |
 |---------|-----------|--------------|
-| `run` | `GOAL` `--thread ID` (default `default`) | Starts the run on the thread, or resumes it if the thread already has state. |
+| `run` | `GOAL` `--thread ID` (default `default`) `--auto-resume` `--max-resumes N` | Starts the run on the thread, or resumes it if the thread already has state. `--auto-resume` retries a `FAILED_TRANSIENT` outage up to `N` times (default 8). |
 | `resume` | `--thread ID` | Continues a thread from its last checkpoint. |
 | `pending` | `--thread ID` | Prints the actions waiting for a human decision, from every paused subagent. |
 | `approve` | `--thread ID` | Approves every pending action, across all paused subagents, and continues. Errors if nothing is pending. |
 | `reject` | `--thread ID` `-m/--message TEXT` | Rejects every pending action, across all paused subagents. The message is shown to the agent. |
+| `note` | `--thread ID` `TEXT` | Leaves an operator note the coordinator reads before its next model call. Needs no key or network. |
 | `history` | `--thread ID` | Lists checkpoints, newest first: id, step, source, next node, message count. |
 | `fork` | `--thread ID` `CHECKPOINT_ID` | Re-executes from a past checkpoint. Original history is kept. Prints the final message. |
 | `runs` | none | Prints the run ledger across threads (up to 100 entries). |
+| `a2a` | `--thread ID` `--out FILE` | Exports the run's agent-to-agent conversation from the event journal. Needs no key or network. |
 | `telemetry` | `--last N` (default 500) `--errors` | Summarises `state/telemetry.jsonl`. Needs no key or network. |
 
 Exit codes for `run`, `resume`, `approve` and `reject`:
@@ -358,8 +402,9 @@ Exit codes for `run`, `resume`, `approve` and `reject`:
 ## Configuration reference
 
 Settings are read from the process environment by `Settings.from_env()` in
-`src/posttrain_agent/config.py`. The code does not load `.env` files. Use `.env.example` as a
-template.
+`src/posttrain_agent/config.py`. The `posttrain` CLI loads `./.env` at startup without overriding
+already-exported variables; library callers get only the process environment. Use `.env.example`
+as a template.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -378,13 +423,25 @@ template.
 | `POSTTRAIN_CASSETTE_MODE` | `auto` | `auto` replays hits and records misses; `record` always calls live; `replay` never calls and fails on a miss. |
 | `NEBIUS_API_KEY` | `""` | Nebius key. Empty selects the labelled simulation backend. |
 | `NEBIUS_BASE_URL` | `https://api.tokenfactory.nebius.com/v1` | Nebius OpenAI-compatible base URL. |
-| `POSTTRAIN_BASE_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | Base model for fine-tuning and for the `base` checkpoint alias. |
-| `POSTTRAIN_PRICE_PER_MTOK` | unset | USD per 1M trained tokens. **Required to launch.** |
-| `POSTTRAIN_MAX_COST_USD` | `25` | Cumulative estimated spend cap across all launched jobs. |
+| `POSTTRAIN_BASE_MODEL` | `Qwen/Qwen3-0.6B` | Base model for fine-tuning and for the `base` checkpoint alias. |
+| `POSTTRAIN_PRICE_PER_MTOK` | unset | USD per 1M trained tokens. **Required to launch unless `POSTTRAIN_ALLOW_UNPRICED=1`.** |
+| `POSTTRAIN_ALLOW_UNPRICED` | `0` | `1`/`true`/`yes` allows launches without a price, capped by cumulative trained tokens instead of USD. |
+| `POSTTRAIN_MAX_TRAINED_TOKENS` | `10000000` | Cumulative trained-token cap when unpriced (this job plus earlier ones). |
+| `POSTTRAIN_MAX_COST_USD` | `25` | Cumulative estimated spend cap across all launched jobs when priced. |
 | `POSTTRAIN_DATA_DIR` | `<STATE_DIR>/data` | Where verified datasets are stored. |
-| `POSTTRAIN_SUITE_DIR` | `<STATE_DIR>/suite` | Directory containing `train.jsonl`, `heldout.jsonl`, `regression.jsonl`. |
+| `POSTTRAIN_SUITE_DIR` | `<STATE_DIR>/suite_v2` | Directory containing `train.jsonl`, `heldout.jsonl`, `regression.jsonl`, `heldout_phrasing.jsonl`. `state/suite` is the legacy v1 suite. |
+| `POSTTRAIN_MAX_DATASET_ROWS` | `1200` | SFT row cap. Can only lower the hard 1200-row limit. |
 | `POSTTRAIN_REQUIRE_APPROVAL` | `1` | Set to `0`, `false` or `no` to disable the approval gate. Only do this for unattended runs you accept. |
 | `POSTTRAIN_SEED` | `7` | Seed for benchmark and evaluation requests and for Nebius jobs. |
+| `POSTTRAIN_SERVE` | `auto` | `auto` serves the base model serverlessly if `/models` lists it, else on sandbox CPU; `serverless`/`sandbox` force one path. |
+| `POSTTRAIN_EVAL_JUDGE` | `auto` | `auto` uses the sandbox judge when configured, else local rules; `sandbox` requires it; `local` never uses it. |
+| `NEBIUS_PROJECT_ID` | `""` | Nebius project for Sandboxes (Beta), used for serving and judging. |
+| `POSTTRAIN_SANDBOX_IMAGE` | `python:3.12-slim` | Base image for sandbox jobs. |
+| `POSTTRAIN_TOKENIZER_DIR` | unset | Directory with the base model's `tokenizer.json`/`tokenizer_config.json`; otherwise the Hugging Face cache is searched. |
+| `POSTTRAIN_SUBAGENT_MAX_CALLS` / `POSTTRAIN_SUBAGENT_MAX_TOKENS` | `12` / `150000` | Per-subagent model-call and token caps. |
+| `POSTTRAIN_COORDINATOR_MAX_CALLS` / `POSTTRAIN_COORDINATOR_MAX_TOKENS` | `80` / `1000000` | Per-coordinator model-call and token caps. |
+| `POSTTRAIN_RUN_MAX_TOKENS` | `2000000` | Whole-run token cap, persisted in `state/run_tokens.json`. |
+| `POSTTRAIN_MODEL_<ROLE>` | unset | Per-role `provider:model` override (for example `POSTTRAIN_MODEL_EVALUATOR=anthropic:claude-sonnet-4-5`). |
 | `TAVILY_API_KEY` | `""` | Enables `web_search` and `web_extract`. |
 | `HF_TOKEN` | `""` | Bearer token for Hugging Face Hub requests. |
 
@@ -415,27 +472,36 @@ Rules enforced by `dataset.verify_rows`:
 - Each message has `role` in `system`, `user`, `assistant`, `tool`.
 - `content` is a string or null. A message needs content or tool calls.
 - Only `assistant` messages may carry `tool_calls`.
-- Every tool call's `function.name` is in the allow-list: `get_logs`, `inspect_service`,
-  `read_config`, `edit_config`, `restart_service`, `run_healthcheck`.
+- Every tool call's `function.name` is in the allow-list: the four game tools (`place_mark`,
+  `take_stones`, `guess_number`, `play_move`) and the six ops tools (`get_logs`,
+  `inspect_service`, `read_config`, `edit_config`, `restart_service`, `run_healthcheck`).
 - Tool arguments parse to a JSON object (a string that parses, or an object).
 - The last message is from the `assistant`. It is the training target.
 - No row contains `heldout://`, `sealed://`, `heldout/` or `sealed/`.
-- `metadata.evidence`, if present, is `LIVE`, `PRIOR_VERIFIED_RUN` or `EXPLANATION`.
+- `metadata.evidence`, if present, is `LIVE`, `PRIOR_VERIFIED_RUN`, `RULE_VERIFIED` or
+  `EXPLANATION`.
+- If `metadata.state` names a game state, the tool call is recomputed from the game rule and must
+  match.
 - No two rows are identical (SHA-256 of the canonical JSON).
 - At least one row.
 
 Warnings, not errors: rows labelled `EXPLANATION`, and datasets with no evidence labels at all.
+`RULE_VERIFIED` is the normal label for rows produced by `generate_game_sft`: it means the answer
+was recomputed by code, not measured from a model.
 
-**What the verifier does not check.** It does not replay tool calls in an environment, so it does
-not know whether a call is correct. It does not check that a `tool` message follows the matching
-tool call, that `id` values are unique or linked, or that `source_task_id` refers to a real task.
-It does not check licence or provenance of external data, and it does not detect contamination
-beyond the sealed-marker substrings. Token length is estimated, not enforced (see
-[Budget model](#budget-model)). Verification is structural and policy-based. It is not a
-correctness check.
+**What the verifier does not check.** For ops-style rows it does not replay tool calls in an
+environment, so it cannot know whether a call is correct. It does not check that a `tool` message
+follows the matching tool call, that `id` values are unique or linked, or that `source_task_id`
+refers to a real task. It does not check licence or provenance of external data. `verify_rows`
+does not compare game states against the evaluation suite; `check_chat_template` and
+`launch_training` run a separate state-overlap check and reject any training state that appears in
+any eval split, including `heldout_phrasing`. Token length is estimated, not enforced (see
+[Budget model](#budget-model)). Verification is structural, policy-based and rule-based for game
+rows; it is not a full environment replay.
 
-`save_rows` writes nothing unless verification passes. `launch_training` re-verifies the dataset
-before submitting it, and reports its SHA-256 in the result.
+`save_rows` writes nothing unless verification passes. `check_chat_template` must pass for the
+current file SHA-256, and `launch_training` re-verifies the dataset, re-checks suite overlap and
+requires that template check before submitting; it reports the SHA-256 in the result.
 
 ---
 
@@ -459,8 +525,9 @@ inclusive. LoRA is always on.
 
 `validate_hparams` returns a list of violations. An empty list means valid. It rejects missing
 required keys, unknown keys (including `lora`), booleans used as numbers, non-finite numbers, and
-non-integer values for integer keys. `launch_training` re-runs this check, so a bad configuration
-cannot reach Nebius.
+non-integer values for integer keys. With a `dataset_ref` it also estimates optimizer steps and
+blocks fewer than about 50 (warns below 100). `launch_training` re-runs both checks, so a bad
+configuration cannot reach Nebius.
 
 ---
 
@@ -468,44 +535,64 @@ cannot reach Nebius.
 
 Source: `src/posttrain_agent/tools/budget.py`.
 
-1. **Tokens per row** is a heuristic: `max(1, chars // 4)`, where chars is the sum over messages of
-   `len(content) + 16`, plus the tool name and arguments length for each tool call.
+1. **Tokens per row** comes from the base model's tokenizer and chat template, with the tools schema
+   included (`experiments/pretokenize.py`). It uses the cached Qwen3 tokenizer, or
+   `POSTTRAIN_TOKENIZER_DIR`. If the optional `tokenize` extra or tokenizer files are unavailable it
+   falls back to `4 * max(1, chars // 4)` (the old estimate undercounted the tools schema and chat
+   template). The estimate reports which `basis` it used.
 2. **Trained tokens** is `sum(min(row_tokens, context_length)) * n_epochs`. Defaults are
    `n_epochs = 3` and `context_length = 8192` when absent. Rows longer than the context are
    counted at the context length and reported in `rows_over_context`.
 3. **Estimated cost** is `trained_tokens / 1e6 * POSTTRAIN_PRICE_PER_MTOK`.
 4. **Spent** is the sum of `estimated_cost_usd` in `state/spend.jsonl`. It is recorded after each
-   successful submission that returns a provider job ID. Stub launches are recorded too.
-5. **Within budget** is `spent + cost <= POSTTRAIN_MAX_COST_USD`.
+   successful submission that returns a provider job ID. Stub launches are recorded too. When the
+   provider later reports `trained_tokens`, a `reconcile` record replaces the estimate.
+5. **Within budget** is `spent + cost <= POSTTRAIN_MAX_COST_USD` when priced. In unpriced mode it is
+   `spent_trained_tokens + trained_tokens <= POSTTRAIN_MAX_TRAINED_TOKENS`.
 
 Without `POSTTRAIN_PRICE_PER_MTOK` the estimate reports token counts only, with
-`estimated_cost_usd: null` and `within_budget: null`. `launch_training` then returns
-`BLOCKED` at the `budget` stage. This is deliberate: the system fails closed.
+`estimated_cost_usd: null`. If `POSTTRAIN_ALLOW_UNPRICED=1`, `within_budget` is computed against the
+cumulative token cap. Otherwise `within_budget` is `null` and `launch_training` returns `BLOCKED` at
+the `budget` stage. This is deliberate: the system fails closed.
 
-The estimate is an estimate. Nebius bills by compute, and the spend ledger records estimates, not
-invoices. Reconcile against your Nebius billing before relying on the cap.
+The estimate is an estimate. Nebius bills by compute, and the spend ledger records estimates (or
+provider-reported token counts after reconciliation), not invoices. Reconcile against your Nebius
+billing before relying on the cap.
 
 ---
 
 ## Safety model
 
 - **Sealed held-out data.** `run_benchmark` accepts only the `train` split. `evaluate_checkpoint`
-  accepts only `heldout` or `regression`, and returns only `evidence`, `score`, `n` and the seed
-  (no per-task failures). Web queries containing `heldout://` or `sealed://` are refused, and
-  dataset rows containing sealed markers are refused.
-- **Fail-closed promotion gate.** `decide_promotion` (`promotion_gate` in `experiments/domain.py`) returns
-  `REJECT` unless all of the following hold:
+  accepts `heldout`, `regression` or `heldout_phrasing`, and returns only scores and metadata (no
+  task contents). The phrasing split is informational and never gates. Web queries containing
+  `heldout://` or `sealed://` are refused, datasets with sealed markers are refused, and
+  `check_chat_template` / `launch_training` block any dataset state that appears in any eval split.
+- **Fail-closed promotion gate.** `run_gate` reads the evaluation ledger and calls the deterministic
+  `promotion_gate` (`experiments/gate.py`). It returns `REJECT` unless all of the following hold:
   - both results have verified evidence (`LIVE` or `PRIOR_VERIFIED_RUN`);
-  - suite, split and seed match between champion and candidate;
+  - `suite`, `split`, `seed`, `judged_by` and `served_by` match between champion and candidate;
+  - both report an integer `n > 0`;
+  - the candidate's `parse_rate` is at least `max(0.90, base parse_rate - 0.02)`; a missing
+    candidate parse rate rejects;
   - the relative improvement is at least 10% (if the champion score is 0, any positive candidate
-    score passes this check);
-  - the regression is at most 0.05 absolute.
-  Only the deterministic code decides. No agent can set a decision. The gate does not itself
-  require the split to be `heldout`; it requires the two inputs to match.
-- **Evidence labels.** Every measurement carries `evidence`. `LIVE` means provider-measured.
-  `PRIOR_VERIFIED_RUN` is accepted by the gate, but no code path produces it. `EXPLANATION` means
-  simulated or inferred, and it can never be promoted. Subagent prompts require labels to be
-  copied unchanged from tool results.
+    score passes this check) and no absolute drop exceeds 0.05;
+  - the gain is significant: an exact paired McNemar/sign test when both results carry per-task
+    `verdicts` and the same `tasks_sha256`, otherwise a one-sided two-proportion z-test with
+    `z >= 1.645`;
+  - the regression split is supplied for both sides and passes the same validity, parse-rate and
+    `<= 0.05` drop checks (`run_gate` passes `require_regression=True`);
+  - differing `tasks_sha256` values reject as "not computed on the same tasks".
+  `decide_promotion` is still available to code and defaults to not requiring regression, but no
+  agent role gets it. Only deterministic code decides; no agent can set a decision. The gate does
+  not itself require the split to be `heldout`; it requires the two inputs to match.
+  The verdict also reports `mde_80pct_power`, `power_note` and a `power` block (observed gain,
+  adequacy, recommended n=300) at 80% power and one-sided 5%.
+- **Evidence labels.** `LIVE` means provider-measured. `PRIOR_VERIFIED_RUN` is accepted by the gate,
+  but no code path produces it. `RULE_VERIFIED` marks a dataset row whose answer was recomputed by
+  code from the game rule; the dataset verifier accepts it, but the promotion gate does not.
+  `EXPLANATION` means simulated or inferred and can never be promoted. Subagent prompts require
+  labels to be copied unchanged from tool results.
 - **Human approval gate.** `launch_training` is the only path to a training job. The agent
   interrupts before it runs. Approve or reject is recorded durably, in the checkpoint.
 - **Stub by default.** With no `NEBIUS_API_KEY`, the backend is `LocalStubBackend`. Every result it
@@ -532,9 +619,17 @@ state/
   store.sqlite           /memories/ files (including AGENTS.md) and the run ledger
   backboard.json         Backboard assistant id, written on first use
   telemetry.jsonl        model and tool events (append-only)
-  spend.jsonl            one line per launched job: estimated cost, dataset, job id
+  spend.jsonl            launch estimates and reconciled trained tokens per job
+  eval_ledger.jsonl      every held-out/regression evaluation result (run_gate reads this)
+  run_state.jsonl        launch intent, job status, checkpoint and trained tokens
+  gate_log.jsonl         one record per run_gate verdict
+  aborts.jsonl           one record per abort_experiment
+  notes.jsonl            operator notes and read cursors
+  events.sqlite          redacted event journal for the dashboard/API
+  run_tokens.json        persisted whole-run token total
   data/                  POSTTRAIN_DATA_DIR: verified <name>.jsonl datasets
-  suite/                 POSTTRAIN_SUITE_DIR: train.jsonl, heldout.jsonl, regression.jsonl
+  suite_v2/              current suite: train, heldout, regression, heldout_phrasing
+  suite/                 legacy v1 suite: train, heldout, regression
 ```
 
 The cassette file is wherever `POSTTRAIN_CASSETTE` points. Scratch files the agents write under
@@ -606,9 +701,11 @@ include `error_types` and `recent_errors`. The coordinator can call the same sum
 
 ### Job status
 
-There is no standalone CLI command to poll a provider job. The `training_executor` role fetches
-status with `get_training_status` while it runs, and it can be asked again by resuming the thread.
-Job events come from `read_training_logs`.
+There is no standalone CLI command to poll a provider job. The `training_executor` role calls
+`wait_for_training`, which blocks inside the tool until the job is terminal or its timeout expires;
+on timeout it returns `timed_out: true` and can be called again with the same job id. Job events
+come from `read_training_logs`. `get_training_status` is available in the deterministic tool set but
+is not one of the role's assigned tools.
 
 ---
 
@@ -630,8 +727,9 @@ class ExperimentBackend(Protocol):
 Contract points taken from the existing code:
 
 - `train` must return `provider_job_id` if the job was submitted. Otherwise no spend is recorded.
-- `evaluate` must return `score`, `evidence`, and echo `suite`, `split` and `seed`, because the gate
-  compares them.
+- `evaluate` must return `score`, `evidence`, `n`, `parse_rate`, and echo `suite`, `split`, `seed`,
+  `judged_by` and `served_by`, because the gate compares them. Per-task `verdicts` and
+  `tasks_sha256` enable the paired exact test; without them the gate uses the unpaired z-test.
 - Return `"evidence": "LIVE"` only for provider-measured values. Use `EXPLANATION` otherwise.
 - Keep held-out task contents out of the return value.
 
@@ -653,9 +751,11 @@ the CLI.
 
 ## Live dashboard
 
-Every run appends redacted events (statuses, scores, job progress, budget, approvals) to a SQLite journal under the state directory. A read-only API streams them
-to the dashboard over Server-Sent Events. Failures are journaled as exception type names only; the
-journal never holds raw model prompts or completions, tool arguments or secrets.
+The dashboard is the Next.js app in `web/` (see [web/README.md](web/README.md)); it is not part of
+the Python package. Every run appends redacted events (statuses, scores, job progress, budget,
+approvals) to a SQLite journal under the state directory. A read-only API streams them to the
+dashboard over Server-Sent Events. Failures are journaled as exception type names only; the journal
+never holds raw model prompts or completions, tool arguments or secrets.
 
 **Agent-to-agent conversation.** The one exception is the coordinator/subagent traffic: each
 `task` delegation is stored as two `a2a.message` events, the coordinator's brief and the
@@ -724,60 +824,75 @@ uv sync --extra dev
 ```
 
 The pytest config in `pyproject.toml` uses `asyncio_mode = "auto"` and adds `tests/` and `src/` to
-the path. Lint with `.venv/bin/ruff check src tests` (line length 100).
+the path. Lint with `.venv/bin/ruff check src tests` (line length 100); the command is useful, but
+the branch is not lint-clean at the moment.
 
-| Test file | Covers |
-|-----------|--------|
-| `test_approval.py` | Pause at `launch_training`, resume in a new process, reject with a message, approval disabled |
-| `test_backboard_model.py` | Stateless calls, tool-call round trip, malformed arguments, empty responses, cassette record and replay |
-| `test_data_budget.py` | Dataset verifier rules, path traversal, budget math, cap and unpriced behaviour |
-| `test_domain.py` | Hyperparameter validation, promotion gate, sealed split, launch gating, stub promotion refusal |
-| `test_e2e.py` | Full graph with SQLite persistence: assistant reuse, memory tool, crash then resume, history and fork, file memory across threads |
-| `test_hf_nebius_telemetry.py` | Hugging Face tools, Nebius upload, job create, status, events, scoring, telemetry redaction |
-| `test_parallel.py` | The `task` concurrency cap (queued, not dropped, `task` only), three subagents run two at a time, two paused launches answered by one decision |
-| `test_resilience.py` | Transient classification, retry on the same model, fallback order, non-transient fall-through |
-| `test_web.py` | Tavily search and extract, missing key, sealed query refusal, which roles get web tools |
+The suite currently collects 300 tests in this checkout (the audit recorded 276 before later test
+additions).
+
+| Test files | Covers |
+|------------|--------|
+| `test_approval.py`, `test_e2e.py`, `test_exit_gate_e2e.py` | Approval pause/resume, SQLite persistence, crash recovery, history/fork, termination rule |
+| `test_backboard_model.py`, `test_resilience.py` | Backboard chat model, cassette, transient classification, retries and fallback |
+| `test_data_budget.py`, `test_sft_and_gate.py`, `test_gate_power.py` | Dataset verifier, budget/tokenizer math, unpriced cap, promotion gate and power reporting |
+| `test_suite_integrity.py` | v1/v2 suite boundary, the 91-state overlap, contamination blocking, phrasing exclusion |
+| `test_domain.py`, `test_nebius_regressions.py`, `test_eval_resilience.py`, `test_eval_honesty.py` | Hyperparameters, sealed splits, launch gating, Nebius scoring/retries and error honesty |
+| `test_parallel.py`, `test_budget_guard.py`, `test_role_models.py` | Concurrency cap, per-agent budgets, role model overrides |
+| `test_hf_nebius_telemetry.py`, `test_web.py`, `test_token_key_fallback.py` | External tool request shapes, telemetry redaction, token-key fallback |
+| `test_api.py`, `test_events.py`, `test_journal_wiring.py`, `test_a2a.py`, `test_fold.py` | Journal/API/SSE, dashboard folds and A2A export |
+| `test_sandbox_eval.py`, `test_sandbox_student.py`, `test_game_suites.py`, `test_prompts.py` | Sandbox judge/serving, suite generation, prompt contracts |
 
 Tests use a scripted fake Backboard client (`tests/fakes.py`) and `httpx.MockTransport` for Nebius,
-Tavily and Hugging Face. No test calls a live service.
+Tavily and Hugging Face. No test calls a live Backboard, Nebius, Tavily or Hugging Face service; the
+request shapes are exercised against mocks, not the live APIs.
 
 ---
 
-## Status and limitations
+## Known limitations / honest status
 
 Read this before relying on the system.
 
-- **No live calls have been exercised.** The tests use a fake Backboard client and mocked HTTP
-  transports. No live Backboard, Nebius, Tavily or Hugging Face call has been made by the test
-  suite. The request shapes follow the published APIs as implemented in the code, but they are
-  unverified against the live services.
-- **Serving a fine-tuned checkpoint for evaluation is untested.** Evaluation sends chat completions
-  with the checkpoint string as the `model` value. Whether Nebius serves a newly fine-tuned
-  checkpoint under that name has not been tested.
-- **Token estimates are heuristic.** The chars/4 estimate is not Nebius's tokenizer. Billing is by
-  compute. Spend records are estimates.
+- **The last live run did not promote anything.** It ended without a gate verdict: the candidate
+  held-out evaluation timed out uploading the adapter (`ApiTimeoutError` on the Sandbox file
+  upload), the candidate regression scored 0.0, and no candidate held-out score existed. The base
+  scored 0.19 on held-out (n=100) and 0.1833 on regression (n=60). Do not present this as a
+  successful promotion.
+- **The gate's 10% relative threshold is below the MDE at n=100.** At a 0.19 base and n=100, the
+  reported 80%-power MDE is about 0.138 absolute (13.8 points); a 10% relative gain is only about
+  1.9 points, so it cannot clear the significance test. Use the 300-task held-out suite for a real
+  comparison and read `mde_80pct_power` and the `power` block.
+- **Tests do not exercise live services.** The suite uses a fake Backboard client and mocked HTTP
+  transports. No live Backboard, Nebius, Tavily or Hugging Face call is made by the tests.
+- **The old v1 dataset is unsafe on suite_v2.** `state/data/exp1_data_n1200.jsonl` shares 91 states
+  with `suite_v2` (15 train, 40 held-out, 18 regression, 18 held-out-phrasing). The overlap check
+  blocks it; generate fresh data with `generate_game_sft` or `scripts/make_sft.py`.
+- **Candidate serving is not proven end to end.** The last live run reached adapter upload but timed
+  out there. A fine-tuned checkpoint has not been fully evaluated through the gate.
+- **Token estimates can be approximate.** The tokenizer/chat-template estimate is used when the
+  optional tokenizer is available; otherwise the code falls back to a scaled chars/4 heuristic.
+  Nebius bills by compute, and spend records are estimates unless reconciled with reported trained
+  tokens.
 - **No live price.** Nebius publishes no per-token fine-tuning price, so `POSTTRAIN_PRICE_PER_MTOK`
-  is operator-supplied. The cap is only as accurate as that value.
+  is operator-supplied. In unpriced mode the dollar cost is unknown; only the token cap applies.
 - **Simulation without a key.** With no `NEBIUS_API_KEY`, every benchmark, training and evaluation
   result comes from `LocalStubBackend`. These results are labelled `EXPLANATION`, and the gate
-  always rejects them. The sandbox default is the stub.
+  always rejects them.
 - **Subagent outputs are not schema-checked.** The OUTPUT CONTRACT blocks in the prompt files
   describe JSON shapes. The code does not validate them. Some prompt inputs, such as `run_id` and
   `manifest_hash`, are not supplied by any tool. Treat the prompts as guidance.
-- **No champion store or deployment.** `decide_promotion` returns a decision. The code does not
-  record a champion, deploy a checkpoint, or pick the next candidate. The coordinator prompt
-  describes a champion, but nothing persists it.
+- **No champion store or deployment.** `run_gate` returns a decision. The code does not record a
+  champion, deploy a checkpoint, or pick the next candidate.
 - **Approval shows the dataset reference, not its hash.** The dataset could change between approval
-  and submission. `launch_training` re-verifies the file before upload, and its result reports the
-  SHA-256, but the approval text does not include the hash.
+  and submission. `launch_training` re-verifies the file and the suite overlap before upload, and
+  its result reports the SHA-256, but the approval text does not include the hash.
 - **Crash between submit and spend record.** See [Recovering from crashes](#recovering-from-crashes).
 - **Replay re-executes tools.** See [Replaying offline with the cassette](#replaying-offline-with-the-cassette).
 - **Approval can be turned off.** `POSTTRAIN_REQUIRE_APPROVAL=0` removes the only human check on
   spend. Use it only for runs you accept.
 - **Web and Hugging Face lookups are external and not cached.** They are not recorded in the
   cassette, so a replay makes them again.
-- **Not included:** no UI, no multi-process scheduling, no retry of a rejected launch, no
-  cancellation of a running provider job, and no automatic promotion or deployment.
+- **Not included:** no multi-process scheduling, no retry of a rejected launch, no cancellation of a
+  running provider job, and no automatic promotion or deployment.
 
 ---
 

@@ -314,7 +314,7 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         Rows are computed by code (never written by a model), balanced over the games, use
         paraphrased prompts, and never contain a state from any evaluation split.
         """
-        states = games_mod.suite_states(settings.suite_dir)
+        states = games_mod.suite_states(settings.suite_dir, include_phrasing=True)
         if not states:
             return {"ok": False, "errors": [
                 "evaluation suite files carry no 'state' keys; regenerate them with "
@@ -337,8 +337,9 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
     def launch_training(hyperparameters: dict[str, Any] | str, dataset_ref: str,
                         base_model: str | None = None) -> dict[str, Any]:
         """Launch ONE LoRA fine-tuning job (needs human approval). Re-checks hyperparameters, dataset,
-        the chat-template check (check_chat_template must have passed for this exact dataset), the
-        optimizer-step floor and the budget. Trains on the pretokenized file."""
+        train/eval state disjointness (against the CURRENT suite), the chat-template check
+        (check_chat_template must have passed for this exact dataset), the optimizer-step floor and
+        the budget. Trains on the pretokenized file."""
         hyperparameters = _hp(hyperparameters)
         if not isinstance(hyperparameters, dict):
             return {"status": "BLOCKED", "stage": "hyperparameters",
@@ -348,6 +349,13 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         report = dataset_mod.verify_file(settings.data_dir, dataset_ref, settings.max_dataset_rows)
         if not report["ok"]:
             return {"status": "BLOCKED", "stage": "dataset", "errors": report["errors"]}
+        # Re-read the suite and dataset on every launch: a suite edit or dataset swap after the
+        # template check must not turn contaminated data into a job.
+        overlap = dataset_mod.check_suite_overlap(settings.data_dir, dataset_ref,
+                                                  settings.suite_dir)
+        if not overlap["ok"]:
+            return {"status": "BLOCKED", "stage": "contamination",
+                    "errors": overlap["errors"], "overlap": overlap}
         if not dataset_mod.check_marker_ok(settings.data_dir, dataset_ref, report["sha256"]):
             return {"status": "BLOCKED", "stage": "template_check", "errors": [
                 f"no passing check_chat_template for {dataset_ref} with sha256 {report['sha256']}; "
@@ -583,8 +591,9 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         prompt and the call parses. Writes the marker launch_training requires (bound to the
         dataset's sha256). Returns supervised-token fraction and per-game counts."""
         try:
-            return dataset_mod.check_chat_template(settings.data_dir, dataset_ref,
-                                                   settings.max_dataset_rows)
+            return dataset_mod.check_chat_template(
+                settings.data_dir, dataset_ref, settings.max_dataset_rows,
+                suite_dir=settings.suite_dir)
         except ValueError as exc:
             return {"ok": False, "errors": [str(exc)]}
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
@@ -28,7 +28,8 @@ HELDOUT_STYLES = (3, 4)  # phrasing never used in SFT
 RULE_VERIFIED = "RULE_VERIFIED"  # answer recomputed from the game rule (not a measurement)
 SYSTEM_PROMPT = ("You are a game-playing agent. Answer every request by calling the provided tool "
                  "exactly once with the correct arguments. Do not reply in prose.")
-SPLIT_FILES = ("train", "heldout", "regression", "heldout_phrasing")
+GATE_SPLITS = ("train", "heldout", "regression")  # the three splits used by the promotion gate
+SPLIT_FILES = (*GATE_SPLITS, "heldout_phrasing")  # every eval split, including the phrasing slice
 
 
 def _tool(name: str, desc: str, props: dict, required: list[str]) -> dict:
@@ -205,10 +206,16 @@ def make_split(seed: int, n: int, exclude: set[str] | frozenset[str] = frozenset
     return out
 
 
-def suite_states(suite_dir: Path | str) -> set[str]:
-    """Canonical states of every eval split on disk (empty if the files carry no ``state``)."""
-    states: set[str] = set()
-    for split in SPLIT_FILES:
+def suite_split_states(suite_dir: Path | str,
+                       splits: Iterable[str] = SPLIT_FILES) -> dict[str, set[str]]:
+    """``{split: canonical states}`` for every split file that exists on disk.
+
+    Missing files yield an empty set. Splits with no usable ``state`` keys stay empty too, so
+    callers can distinguish "not configured" from "configured but unreadable" if they need to.
+    """
+    out: dict[str, set[str]] = {}
+    for split in splits:
+        states: set[str] = set()
         path = Path(suite_dir) / f"{split}.jsonl"
         if path.exists():
             for line in path.read_text().splitlines():
@@ -216,7 +223,21 @@ def suite_states(suite_dir: Path | str) -> set[str]:
                     state = json.loads(line).get("state")
                     if isinstance(state, str):
                         states.add(state)
-    return states
+        out[split] = states
+    return out
+
+
+def suite_states(suite_dir: Path | str, splits: Iterable[str] | None = None,
+                 *, include_phrasing: bool = True) -> set[str]:
+    """Canonical states of every eval split on disk (empty if the files carry no ``state``).
+
+    The default includes all four splits, so SFT data can exclude the wording-only
+    ``heldout_phrasing`` slice as well. Pass ``include_phrasing=False`` (or explicit ``splits``)
+    for the legacy three-gate-split view.
+    """
+    names = tuple(splits) if splits is not None else (
+        SPLIT_FILES if include_phrasing else GATE_SPLITS)
+    return set().union(*suite_split_states(suite_dir, names).values())
 
 
 def generate_sft(n: int, seed: int, exclude: set[str] | frozenset[str],

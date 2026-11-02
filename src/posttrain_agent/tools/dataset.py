@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ ROLES = frozenset({"system", "user", "assistant", "tool"})
 SEALED_MARKERS = ("heldout://", "sealed://", "heldout/", "sealed/")
 VERIFIED = frozenset({"LIVE", "PRIOR_VERIFIED_RUN"})
 MAX_ROWS = 1200  # hard cap on SFT dataset size
+EVAL_SPLITS = ("train", "heldout", "regression", "heldout_phrasing")
 RULE_VERIFIED = "RULE_VERIFIED"  # answer recomputed from the game rule by code
 _NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
@@ -156,6 +158,67 @@ def verify_file(data_dir: Path, ref: str, max_rows: int = MAX_ROWS) -> dict[str,
     return verify_rows(rows, max_rows=max_rows)
 
 
+def row_states(rows: Iterable[Any]) -> set[str]:
+    """Distinct canonical ``metadata.state`` values carried by dataset rows."""
+    states: set[str] = set()
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("metadata"), dict):
+            state = row["metadata"].get("state")
+            if isinstance(state, str) and state:
+                states.add(state)
+    return states
+
+
+def check_suite_overlap(data_dir: Path, ref: str, suite_dir: Path | str | None,
+                        splits: Iterable[str] = EVAL_SPLITS) -> dict[str, Any]:
+    """Compare a saved dataset's ``metadata.state`` values with every configured eval split.
+
+    Deterministic and LLM-free. A missing suite directory is reported as a warning (nothing is
+    configured, so there is nothing to compare); an existing suite whose files carry no ``state``
+    keys is an error because disjointness cannot be proven. Any overlapping state blocks:
+    ``errors`` names the split and how many training states it contains.
+    """
+    try:
+        rows = load_rows(data_dir, ref)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "dataset_ref": ref, "errors": [str(exc)], "warnings": []}
+    from ..experiments import games  # local import: games has no dependency on this module
+
+    names = tuple(splits)
+    training_states = row_states(rows)
+    root = Path(suite_dir) if suite_dir is not None else None
+    base: dict[str, Any] = {
+        "dataset_ref": ref, "dataset_states": len(training_states),
+        "suite_dir": str(root) if root is not None else None, "split_states": {},
+        "overlap_counts": dict.fromkeys(names, 0), "overlap_total": 0,
+        "overlap_states": {}, "errors": [], "warnings": []}
+    if root is None or not root.is_dir():
+        base["warnings"].append(
+            f"suite directory {root} does not exist; train/eval state overlap not checked")
+        return {**base, "ok": True}
+    per_split = games.suite_split_states(root, names)
+    base["split_states"] = {split: len(states) for split, states in per_split.items()}
+    if not any(per_split.values()):
+        return {**base, "ok": False, "errors": [(
+            f"evaluation suite {root} carries no 'state' keys; cannot prove training data is "
+            "disjoint from evaluation data (regenerate it with scripts/make_game_suites.py)")]}
+    errors: list[str] = []
+    overlaps: dict[str, list[str]] = {}
+    counts: dict[str, int] = {}
+    for split in names:
+        hit = sorted(training_states & per_split.get(split, set()))
+        counts[split] = len(hit)
+        if hit:
+            overlaps[split] = hit
+            errors.append(
+                f"contamination: {len(hit)} training state(s) also appear in eval split "
+                f"'{split}' ({root / f'{split}.jsonl'}); SFT data must exclude every "
+                "evaluation state")
+    base.update(overlap_counts=counts, overlap_total=len(set().union(*overlaps.values())),
+                overlap_states=overlaps, errors=errors)
+    return {**base, "ok": not overlaps}
+
+
 def save_rows(data_dir: Path, ref: str, rows: list[Any],
               max_rows: int = MAX_ROWS) -> dict[str, Any]:
     """Verify then write ``rows`` as JSONL. Nothing is written unless verification passes."""
@@ -234,7 +297,8 @@ def inspect_dataset(data_dir: Path, ref: str, n: int = 3, game: str | None = Non
             "warnings": report["warnings"], "samples": samples}
 
 
-def check_chat_template(data_dir: Path, ref: str, max_rows: int = MAX_ROWS) -> dict[str, Any]:
+def check_chat_template(data_dir: Path, ref: str, max_rows: int = MAX_ROWS, *,
+                        suite_dir: Path | str | None = None) -> dict[str, Any]:
     """Pretokenize the dataset and prove the training rows match serving. On success writes the
     pretokenized file and the check marker that ``launch_training`` requires.
 
@@ -242,6 +306,9 @@ def check_chat_template(data_dir: Path, ref: str, max_rows: int = MAX_ROWS) -> d
     tool call (and parses with the evaluator's ``parse_tool_calls``); the masked prefix equals the
     serving prompt (same template call as ``sandbox_student``); template-derived target equals the
     literal one; tokenisation is stable across the prompt/target boundary.
+
+    With ``suite_dir`` it first proves the dataset's states are disjoint from every evaluation
+    split (train, heldout, regression, heldout_phrasing) and blocks contaminated data.
     """
     from ..experiments import pretokenize as pt
     from ..experiments.sandbox_student import parse_tool_calls
@@ -249,6 +316,10 @@ def check_chat_template(data_dir: Path, ref: str, max_rows: int = MAX_ROWS) -> d
     report = verify_file(data_dir, ref, max_rows)
     if not report["ok"]:
         return {"ok": False, "stage": "verify", "errors": report["errors"]}
+    overlap = check_suite_overlap(data_dir, ref, suite_dir)
+    if not overlap["ok"]:
+        return {"ok": False, "stage": "contamination", "errors": overlap["errors"],
+                "overlap": overlap}
     try:
         tok = pt.get_tokenizer()
     except pt.TokenizerUnavailable as exc:

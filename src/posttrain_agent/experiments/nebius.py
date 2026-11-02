@@ -42,10 +42,13 @@ FAILURES_SHOWN = 10  # failure records returned by evaluate()
 TERMINAL = {"succeeded", "failed", "cancelled"}
 SERVED_BY_SERVERLESS = "nebius-serverless"
 MAX_JOBS_SCANNED = 30  # succeeded jobs searched when resolving a checkpoint name
+CHECKPOINT_TRIES = 5  # a succeeded job's checkpoint list can lag (seen live: empty, then 3)
+CHECKPOINT_BASE_DELAY_S = 1.0
+CHECKPOINT_MAX_DELAY_S = 8.0
 _STUDENT_LOCK = threading.Lock()
 
 
-_STEP = re.compile(r"step[-_]?(\d+)", re.I)
+_STEP = re.compile(r"step[-_]?(\d+)", re.IGNORECASE)
 
 
 def checkpoint_step(c: dict[str, Any]) -> int:
@@ -133,7 +136,7 @@ class NebiusBackend:
 
         try:
             resp = retry_sync(once, sleep=self._sleep)
-        except Exception as exc:  # noqa: BLE001 - only transient failures become structured errors
+        except Exception as exc:  # only transient failures become structured errors
             if not is_transient(exc):
                 raise
             return self._transient_error(exc, f"GET {path}")
@@ -167,8 +170,9 @@ class NebiusBackend:
                     return (SERVED_BY_SERVERLESS,
                             f"/models probe failed ({listed.get('error')}); assumed serverless")
                 self._serving = ((SERVED_BY_SERVERLESS, None) if self.s.base_model in ids else
-                                 (SERVED_BY_SANDBOX, f"{self.s.base_model} is not served by "
-                                                     "/chat/completions; served on sandbox CPU"))
+                                 (SERVED_BY_SANDBOX,
+                                  (f"{self.s.base_model} is not served by "
+                                   "/chat/completions; served on sandbox CPU")))
         return self._serving
 
     # -- plumbing ---------------------------------------------------------------
@@ -190,7 +194,7 @@ class NebiusBackend:
 
         try:
             resp = retry_sync(once, tries=tries, sleep=self._sleep)
-        except Exception as exc:  # noqa: BLE001 - only transient failures become structured errors
+        except Exception as exc:  # only transient failures become structured errors
             if not is_transient(exc):
                 raise
             return self._transient_error(exc, f"{method} {path}")
@@ -231,21 +235,59 @@ class NebiusBackend:
                "trained_tokens": job.get("trained_tokens"), "error": job.get("error"),
                "checkpoint": None}
         if job.get("status") == "succeeded":
-            items = self._index_checkpoints(job_id)
-            last = final_checkpoint(items)  # highest step, not list order
-            out["checkpoint"] = last.get("fine_tuned_model_checkpoint") if last else None
+            last, missing = self._final_checkpoint(job_id)  # highest step, not list order
+            if last:
+                out["checkpoint"] = last.get("fine_tuned_model_checkpoint")
+            else:
+                out.update(missing or {})
         return out
 
+    def _final_checkpoint(self, job_id: str
+                          ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The highest-step checkpoint of a succeeded job, retrying a briefly empty listing.
+
+        Checkpoint listings can lag the terminal job status (seen live: a succeeded job returned
+        an empty list, then three checkpoints on a later request). Only the idempotent listing is
+        retried, with bounded exponential backoff; the training job is never created again.
+        """
+        detail = "empty checkpoint list"
+        for attempt in range(CHECKPOINT_TRIES):
+            items, err = self._checkpoint_items(job_id)
+            last = final_checkpoint(items)
+            if last and last.get("fine_tuned_model_checkpoint"):
+                return last, None
+            if err:
+                detail = str(err.get("error") or err)[:300]
+            if attempt + 1 < CHECKPOINT_TRIES:
+                self._sleep(min(CHECKPOINT_MAX_DELAY_S,
+                                CHECKPOINT_BASE_DELAY_S * 2 ** attempt))
+        return None, {
+            "error": f"job {job_id} reports succeeded but no checkpoint was listed "
+                     f"after {CHECKPOINT_TRIES} attempts ({detail}); refusing to evaluate "
+                     "without a checkpoint",
+            "stage": "checkpoint", "checkpoint_missing": True, "transient": True,
+            "attempts": CHECKPOINT_TRIES,
+        }
+
     def _index_checkpoints(self, job_id: str) -> list[dict[str, Any]]:
-        """The job's checkpoints; remembers name -> (job, result files) for sandbox serving."""
+        """The job's checkpoints from one listing; remembers name -> (job, result files) for
+        sandbox serving. See ``_final_checkpoint`` for the retrying succeeded-job path."""
+        items, _err = self._checkpoint_items(job_id)
+        return items
+
+    def _checkpoint_items(self, job_id: str
+                          ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """One checkpoint listing and its structured error (if the request failed)."""
         ck = self._req("GET", f"/fine_tuning/jobs/{job_id}/checkpoints")
-        items = [c for c in ck.get("data", []) if isinstance(c, dict)] if "error" not in ck else []
+        if "error" in ck:
+            return [], ck
+        items = [c for c in (ck.get("data") or []) if isinstance(c, dict)]
         for c in items:
             if name := c.get("fine_tuned_model_checkpoint"):
                 files = [f.get("id") if isinstance(f, dict) else f
                          for f in c.get("result_files") or []]
                 self._ckpts[name] = {"job_id": job_id, "result_files": [f for f in files if f]}
-        return items
+        return items, None
 
     def _resolve_checkpoint(self, checkpoint: str) -> dict[str, Any]:
         """Find the job and result files of a checkpoint name (exact match, never by position)."""

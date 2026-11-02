@@ -30,12 +30,20 @@ from posttrain_agent.experiments.nebius import NebiusBackend
 from posttrain_agent.observability.events import CURRENT_RUN, Journal
 
 SPLITS = ("heldout", "regression")
+SUITE = "AgentGym/AgentEval"  # make_tools' default, stored in the ledger for resume matching
 
 
 def _candidate_split(tools: dict, s: Settings, run: str, job: str, split: str,
                      resume: bool) -> dict[str, Any]:
     if resume:
-        rec = ledger.latest_ok(s.state_dir, run=run, job=job, split=split)
+        # Reuse only this run/job's split on the same suite and seed; a changed seed or suite
+        # means the old score is not comparable and must be recomputed.
+        rec = ledger.latest_ok(s.state_dir, run=run, job=job, split=split, suite=SUITE,
+                               seed=s.seed)
+        if rec is None and not job.startswith("ftjob-"):
+            # a checkpoint-name ref is recorded with job=None, its name in "checkpoint"
+            rec = ledger.latest_ok(s.state_dir, run=run, checkpoint=job, split=split,
+                                   suite=SUITE, seed=s.seed)
         if rec:
             return rec["result"]
     return tools["evaluate_checkpoint"](job, split)
@@ -49,7 +57,7 @@ def _base_split(tools: dict, s: Settings, base: str, split: str, like: dict) -> 
 def evaluate(run: str, job: str, settings: Settings, backend: Any, *, resume: bool = False,
              base: str = "base") -> dict[str, Any]:
     journal = Journal(settings.state_dir / "events.sqlite")
-    tools = make_tools(backend, settings, journal=journal)
+    tools = make_tools(backend, settings, suite=SUITE, journal=journal)
     token = CURRENT_RUN.set(run)
     try:
         cand = {sp: _candidate_split(tools, settings, run, job, sp, resume) for sp in SPLITS}
