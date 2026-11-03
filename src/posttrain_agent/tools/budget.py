@@ -115,11 +115,17 @@ def record_spend(settings: Settings, job_id: str | None, cost: float, dataset_re
                              "estimated_trained_tokens": estimated_tokens}) + "\n")
 
 
-def reconcile(settings: Settings, job_id: str, trained_tokens: int | None) -> bool:
+def reconcile(settings: Settings, job_id: str, trained_tokens: int | None,
+              status: str | None = None) -> bool:
     """Replace a launched job's estimate with the provider's actual ``trained_tokens`` (once per
-    value). Returns True if a record was written."""
-    if not job_id or not isinstance(trained_tokens, int) or isinstance(trained_tokens, bool) \
-            or trained_tokens <= 0:
+    value). Returns True if a record was written.
+
+    Zero only counts when ``status`` says the job is over (``failed``/``cancelled``): a job the
+    provider rejected trained nothing, while a running job reporting 0 has simply not started."""
+    if not job_id or not isinstance(trained_tokens, int) or isinstance(trained_tokens, bool):
+        return False
+    ended = str(status or "").lower() in {"failed", "cancelled", "canceled"}
+    if trained_tokens < 0 or (trained_tokens == 0 and not ended):
         return False
     jobs = _ledger(settings)
     if job_id not in jobs or jobs[job_id]["tokens"] == trained_tokens:

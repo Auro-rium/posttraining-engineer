@@ -405,7 +405,8 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         else:
             rs.write_run_state(settings.state_dir, **intent, job_id=None, status="LAUNCH_FAILED",
                                checkpoint=None, trained_tokens=None)
-        if result.get("provider_job_id"):
+        # BLOCKED with a job id: the provider rejected the dataset, so the job trained nothing
+        if result.get("provider_job_id") and result.get("status") != "BLOCKED":
             cost = est["estimated_cost_usd"] or 0.0  # None when running unpriced
             budget_mod.record_spend(settings, result["provider_job_id"], cost, dataset_ref,
                                     est.get("estimated_trained_tokens"))
@@ -427,7 +428,7 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
         # must never break status polling
         with contextlib.suppress(Exception):
             if isinstance(res, dict):
-                budget_mod.reconcile(settings, job_id, res.get("trained_tokens"))
+                budget_mod.reconcile(settings, job_id, res.get("trained_tokens"), res.get("status"))
         return res
 
     def _record_status(job_id: str, res: dict[str, Any]) -> None:
@@ -460,7 +461,7 @@ def make_tools(backend: ExperimentBackend, settings: Settings,
             sleep(poll_s)
             waited += poll_s
         with contextlib.suppress(Exception):
-            budget_mod.reconcile(settings, job_id, res.get("trained_tokens"))
+            budget_mod.reconcile(settings, job_id, res.get("trained_tokens"), res.get("status"))
         with contextlib.suppress(OSError):
             _record_status(job_id, res)
         terminal = status in rs.TERMINAL
