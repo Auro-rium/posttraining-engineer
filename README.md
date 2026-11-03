@@ -840,7 +840,7 @@ additions).
 | `test_suite_integrity.py` | v1/v2 suite boundary, the 91-state overlap, contamination blocking, phrasing exclusion |
 | `test_domain.py`, `test_nebius_regressions.py`, `test_eval_resilience.py`, `test_eval_honesty.py` | Hyperparameters, sealed splits, launch gating, Nebius scoring/retries and error honesty |
 | `test_parallel.py`, `test_budget_guard.py`, `test_role_models.py` | Concurrency cap, per-agent budgets, role model overrides |
-| `test_hf_nebius_telemetry.py`, `test_web.py`, `test_token_key_fallback.py` | External tool request shapes, telemetry redaction, token-key fallback |
+| `test_hf_nebius_telemetry.py`, `test_web.py`, `test_dataset_validation.py` | External tool request shapes, telemetry redaction, single-submission dataset validation and the pretokenized wire key |
 | `test_api.py`, `test_events.py`, `test_journal_wiring.py`, `test_a2a.py`, `test_fold.py` | Journal/API/SSE, dashboard folds and A2A export |
 | `test_sandbox_eval.py`, `test_sandbox_student.py`, `test_game_suites.py`, `test_prompts.py` | Sandbox judge/serving, suite generation, prompt contracts |
 
@@ -898,6 +898,11 @@ Read this before relying on the system.
   spend. Use it only for runs you accept.
 - **Web and Hugging Face lookups are external and not cached.** They are not recorded in the
   cassette, so a replay makes them again.
+- **The pretokenized key is `input_ids`, whatever the docs' examples show.** Nebius' docs conflict
+  (`input_ids` in the schema table, `token_ids` in the examples). Live, `token_ids` was rejected on two
+  jobs and `input_ids` trained on one (`ftjob-1854c2cc`, an 8-row probe, 1 step). The upload renames
+  `token_ids` to `PRETOK_TOKEN_KEY` in `experiments/nebius.py`, and each submission is made once (no
+  key-name retry). A full-size pretokenized job has not been run yet.
 - **Not included:** no multi-process scheduling, no retry of a rejected launch, no cancellation of a
   running provider job, and no automatic promotion or deployment.
 

@@ -349,6 +349,17 @@ include up to 20 failures with `task_id`, `expected`, and `got`. Evaluation resu
 `regression`, `heldout_phrasing`) include `n`, `score`, `parse_rate`, `by_game`, `judged_by`,
 `served_by`, per-task `verdicts` and `tasks_sha256`, but no task contents or expected values.
 
+**Dataset submission.** `train` makes one submission: at most one upload and one job per call, with no
+key-name retry or fallback. Pretokenized rows are written locally with `token_ids`; at upload time
+only, `_provider_jsonl` renames that key to `PRETOK_TOKEN_KEY` (`input_ids`) and strips `metadata`, so
+local files, hashes and markers are unchanged. Nebius' docs conflict on this key: `token_ids` was
+rejected on two live jobs (`ftjob-fe4392c5`, `ftjob-8bd42d1b`), and `input_ids` trained on an 8-row
+probe (`ftjob-1854c2cc`). Nebius validates the dataset asynchronously: a bad file ends `failed` with 0
+tokens (seen ~40s after submit), and a good one logs "processed successfully" (seen ~70s) while still
+reporting `running`. So `train` watches a new job (`_dataset_rejected`) for up to
+`DATASET_VALIDATION_WAIT_S` and returns `BLOCKED` with stage `upload`, `create_job` or
+`dataset_validation`; a rejected job is reported as `provider_job_id` with no `id`.
+
 The fine-tuning request shape follows Nebius' published schema, as noted in the module docstring. The
 Nebius client and sandbox paths have been exercised against mocks and a live job; the test suite
 itself does not call Nebius.

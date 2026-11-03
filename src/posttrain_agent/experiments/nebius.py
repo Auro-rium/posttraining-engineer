@@ -47,6 +47,9 @@ CHECKPOINT_BASE_DELAY_S = 1.0
 DATASET_VALIDATION_WAIT_S = 150.0  # live: format rejection arrived ~40s after submit
 DATASET_VALIDATION_POLL_S = 10.0
 CHECKPOINT_MAX_DELAY_S = 8.0
+# Nebius docs conflict (schema table says input_ids, examples say token_ids). Live: token_ids was
+# rejected on ftjob-fe4392c5 and ftjob-8bd42d1b; input_ids trained on ftjob-1854c2cc (2026-11-03).
+PRETOK_TOKEN_KEY = "input_ids"
 _STUDENT_LOCK = threading.Lock()
 
 
@@ -76,31 +79,19 @@ def _note(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def _provider_jsonl(path: Path) -> bytes:
-    """The dataset as the provider's format allows: our private ``metadata`` key is not sent."""
+    """The dataset as the provider's format allows: our private ``metadata`` key is not sent, and
+    a pretokenized row's ``token_ids`` goes out as ``PRETOK_TOKEN_KEY``. The local file is not
+    touched: only the uploaded bytes differ."""
     out = []
     for line in path.read_text().splitlines():
         if line.strip():
             row = json.loads(line)
             if isinstance(row, dict):
                 row.pop("metadata", None)
+                if "token_ids" in row:
+                    row = {(PRETOK_TOKEN_KEY if k == "token_ids" else k): v
+                           for k, v in row.items()}
             out.append(json.dumps(row, sort_keys=True))
-    return ("\n".join(out) + "\n").encode()
-
-
-def _swap_token_key(data: bytes, failure: dict[str, Any]) -> bytes | None:
-    """The same pretokenized file with ``token_ids`` <-> ``input_ids`` renamed, or None when the
-    failure is not a 4xx that names the key (or the file is not pretokenized)."""
-    text = f"{failure.get('error', '')} {failure.get('detail', '')}"
-    if "HTTP 4" not in text or not ("token_ids" in text or "input_ids" in text):
-        return None
-    rows = [json.loads(line) for line in data.decode().splitlines() if line.strip()]
-    if not rows or not all(isinstance(r, dict) for r in rows):
-        return None
-    old, new = ("token_ids", "input_ids") if "token_ids" in rows[0] else ("input_ids", "token_ids")
-    if old not in rows[0]:
-        return None
-    out = [json.dumps({(new if k == old else k): v for k, v in r.items()}, sort_keys=True)
-           for r in rows]
     return ("\n".join(out) + "\n").encode()
 
 
@@ -206,34 +197,31 @@ class NebiusBackend:
 
     # -- training ---------------------------------------------------------------
     def train(self, config: dict[str, Any], dataset_path: Path, base_model: str) -> dict[str, Any]:
-        """Upload then create the job. Nebius's docs name the pretokenized key both ``token_ids``
-        and ``input_ids``; if the provider rejects the file or job with a 4xx naming the key,
-        re-upload ONCE with the other name. A rejected creation made no job, so no double launch."""
+        """Upload then create the job: at most one upload and one job per call, never a resubmit.
+
+        A pretokenized row goes out keyed ``PRETOK_TOKEN_KEY`` (see ``_provider_jsonl``). Results:
+        an upload error is ``BLOCKED`` at stage ``upload``; a job-creation error (no ``id``) is
+        ``BLOCKED`` at ``create_job``; a job that the provider's dataset validation then fails
+        (``_dataset_rejected``) is ``BLOCKED`` at ``dataset_validation`` with the provider's
+        message and its ``provider_job_id`` but no ``id`` (that job trained nothing). Otherwise the
+        job record with ``provider_job_id`` and ``training_file``."""
         data = _provider_jsonl(dataset_path)
-        swaps = 0
-        while True:
-            up = self._req("POST", "/files", data={"purpose": "fine-tune"},
-                           files={"file": (dataset_path.name, data)})
-            job = up if "error" in up else self._req("POST", "/fine_tuning/jobs", json={
-                "model": base_model, "training_file": up["id"], "seed": self.s.seed,
-                "suffix": dataset_path.stem[:64],
-                "hyperparameters": {**config, "lora": True},
-            }, tries=1)  # never auto-retry job creation: a lost response could double-launch
-            if job.get("error") and "id" not in job:
-                swapped = _swap_token_key(data, job)  # synchronous 4xx naming the key
-            elif (reason := self._dataset_rejected(job["id"])) is not None:
-                # Nebius accepted the upload and validates it asynchronously: the job then ends
-                # `failed` with 0 trained tokens. That job cost nothing, so one resubmit is safe.
-                swapped = _swap_token_key(data, {"error": f"HTTP 4 token_ids/input_ids: {reason}"})
-                job = {"error": reason, "provider_job_id": job["id"]}  # no "id": not launched
-                if swaps or swapped is None:
-                    return {**job, "status": "BLOCKED", "stage": "dataset_validation"}
-            else:
-                break
-            if swaps or swapped is None:
-                stage = "upload" if "error" in up else "create_job"
-                return {**job, "status": "BLOCKED", "stage": stage}
-            swaps, data = swaps + 1, swapped
+        up = self._req("POST", "/files", data={"purpose": "fine-tune"},
+                       files={"file": (dataset_path.name, data)})
+        if "error" in up:
+            return {**up, "status": "BLOCKED", "stage": "upload"}
+        job = self._req("POST", "/fine_tuning/jobs", json={
+            "model": base_model, "training_file": up["id"], "seed": self.s.seed,
+            "suffix": dataset_path.stem[:64],
+            "hyperparameters": {**config, "lora": True},
+        }, tries=1)  # never auto-retry job creation: a lost response could double-launch
+        if "id" not in job:
+            return {**job, "status": "BLOCKED", "stage": "create_job"}
+        if (reason := self._dataset_rejected(job["id"])) is not None:
+            # Nebius accepts the upload and validates it asynchronously: the job then ends
+            # `failed` with 0 trained tokens. No "id" key: nothing was launched.
+            return {"error": reason, "provider_job_id": job["id"],
+                    "status": "BLOCKED", "stage": "dataset_validation"}
         return {"evidence": "LIVE", "status": job.get("status", "queued"),
                 "provider_job_id": job["id"], "training_file": up["id"], "checkpoint": None}
 
